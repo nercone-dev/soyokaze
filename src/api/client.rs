@@ -1,6 +1,7 @@
 //! Dialling an origin and issuing requests.
 //!
-//! [`Client`] is the entry point. Build one with [`Client::builder`], then use
+//! [`Client`] is the entry point. Build one with [`Client::new`] from a
+//! [`ClientConfig`] — or [`Client::default`] to take every default — then use
 //! [`Client::get`] and friends for one-off requests, or [`Client::connect`]
 //! when the connection itself is wanted — to pipeline over it, multiplex
 //! several streams, or hold it open.
@@ -8,7 +9,7 @@
 //! Which HTTP version is used follows from where the connection goes: a QUIC
 //! port carries HTTP/3, and a TLS handshake negotiates between HTTP/2 and
 //! HTTP/1.1 by ALPN. A plaintext connection cannot negotiate, so it takes the
-//! version the builder was told or HTTP/1.1.
+//! version [`ClientConfig::versions`] pinned or HTTP/1.1.
 //!
 //! A client keeps a [`CookieJar`] and an [`HstsStore`] unless told not to, and
 //! both are consulted by [`Client::fetch`] and updated from what comes back.
@@ -19,112 +20,86 @@ use std::time::Instant;
 use bytes::Bytes;
 use tokio::net::{TcpStream, UnixStream};
 
-use crate::api::tls;
+use crate::api::common::{Limits, VERSIONS};
 use crate::headers::CookieJar;
 use crate::helpers::hsts::HstsStore;
-use crate::models::{Body, ConnectionID, Headers, Limits, Message, Method, Port, Url, Version};
-use crate::protocol::common::{AnyConnection, Connection, Error, Transport};
+use crate::models::{Body, ConnectionID, Headers, Message, Method, Port, Url, Version};
+use crate::tls;
+use crate::protocol::base::{AnyConnection, Connection, Transport};
+use crate::protocol::common::{self, Error};
 use crate::protocol::h1::H1Connection;
 use crate::protocol::h2::H2Connection;
 use crate::protocol::h3::{H3Connection, H3Session};
 
-/// The versions offered when the builder was not told which to use, in the
-/// order they are preferred.
-pub const PREFERENCE: &[Version] = &[Version::V3_0, Version::V2_0, Version::V1_1];
-
-/// Builds a [`Client`].
+/// How a [`Client`] is configured.
 ///
-/// Everything has a working default: TLS on, cookies kept, HSTS remembered,
-/// the platform trust store, and version chosen by negotiation.
-pub struct ClientBuilder {
-    version: Option<Version>,
-    limits: Option<Limits>,
-    secure: bool,
-    roots: Option<Vec<Vec<u8>>>,
-    ech: std::collections::HashMap<String, Vec<u8>>,
-    cookies: bool,
-    hsts: bool,
-}
-
-impl ClientBuilder {
-    /// A builder with the defaults described on [`ClientBuilder`].
-    pub fn new() -> Self {
-        Self { version: None, limits: None, secure: true, roots: None, ech: std::collections::HashMap::new(), cookies: true, hsts: true }
-    }
-
-    /// Pins the HTTP version instead of negotiating one.
+/// Every field has a working default: every supported version offered, TLS on,
+/// cookies kept, HSTS remembered, and the platform trust store.
+#[derive(Clone)]
+pub struct ClientConfig {
+    /// The versions to offer, in the order they are preferred.
     ///
-    /// [`Version::V3_0`] makes [`Client::open`] dial QUIC rather than TCP.
-    pub fn version(mut self, version: Version) -> Self {
-        self.version = Some(version);
-        self
-    }
+    /// Exactly one entry pins the version instead of negotiating one, and
+    /// [`Version::V3_0`] alone makes [`Client::open`] dial QUIC rather than
+    /// TCP.
+    pub versions: Vec<Version>,
 
-    /// Sets the limits every connection this client makes will hold itself to.
-    pub fn limits(mut self, limits: Limits) -> Self {
-        self.limits = Some(limits);
-        self
-    }
+    /// The limits every connection this client makes will hold itself to.
+    pub limits: ClientLimits,
 
     /// Whether [`Client::connect`] wraps a stream transport in TLS.
     ///
     /// This does not affect [`Client::open`] and [`Client::fetch`], which
     /// decide from the URL's scheme.
-    pub fn secure(mut self, secure: bool) -> Self {
-        self.secure = secure;
-        self
-    }
+    pub secure: bool,
 
-    /// Trusts exactly these certificates instead of the platform store.
+    /// The certificates to trust instead of the platform store.
     ///
     /// Each entry is DER or PEM, so a whole bundle of roots may be one entry.
-    pub fn roots(mut self, roots: Vec<Vec<u8>>) -> Self {
-        self.roots = Some(roots);
-        self
-    }
+    pub roots: Option<Vec<Vec<u8>>>,
 
-    /// Uses an ECH configuration list when dialling `host`.
+    /// The ECH configuration list to use when dialling each host.
     ///
-    /// A host of `*` applies wherever no exact entry matches. The list is what
-    /// [`EchKeys::config_list`] produces.
+    /// A host of `*` applies wherever no exact entry matches. Each list is
+    /// what [`EchKeys::config_list`] produces.
     ///
-    /// [`EchKeys::config_list`]: crate::api::tls::EchKeys::config_list
-    pub fn ech(mut self, host: &str, config_list: Vec<u8>) -> Self {
-        self.ech.insert(host.to_owned(), config_list);
-        self
-    }
+    /// [`EchKeys::config_list`]: crate::tls::EchKeys::config_list
+    pub ech: std::collections::HashMap<String, Vec<u8>>,
 
     /// Whether to keep a [`CookieJar`] across requests.
-    pub fn cookies(mut self, cookies: bool) -> Self {
-        self.cookies = cookies;
-        self
-    }
+    pub cookies: bool,
 
     /// Whether to keep an [`HstsStore`] across requests.
-    pub fn hsts(mut self, hsts: bool) -> Self {
-        self.hsts = hsts;
-        self
-    }
+    pub hsts: bool,
+}
 
-    /// Builds the client.
-    pub fn build(self) -> Client {
-        let limits = self.limits.unwrap_or_default();
-
-        Client {
-            version: self.version,
-            limits,
-            secure: self.secure,
-            roots: self.roots,
-            ech: self.ech,
-            jar: self.cookies.then(|| Arc::new(CookieJar::new().with_limits(limits))),
-            store: self.hsts.then(|| Arc::new(HstsStore::new().with_limits(limits))),
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            versions: VERSIONS.to_vec(),
+            limits: ClientLimits::default(),
+            secure: true,
+            roots: None,
+            ech: std::collections::HashMap::new(),
+            cookies: true,
+            hsts: true,
         }
     }
 }
 
-impl Default for ClientBuilder {
+/// The limits a client applies on top of the per-message [`Limits`].
+#[derive(Debug, Clone)]
+pub struct ClientLimits {
+    /// The limits each connection holds itself to.
+    pub message: Limits,
+    /// In seconds, how long establishing one connection may take, TLS
+    /// handshake included. Zero waits forever.
+    pub connection_timeout: f64,
+}
+
+impl Default for ClientLimits {
     fn default() -> Self {
-        Self::new()
+        Self { message: Limits::default(), connection_timeout: 10.0 }
     }
 }
 
@@ -135,39 +110,34 @@ impl Default for ClientBuilder {
 /// [`Client::fetch`] dials, exchanges, and closes. Use [`Client::connect`] or
 /// [`Client::open`] to hold a connection open yourself.
 pub struct Client {
-    version: Option<Version>,
-    limits: Limits,
-    secure: bool,
-    roots: Option<Vec<Vec<u8>>>,
-    ech: std::collections::HashMap<String, Vec<u8>>,
-    jar: Option<Arc<CookieJar>>,
-    store: Option<Arc<HstsStore>>,
+    /// How this client is configured.
+    pub config: ClientConfig,
+    /// The cookie jar, unless [`ClientConfig::cookies`] turned it off.
+    pub jar: Option<Arc<CookieJar>>,
+    /// The HSTS store, unless [`ClientConfig::hsts`] turned it off.
+    pub store: Option<Arc<HstsStore>>,
+}
+
+impl Default for Client {
+    fn default() -> Self {
+        Self::new(ClientConfig::default())
+    }
 }
 
 impl Client {
-    /// A builder for a client.
-    pub fn builder() -> ClientBuilder {
-        ClientBuilder::new()
+    /// A client with this configuration.
+    pub fn new(config: ClientConfig) -> Self {
+        let jar = config.cookies.then(|| Arc::new(CookieJar::new().with_limits(config.limits.message)));
+        let store = config.hsts.then(|| Arc::new(HstsStore::new().with_limits(config.limits.message)));
+
+        Self { config, jar, store }
     }
 
     /// The ECH configuration list to use for a host, if one was configured.
     ///
     /// Falls back to the `*` entry.
     pub fn ech(&self, host: &str) -> Option<&Vec<u8>> {
-        self.ech.get(host).or_else(|| self.ech.get("*"))
-    }
-
-    /// The limits every connection this client makes holds itself to.
-    pub fn limits(&self) -> &Limits {
-        &self.limits
-    }
-
-    /// The versions this client will offer, in order of preference.
-    pub fn versions(&self) -> Vec<Version> {
-        match self.version {
-            Some(version) => vec![version],
-            None => PREFERENCE.to_vec(),
-        }
+        self.config.ech.get(host).or_else(|| self.config.ech.get("*"))
     }
 
     /// The identifier given to a connection to this host and port.
@@ -179,40 +149,46 @@ impl Client {
     ///
     /// The port decides the transport, and so the versions available: QUIC
     /// carries HTTP/3, TCP carries HTTP/1.1 or HTTP/2 over TLS when
-    /// [`ClientBuilder::secure`] is set, and a Unix socket is always plaintext.
+    /// [`ClientConfig::secure`] is set, and a Unix socket is always plaintext.
+    /// The whole dial, TLS handshake included, is held to
+    /// [`ClientLimits::connection_timeout`].
     ///
     /// # Errors
     ///
     /// Returns [`Error::Io`] when the transport cannot be established,
-    /// [`Error::Tls`] when the handshake fails, and [`Error::Version`] when no
-    /// usable version is agreed.
+    /// [`Error::Tls`] when the handshake fails, [`Error::Version`] when no
+    /// usable version is agreed, and [`Error::Timeout`] when the dial takes too
+    /// long.
     pub async fn connect(&self, host: &str, target: Port) -> Result<AnyConnection, Error> {
         let id = self.id(host, &target);
 
-        match target {
-            Port::QUIC(port) => self.connect_quic(host, port, id).await,
+        common::within(self.config.limits.connection_timeout, async move {
+            match target {
+                Port::QUIC(port) => self.connect_quic(host, port, id).await,
 
-            Port::TCP(port) => {
-                let transport = TcpStream::connect((host, port)).await?;
-                self.connect_stream(host, Box::new(transport), id).await
-            }
+                Port::TCP(port) => {
+                    let transport = TcpStream::connect((host, port)).await?;
+                    self.connect_stream(host, Box::new(transport), id).await
+                }
 
-            Port::UDS(ref path) => {
-                let transport = UnixStream::connect(path).await?;
-                self.assemble(self.prior_version(), Box::new(transport), id).await
+                Port::UDS(ref path) => {
+                    let transport = UnixStream::connect(path).await?;
+                    self.assemble(self.prior_version(), Box::new(transport), id).await
+                }
             }
-        }
+        })
+        .await?
     }
 
     /// Builds a connection over a transport the caller already has.
     ///
-    /// Wraps it in TLS when [`ClientBuilder::secure`] is set.
+    /// Wraps it in TLS when [`ClientConfig::secure`] is set.
     ///
     /// # Errors
     ///
     /// As [`Client::connect_stream_tls`] and [`Client::assemble`].
     pub async fn connect_stream(&self, host: &str, transport: Box<dyn Transport>, id: ConnectionID) -> Result<AnyConnection, Error> {
-        if !self.secure {
+        if !self.config.secure {
             return self.assemble(self.prior_version(), transport, id).await;
         }
 
@@ -230,12 +206,12 @@ impl Client {
     /// or when nothing usable is negotiated, and [`Error::Tls`] when the
     /// handshake fails.
     pub async fn connect_stream_tls(&self, host: &str, transport: Box<dyn Transport>, id: ConnectionID) -> Result<AnyConnection, Error> {
-        let versions: Vec<Version> = self.versions().into_iter().filter(|version| version.major() != 3).collect();
+        let versions: Vec<Version> = self.config.versions.iter().copied().filter(|version| version.major() != 3).collect();
         if versions.is_empty() {
             return Err(Error::Version("HTTP/3 needs a QUIC port".into()));
         }
 
-        let connector = tls::client_config(self.roots.as_deref().unwrap_or(&[]), &versions)?;
+        let connector = tls::client_config(self.config.roots.as_deref().unwrap_or(&[]), &versions)?;
         let mut config = connector.configure().map_err(|err| Error::Tls(err.to_string()))?;
 
         if let Some(list) = self.ech(host) {
@@ -274,11 +250,11 @@ impl Client {
 
         let mut settings = tokio_quiche::settings::QuicSettings::default();
         settings.alpn = vec![Version::V3_0.alpn().as_bytes().to_vec()];
-        settings.max_idle_timeout = crate::protocol::common::duration(self.limits.read_timeout);
+        settings.max_idle_timeout = crate::protocol::common::duration(self.config.limits.message.read_timeout);
         settings.enable_dgram = false;
 
         let hooks = tokio_quiche::settings::Hooks {
-            connection_hook: Some(std::sync::Arc::new(tls::QuicClientTls { roots: self.roots.clone().unwrap_or_default() })),
+            connection_hook: Some(std::sync::Arc::new(tls::QuicClientTls { roots: self.config.roots.clone().unwrap_or_default() })),
         };
 
         let params = tokio_quiche::ConnectionParams::new_client(
@@ -287,7 +263,7 @@ impl Client {
             hooks,
         );
 
-        let session = H3Session::new(crate::models::Role::UserAgent, id, self.limits);
+        let session = H3Session::new(crate::models::Role::UserAgent, id, self.config.limits.message);
         let (mut connection, worker) = H3Connection::pair(session, None);
         let quic = tokio_quiche::quic::connect_with_config(socket, Some(host), &params, worker)
             .await
@@ -299,9 +275,12 @@ impl Client {
 
     /// The version to use where nothing can be negotiated.
     ///
-    /// Whatever the builder was told, or HTTP/1.1.
+    /// Whatever [`ClientConfig::versions`] pinned, or HTTP/1.1.
     pub fn prior_version(&self) -> Version {
-        self.version.unwrap_or(Version::V1_1)
+        match self.config.versions[..] {
+            [version] if version.major() != 3 => version,
+            _ => Version::V1_1,
+        }
     }
 
     /// Wraps a transport in the connection type for a version.
@@ -315,9 +294,9 @@ impl Client {
 
         match version {
             Version::V1_0 | Version::V1_1 => {
-                Ok(AnyConnection::H1(H1Connection::new(transport, role, id, self.limits)))
+                Ok(AnyConnection::H1(H1Connection::new(transport, role, id, self.config.limits.message)))
             }
-            Version::V2_0 => Ok(AnyConnection::H2(H2Connection::new(transport, role, id, self.limits))),
+            Version::V2_0 => Ok(AnyConnection::H2(H2Connection::new(transport, role, id, self.config.limits.message))),
             Version::V3_0 => Err(Error::Version("HTTP/3 needs a QUIC port".into())),
         }
     }
@@ -342,25 +321,17 @@ impl Client {
         }
     }
 
-    /// The cookie jar, unless cookies were turned off.
-    pub fn jar(&self) -> Option<&Arc<CookieJar>> {
-        self.jar.as_ref()
-    }
-
-    /// The HSTS store, unless HSTS was turned off.
-    pub fn store(&self) -> Option<&Arc<HstsStore>> {
-        self.store.as_ref()
-    }
-
-    /// Whether this client dials QUIC rather than TCP.
-    pub fn prefers_h3(&self) -> bool {
-        self.version == Some(Version::V3_0)
+    /// Whether HTTP/3 is the only version on offer, and so QUIC the only
+    /// transport to dial.
+    pub fn only_h3(&self) -> bool {
+        self.config.versions.contains(&Version::V3_0) && self.config.versions.iter().all(|version| version.major() == 3)
     }
 
     /// Opens a connection for a URL, taking the transport from its scheme.
     ///
-    /// A secure scheme dials QUIC when the client is pinned to HTTP/3, and TLS
-    /// over TCP otherwise. An insecure scheme dials plain TCP.
+    /// A secure scheme dials QUIC when the client offers only HTTP/3, and TLS
+    /// over TCP otherwise. An insecure scheme dials plain TCP. The whole dial
+    /// is held to [`ClientLimits::connection_timeout`].
     ///
     /// # Errors
     ///
@@ -368,17 +339,20 @@ impl Client {
     pub async fn open(&self, url: &Url) -> Result<AnyConnection, Error> {
         let id = self.id(&url.host, &Port::TCP(url.port));
 
-        if !url.secure() {
+        common::within(self.config.limits.connection_timeout, async move {
+            if !url.secure() {
+                let transport = TcpStream::connect((url.host.as_str(), url.port)).await?;
+                return self.assemble(self.prior_version(), Box::new(transport), id).await;
+            }
+
+            if self.only_h3() {
+                return self.connect_quic(&url.host, url.port, id).await;
+            }
+
             let transport = TcpStream::connect((url.host.as_str(), url.port)).await?;
-            return self.assemble(self.prior_version(), Box::new(transport), id).await;
-        }
-
-        if self.prefers_h3() {
-            return self.connect_quic(&url.host, url.port, id).await;
-        }
-
-        let transport = TcpStream::connect((url.host.as_str(), url.port)).await?;
-        self.connect_stream_tls(&url.host, Box::new(transport), id).await
+            self.connect_stream_tls(&url.host, Box::new(transport), id).await
+        })
+        .await?
     }
 
     /// Upgrades a URL to its secure scheme when the store says the host insists.
@@ -511,22 +485,5 @@ impl Client {
 
         let connection = self.open(&url).await?;
         connection.open_websocket(&url.authority(), &url.target).await
-    }
-}
-
-/// The limits a client applies on top of the per-message [`Limits`].
-#[derive(Debug, Clone)]
-pub struct ClientLimits {
-    /// The limits each connection holds itself to.
-    pub message: Limits,
-    /// In seconds, how long to wait for a connection to be established.
-    pub connection_timeout: f64,
-    /// The number of connections kept for reuse (HTTP/2 sessions, keep-alive).
-    pub max_connections: u32,
-}
-
-impl Default for ClientLimits {
-    fn default() -> Self {
-        Self { message: Limits::default(), connection_timeout: 10.0, max_connections: 65536 }
     }
 }

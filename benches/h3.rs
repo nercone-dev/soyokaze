@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bytes::Bytes;
 
 use soyokaze::helpers::hpack::HeaderField;
-use soyokaze::models::{Body, ConnectionID, Headers, Limits, Message, Role, StreamID, Version};
+use soyokaze::api::common::Limits;
+use soyokaze::models::{Body, ConnectionID, Headers, Message, Role, StreamID, Version};
 use soyokaze::protocol::h3::{Frame, H3Connection, H3Session, Settings, StreamState};
 use support::{opaque, Group};
 

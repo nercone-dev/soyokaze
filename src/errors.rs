@@ -24,7 +24,7 @@ pub enum Error {
     Protocol(String),
     /// The peer went past one of the ceilings in [`Limits`].
     ///
-    /// [`Limits`]: crate::models::Limits
+    /// [`Limits`]: crate::api::common::Limits
     Limit(String),
     /// One stream failed, with the error code to reset it by.
     ///

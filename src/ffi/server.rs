@@ -7,12 +7,12 @@
 use bytes::Bytes;
 
 use crate::api::server::{Handler, Server, ServerHandle};
-use crate::api::tls::Identity;
+use crate::tls::Identity;
 use crate::ffi::errors::{ErrorHandle, Status};
 use crate::ffi::models::Port;
 use crate::ffi::{borrow, Runtime};
 use crate::models::{Body, Message, Version};
-use crate::protocol::common::{AnyConnection, Connection};
+use crate::protocol::base::{AnyConnection, Connection};
 
 /// Answers one request.
 ///
@@ -37,9 +37,6 @@ pub struct CallbackHandler {
     pub context: *mut std::ffi::c_void,
 }
 
-// The context is opaque to this library, which only ever hands it back to the
-// callback that supplied it. Making it shareable is the caller's undertaking,
-// stated on `soyokaze_server_serve`.
 unsafe impl Send for CallbackHandler {}
 unsafe impl Sync for CallbackHandler {}
 
@@ -129,18 +126,17 @@ impl ServerConfig {
     /// The certificate and key pointers must each either be null or point to
     /// their stated number of readable octets.
     pub unsafe fn build(&self) -> Server {
-        let mut builder = Server::builder()
-            .max_connections(self.max_connections)
-            .max_connections_per_ip(self.max_connections_per_ip)
-            .reuseport(self.reuseport);
+        let mut config = crate::api::server::ServerConfig::default();
+        config.limits.max_connections = self.max_connections;
+        config.limits.max_connections_per_ip = self.max_connections_per_ip;
+        config.reuseport = self.reuseport;
 
-        if let (Some(certificate), Some(key)) =
-            (unsafe { borrow(self.certificate, self.certificate_len) }, unsafe { borrow(self.key, self.key_len) })
+        if let (Some(certificate), Some(key)) = (unsafe { borrow(self.certificate, self.certificate_len) }, unsafe { borrow(self.key, self.key_len) })
         {
-            builder = builder.with_identity(Identity::new(vec![certificate.to_vec()], key.to_vec()));
+            config.identity = Some(Identity::new(vec![certificate.to_vec()], key.to_vec()));
         }
 
-        builder.build()
+        Server::new(config)
     }
 }
 
@@ -188,16 +184,7 @@ pub unsafe extern "C" fn soyokaze_server_free(server: *mut Server) {
 /// must point to `port_count` readable [`Port`] values whose own pointers are
 /// valid, and `out` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_server_serve(
-    runtime: *mut Runtime,
-    server: *const Server,
-    on_request: OnRequest,
-    context: *mut std::ffi::c_void,
-    ports: *const Port,
-    port_count: usize,
-    out: *mut *mut ServerHandle,
-    error: *mut *mut ErrorHandle,
-) -> Status {
+pub unsafe extern "C" fn soyokaze_server_serve(runtime: *mut Runtime, server: *const Server, on_request: OnRequest, context: *mut std::ffi::c_void, ports: *const Port, port_count: usize, out: *mut *mut ServerHandle, error: *mut *mut ErrorHandle,) -> Status {
     let (Some(runtime), Some(server)) = (unsafe { runtime.as_ref() }, unsafe { server.as_ref() }) else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
@@ -271,12 +258,7 @@ pub unsafe extern "C" fn soyokaze_server_handle_close(runtime: *mut Runtime, han
 ///
 /// `body` must either be null or point to `body_len` readable octets.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_response_with_body(
-    status_code: u16,
-    version: Version,
-    body: *const u8,
-    body_len: usize,
-) -> *mut Message {
+pub unsafe extern "C" fn soyokaze_response_with_body(status_code: u16, version: Version, body: *const u8, body_len: usize) -> *mut Message {
     let mut response = Message::response(status_code, version);
 
     if let Some(body) = unsafe { borrow(body, body_len) } {

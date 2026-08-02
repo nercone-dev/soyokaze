@@ -3,8 +3,9 @@ mod support;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use soyokaze::models::{Body, ConnectionID, Limits, Message, Role, Version};
-use soyokaze::protocol::common::Connection;
+use soyokaze::api::common::Limits;
+use soyokaze::models::{Body, ConnectionID, Message, Role, Version};
+use soyokaze::protocol::base::Connection;
 use soyokaze::protocol::h1::H1Connection;
 use support::{opaque, Group};
 

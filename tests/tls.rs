@@ -1,10 +1,10 @@
 use bytes::Bytes;
 
-use soyokaze::api::tls;
+use soyokaze::tls;
 use soyokaze::helpers::base64;
 use soyokaze::models::{Body, ConnectionID, Message, Method, Port, Version};
-use soyokaze::protocol::common::{AnyConnection, Connection};
-use soyokaze::{Client, Format, Handler, Identity, Server};
+use soyokaze::protocol::base::{AnyConnection, Connection};
+use soyokaze::{Client, ClientConfig, Format, Handler, Identity, Server, ServerConfig};
 
 /// An EC P-256 key in SEC1 (RFC 5915), as `openssl ecparam -genkey` writes it.
 const EC_SEC1: &str = "\
@@ -341,15 +341,15 @@ impl Handler for Echo {
 }
 
 fn exchange(identity: Identity, roots: Vec<Vec<u8>>, version: Version, port: Port) -> Message {
-    let server = Server::builder().version(version).with_identity(identity).build();
+    let server = Server::new(ServerConfig { versions: vec![version], identity: Some(identity), ..ServerConfig::default() });
 
-    let cluster = server.serve_workers(Echo, std::slice::from_ref(&port), 1).expect("the port did not open");
+    let cluster = server.run(Echo, std::slice::from_ref(&port), 1).expect("the port did not open");
     let address = cluster.address().expect("the cluster has no address");
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("no runtime");
 
     let response = runtime.block_on(async move {
-        let client = Client::builder().version(version).roots(roots).build();
+        let client = Client::new(ClientConfig { versions: vec![version], roots: Some(roots), ..ClientConfig::default() });
 
         let target = match port {
             Port::QUIC(_) => Port::QUIC(address.port()),
@@ -399,14 +399,18 @@ fn a_pkcs12_identity_serves_tls() {
     let archive = base64::decode(BUNDLE_PKCS12).expect("the archive is not Base64");
     let identity = Identity::from_pkcs12(&archive, "secret").expect("the archive did not open");
 
-    let server = Server::builder().version(Version::V1_1).with_identity(identity).build();
-    let cluster = server.serve_workers(Echo, &[Port::TCP(0)], 1).expect("the port did not open");
+    let server = Server::new(ServerConfig { versions: vec![Version::V1_1], identity: Some(identity), ..ServerConfig::default() });
+    let cluster = server.run(Echo, &[Port::TCP(0)], 1).expect("the port did not open");
     let port = cluster.address().expect("the cluster has no address").port();
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("no runtime");
 
     let response = runtime.block_on(async move {
-        let client = Client::builder().version(Version::V1_1).roots(vec![LEAF.as_bytes().to_vec()]).build();
+        let client = Client::new(ClientConfig {
+            versions: vec![Version::V1_1],
+            roots: Some(vec![LEAF.as_bytes().to_vec()]),
+            ..ClientConfig::default()
+        });
 
         let transport = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.expect("the port refused a connection");
         let id = ConnectionID(Bytes::from_static(b"test"));

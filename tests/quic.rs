@@ -1,10 +1,10 @@
 use bytes::Bytes;
 
 use soyokaze::models::{Body, ConnectionID, Message, Method, Port, Version};
-use soyokaze::protocol::common::{AnyConnection, Connection};
+use soyokaze::protocol::base::{AnyConnection, Connection};
 use soyokaze::protocol::h3;
 use soyokaze::websocket::{CloseCode, Opcode};
-use soyokaze::{Client, Handler, Server};
+use soyokaze::{Client, ClientConfig, Handler, Identity, Server, ServerConfig};
 
 #[derive(Clone)]
 struct Echo;
@@ -47,18 +47,23 @@ fn many_requests_share_one_quic_connection() {
 
     let certificate = certificate();
 
-    let server = Server::builder()
-        .version(Version::V3_0)
-        .identity(vec![certificate.der.clone()], certificate.key)
-        .build();
+    let server = Server::new(ServerConfig {
+        versions: vec![Version::V3_0],
+        identity: Some(Identity::new(vec![certificate.der.clone()], certificate.key)),
+        ..ServerConfig::default()
+    });
 
-    let cluster = server.serve_workers(Echo, &[Port::QUIC(0)], 1).expect("the QUIC port did not open");
+    let cluster = server.run(Echo, &[Port::QUIC(0)], 1).expect("the QUIC port did not open");
     let port = cluster.address().expect("the cluster has no address").port();
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("no runtime");
 
     let answered = runtime.block_on(async move {
-        let client = Client::builder().version(Version::V3_0).roots(vec![certificate.der]).build();
+        let client = Client::new(ClientConfig {
+            versions: vec![Version::V3_0],
+            roots: Some(vec![certificate.der]),
+            ..ClientConfig::default()
+        });
 
         let id = ConnectionID(Bytes::from_static(b"test"));
         let mut connection = client
@@ -117,18 +122,23 @@ fn a_websocket_over_quic_survives_more_writes_than_it_can_buffer() {
 
     let certificate = certificate();
 
-    let server = Server::builder()
-        .version(Version::V3_0)
-        .identity(vec![certificate.der.clone()], certificate.key)
-        .build();
+    let server = Server::new(ServerConfig {
+        versions: vec![Version::V3_0],
+        identity: Some(Identity::new(vec![certificate.der.clone()], certificate.key)),
+        ..ServerConfig::default()
+    });
 
-    let cluster = server.serve_workers(Tunnel, &[Port::QUIC(0)], 1).expect("the QUIC port did not open");
+    let cluster = server.run(Tunnel, &[Port::QUIC(0)], 1).expect("the QUIC port did not open");
     let port = cluster.address().expect("the cluster has no address").port();
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("no runtime");
 
     let echoed = runtime.block_on(async move {
-        let client = Client::builder().version(Version::V3_0).roots(vec![certificate.der]).build();
+        let client = Client::new(ClientConfig {
+            versions: vec![Version::V3_0],
+            roots: Some(vec![certificate.der]),
+            ..ClientConfig::default()
+        });
 
         let id = ConnectionID(Bytes::from_static(b"test"));
         let connection = client

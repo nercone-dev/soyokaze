@@ -2,8 +2,10 @@ use bytes::BytesMut;
 use tokio::io::AsyncWriteExt;
 
 use soyokaze::helpers::hpack::HeaderField;
-use soyokaze::models::{Body, ConnectionID, Headers, Limits, Message, Method, Role, StreamID, Version};
-use soyokaze::protocol::common::{self, Connection};
+use soyokaze::api::common::Limits;
+use soyokaze::models::{Body, ConnectionID, Headers, Message, Method, Role, StreamID, Version};
+use soyokaze::protocol::base::Connection;
+use soyokaze::protocol::common;
 use soyokaze::protocol::h2::{self, Frame, FrameHeader, FrameType, H2Connection, Settings, StreamState};
 use soyokaze::Error;
 

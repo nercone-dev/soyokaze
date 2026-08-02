@@ -26,10 +26,12 @@ use bytes::{Bytes, BytesMut};
 use tokio_quiche::quic::{HandshakeInfo, QuicheConnection};
 use tokio_quiche::{ApplicationOverQuic, BoxError, QuicResult};
 
+use crate::api::common::Limits;
 use crate::helpers::hpack::HeaderField;
 use crate::helpers::qpack::{self, Decoder, DecoderInstruction, Encoder, EncoderInstruction};
-use crate::models::{Body, ConnectionID, Headers, Limits, Message, Method, Role, StreamID, Version};
-use crate::protocol::common::{self, Connection, Error};
+use crate::models::{Body, ConnectionID, Headers, Message, Method, Role, StreamID, Version};
+use crate::protocol::base::Connection;
+use crate::protocol::common::{self, Error};
 
 /// `SETTINGS_QPACK_MAX_TABLE_CAPACITY`: the QPACK dynamic table ceiling.
 pub const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;

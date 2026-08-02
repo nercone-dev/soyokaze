@@ -12,9 +12,9 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::api::common::Limits;
 use crate::helpers::sync::lock;
 use crate::helpers::text::Text;
-use crate::models::Limits;
 
 /// Appends as much of `part` to `out` as fits, advancing `written`.
 ///

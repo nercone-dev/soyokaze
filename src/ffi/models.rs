@@ -71,12 +71,7 @@ impl Port {
 ///
 /// `url` must point to `url_len` readable octets, and `out` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_url_parse(
-    url: *const u8,
-    url_len: usize,
-    out: *mut *mut Url,
-    error: *mut *mut ErrorHandle,
-) -> Status {
+pub unsafe extern "C" fn soyokaze_url_parse(url: *const u8, url_len: usize, out: *mut *mut Url, error: *mut *mut ErrorHandle) -> Status {
     if out.is_null() {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     }
@@ -179,12 +174,7 @@ pub unsafe extern "C" fn soyokaze_url_authority(url: *const Url) -> Buffer {
 /// `target` must point to `target_len` readable octets. Returns null when it is
 /// not UTF-8.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_message_request(
-    method: Method,
-    target: *const u8,
-    target_len: usize,
-    version: Version,
-) -> *mut Message {
+pub unsafe extern "C" fn soyokaze_message_request(method: Method, target: *const u8, target_len: usize, version: Version) -> *mut Message {
     match unsafe { borrow_text(target, target_len) } {
         Some(target) => Box::into_raw(Box::new(Message::request(method, target, version))),
         None => std::ptr::null_mut(),
@@ -370,15 +360,8 @@ pub unsafe extern "C" fn soyokaze_message_header(message: *const Message, name: 
 /// `message` must either be null or be a handle that has not been freed, and
 /// `name` and `value` must point to their stated number of readable octets.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_message_append_header(
-    message: *mut Message,
-    name: *const u8,
-    name_len: usize,
-    value: *const u8,
-    value_len: usize,
-) -> bool {
-    let (Some(message), Some(name), Some(value)) =
-        (unsafe { message.as_mut() }, unsafe { borrow_text(name, name_len) }, unsafe { borrow_text(value, value_len) })
+pub unsafe extern "C" fn soyokaze_message_append_header(message: *mut Message, name: *const u8, name_len: usize, value: *const u8, value_len: usize) -> bool {
+    let (Some(message), Some(name), Some(value)) = (unsafe { message.as_mut() }, unsafe { borrow_text(name, name_len) }, unsafe { borrow_text(value, value_len) })
     else {
         return false;
     };
@@ -395,15 +378,8 @@ pub unsafe extern "C" fn soyokaze_message_append_header(
 ///
 /// As [`soyokaze_message_append_header`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_message_insert_header(
-    message: *mut Message,
-    name: *const u8,
-    name_len: usize,
-    value: *const u8,
-    value_len: usize,
-) -> bool {
-    let (Some(message), Some(name), Some(value)) =
-        (unsafe { message.as_mut() }, unsafe { borrow_text(name, name_len) }, unsafe { borrow_text(value, value_len) })
+pub unsafe extern "C" fn soyokaze_message_insert_header(message: *mut Message, name: *const u8, name_len: usize, value: *const u8, value_len: usize) -> bool {
+    let (Some(message), Some(name), Some(value)) = (unsafe { message.as_mut() }, unsafe { borrow_text(name, name_len) }, unsafe { borrow_text(value, value_len) })
     else {
         return false;
     };
@@ -504,12 +480,7 @@ pub unsafe extern "C" fn soyokaze_message_body_len(message: *const Message) -> i
 /// `runtime` and `message` must be handles that have not been freed, and `out`
 /// must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_message_body(
-    runtime: *mut Runtime,
-    message: *const Message,
-    out: *mut Buffer,
-    error: *mut *mut ErrorHandle,
-) -> Status {
+pub unsafe extern "C" fn soyokaze_message_body(runtime: *mut Runtime, message: *const Message, out: *mut Buffer, error: *mut *mut ErrorHandle) -> Status {
     let (Some(runtime), Some(message)) = (unsafe { runtime.as_ref() }, unsafe { message.as_ref() }) else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };

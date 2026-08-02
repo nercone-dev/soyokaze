@@ -9,7 +9,7 @@ use crate::ffi::errors::{ErrorHandle, Status};
 use crate::ffi::models::Port;
 use crate::ffi::{borrow_text, Runtime};
 use crate::models::{Message, Method, Url, Version};
-use crate::protocol::common::{AnyConnection, Connection};
+use crate::protocol::base::{AnyConnection, Connection};
 
 /// How a [`Client`] is configured.
 ///
@@ -45,13 +45,18 @@ impl ClientConfig {
 
     /// The [`Client`] this configures.
     pub fn build(&self) -> Client {
-        let mut builder = Client::builder().secure(self.secure).cookies(self.cookies).hsts(self.hsts);
+        let mut config = crate::api::client::ClientConfig {
+            secure: self.secure,
+            cookies: self.cookies,
+            hsts: self.hsts,
+            ..crate::api::client::ClientConfig::default()
+        };
 
         if let Some(version) = self.version() {
-            builder = builder.version(version);
+            config.versions = vec![version];
         }
 
-        builder.build()
+        Client::new(config)
     }
 }
 
@@ -96,20 +101,10 @@ pub unsafe extern "C" fn soyokaze_client_free(client: *mut Client) {
 /// point to `url_len` readable octets, `request` must either be null or be a
 /// message handle the caller owns, and `out` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_client_fetch(
-    runtime: *mut Runtime,
-    client: *const Client,
-    method: Method,
-    url: *const u8,
-    url_len: usize,
-    request: *mut Message,
-    out: *mut *mut Message,
-    error: *mut *mut ErrorHandle,
-) -> Status {
+pub unsafe extern "C" fn soyokaze_client_fetch(runtime: *mut Runtime, client: *const Client, method: Method, url: *const u8, url_len: usize, request: *mut Message, out: *mut *mut Message, error: *mut *mut ErrorHandle) -> Status {
     let request = (!request.is_null()).then(|| *unsafe { Box::from_raw(request) });
 
-    let (Some(runtime), Some(client), Some(url)) =
-        (unsafe { runtime.as_ref() }, unsafe { client.as_ref() }, unsafe { borrow_text(url, url_len) })
+    let (Some(runtime), Some(client), Some(url)) = (unsafe { runtime.as_ref() }, unsafe { client.as_ref() }, unsafe { borrow_text(url, url_len) })
     else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
@@ -138,14 +133,7 @@ pub unsafe extern "C" fn soyokaze_client_fetch(
 ///
 /// As [`soyokaze_client_fetch`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_client_get(
-    runtime: *mut Runtime,
-    client: *const Client,
-    url: *const u8,
-    url_len: usize,
-    out: *mut *mut Message,
-    error: *mut *mut ErrorHandle,
-) -> Status {
+pub unsafe extern "C" fn soyokaze_client_get(runtime: *mut Runtime, client: *const Client, url: *const u8, url_len: usize, out: *mut *mut Message, error: *mut *mut ErrorHandle) -> Status {
     unsafe { soyokaze_client_fetch(runtime, client, Method::GET, url, url_len, std::ptr::null_mut(), out, error) }
 }
 
@@ -155,14 +143,7 @@ pub unsafe extern "C" fn soyokaze_client_get(
 ///
 /// As [`soyokaze_client_fetch`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_client_head(
-    runtime: *mut Runtime,
-    client: *const Client,
-    url: *const u8,
-    url_len: usize,
-    out: *mut *mut Message,
-    error: *mut *mut ErrorHandle,
-) -> Status {
+pub unsafe extern "C" fn soyokaze_client_head(runtime: *mut Runtime, client: *const Client, url: *const u8, url_len: usize, out: *mut *mut Message, error: *mut *mut ErrorHandle) -> Status {
     unsafe { soyokaze_client_fetch(runtime, client, Method::HEAD, url, url_len, std::ptr::null_mut(), out, error) }
 }
 
@@ -172,15 +153,7 @@ pub unsafe extern "C" fn soyokaze_client_head(
 ///
 /// As [`soyokaze_client_fetch`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_client_post(
-    runtime: *mut Runtime,
-    client: *const Client,
-    url: *const u8,
-    url_len: usize,
-    request: *mut Message,
-    out: *mut *mut Message,
-    error: *mut *mut ErrorHandle,
-) -> Status {
+pub unsafe extern "C" fn soyokaze_client_post(runtime: *mut Runtime, client: *const Client, url: *const u8, url_len: usize, request: *mut Message, out: *mut *mut Message, error: *mut *mut ErrorHandle) -> Status {
     unsafe { soyokaze_client_fetch(runtime, client, Method::POST, url, url_len, request, out, error) }
 }
 
@@ -190,15 +163,7 @@ pub unsafe extern "C" fn soyokaze_client_post(
 ///
 /// As [`soyokaze_client_fetch`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_client_put(
-    runtime: *mut Runtime,
-    client: *const Client,
-    url: *const u8,
-    url_len: usize,
-    request: *mut Message,
-    out: *mut *mut Message,
-    error: *mut *mut ErrorHandle,
-) -> Status {
+pub unsafe extern "C" fn soyokaze_client_put(runtime: *mut Runtime, client: *const Client, url: *const u8, url_len: usize, request: *mut Message, out: *mut *mut Message, error: *mut *mut ErrorHandle) -> Status {
     unsafe { soyokaze_client_fetch(runtime, client, Method::PUT, url, url_len, request, out, error) }
 }
 
@@ -208,14 +173,7 @@ pub unsafe extern "C" fn soyokaze_client_put(
 ///
 /// As [`soyokaze_client_fetch`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_client_delete(
-    runtime: *mut Runtime,
-    client: *const Client,
-    url: *const u8,
-    url_len: usize,
-    out: *mut *mut Message,
-    error: *mut *mut ErrorHandle,
-) -> Status {
+pub unsafe extern "C" fn soyokaze_client_delete(runtime: *mut Runtime, client: *const Client, url: *const u8, url_len: usize, out: *mut *mut Message, error: *mut *mut ErrorHandle) -> Status {
     unsafe { soyokaze_client_fetch(runtime, client, Method::DELETE, url, url_len, std::ptr::null_mut(), out, error) }
 }
 
@@ -226,15 +184,8 @@ pub unsafe extern "C" fn soyokaze_client_delete(
 /// `runtime`, `client` and `url` must be handles that have not been freed, and
 /// `out` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_client_open(
-    runtime: *mut Runtime,
-    client: *const Client,
-    url: *const Url,
-    out: *mut *mut AnyConnection,
-    error: *mut *mut ErrorHandle,
-) -> Status {
-    let (Some(runtime), Some(client), Some(url)) =
-        (unsafe { runtime.as_ref() }, unsafe { client.as_ref() }, unsafe { url.as_ref() })
+pub unsafe extern "C" fn soyokaze_client_open(runtime: *mut Runtime, client: *const Client, url: *const Url, out: *mut *mut AnyConnection, error: *mut *mut ErrorHandle) -> Status {
+    let (Some(runtime), Some(client), Some(url)) = (unsafe { runtime.as_ref() }, unsafe { client.as_ref() }, unsafe { url.as_ref() })
     else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
@@ -262,15 +213,7 @@ pub unsafe extern "C" fn soyokaze_client_open(
 /// point to `host_len` readable octets, `port` must point to a readable [`Port`]
 /// whose own pointers are valid, and `out` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_client_connect(
-    runtime: *mut Runtime,
-    client: *const Client,
-    host: *const u8,
-    host_len: usize,
-    port: *const Port,
-    out: *mut *mut AnyConnection,
-    error: *mut *mut ErrorHandle,
-) -> Status {
+pub unsafe extern "C" fn soyokaze_client_connect(runtime: *mut Runtime, client: *const Client, host: *const u8, host_len: usize, port: *const Port, out: *mut *mut AnyConnection, error: *mut *mut ErrorHandle) -> Status {
     let (Some(runtime), Some(client), Some(host), Some(port)) = (
         unsafe { runtime.as_ref() },
         unsafe { client.as_ref() },
@@ -307,22 +250,14 @@ pub unsafe extern "C" fn soyokaze_client_connect(
 /// `runtime`, `client`, `connection` and `request` must be handles that have not
 /// been freed, and `out` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_client_request(
-    runtime: *mut Runtime,
-    client: *const Client,
-    connection: *mut AnyConnection,
-    request: *mut Message,
-    out: *mut *mut Message,
-    error: *mut *mut ErrorHandle,
-) -> Status {
+pub unsafe extern "C" fn soyokaze_client_request(runtime: *mut Runtime, client: *const Client, connection: *mut AnyConnection, request: *mut Message, out: *mut *mut Message, error: *mut *mut ErrorHandle) -> Status {
     if request.is_null() {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     }
 
     let request = *unsafe { Box::from_raw(request) };
 
-    let (Some(runtime), Some(client), Some(connection)) =
-        (unsafe { runtime.as_ref() }, unsafe { client.as_ref() }, unsafe { connection.as_mut() })
+    let (Some(runtime), Some(client), Some(connection)) = (unsafe { runtime.as_ref() }, unsafe { client.as_ref() }, unsafe { connection.as_mut() })
     else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };

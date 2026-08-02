@@ -7,8 +7,8 @@ use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use soyokaze::models::{Body, Message, Port};
-use soyokaze::protocol::common::{AnyConnection, Connection};
-use soyokaze::{Cluster, Handler, Server};
+use soyokaze::protocol::base::{AnyConnection, Connection};
+use soyokaze::{Cluster, Handler, Server, ServerConfig};
 
 #[derive(Clone)]
 struct Recorder {
@@ -76,16 +76,15 @@ fn exercise(cluster: &Cluster, requests: usize) {
 
 #[test]
 fn reuseport_is_the_default() {
-    assert!(Server::builder().build().reuseport());
-    assert!(!Server::builder().reuseport(false).build().reuseport());
+    assert!(ServerConfig::default().reuseport);
 }
 
 #[test]
 fn workers_share_one_reused_port() {
     let recorder = Recorder::new();
-    let server = Server::builder().version(soyokaze::Version::V1_1).build();
+    let server = Server::new(ServerConfig { versions: vec![soyokaze::Version::V1_1], ..ServerConfig::default() });
 
-    let cluster = server.serve_workers(recorder.clone(), &[Port::TCP(0)], 4).expect("the cluster did not start");
+    let cluster = server.run(recorder.clone(), &[Port::TCP(0)], 4).expect("the cluster did not start");
 
     assert_eq!(cluster.workers(), 4);
     assert_eq!(cluster.addresses().len(), 1);
@@ -99,9 +98,13 @@ fn workers_share_one_reused_port() {
 #[test]
 fn workers_share_one_descriptor_without_reuseport() {
     let recorder = Recorder::new();
-    let server = Server::builder().version(soyokaze::Version::V1_1).reuseport(false).build();
+    let server = Server::new(ServerConfig {
+        versions: vec![soyokaze::Version::V1_1],
+        reuseport: false,
+        ..ServerConfig::default()
+    });
 
-    let cluster = server.serve_workers(recorder.clone(), &[Port::TCP(0)], 2).expect("the cluster did not start");
+    let cluster = server.run(recorder.clone(), &[Port::TCP(0)], 2).expect("the cluster did not start");
 
     assert_eq!(cluster.workers(), 2);
 
@@ -114,9 +117,9 @@ fn workers_share_one_descriptor_without_reuseport() {
 #[test]
 fn a_single_worker_still_serves() {
     let recorder = Recorder::new();
-    let server = Server::builder().version(soyokaze::Version::V1_1).build();
+    let server = Server::new(ServerConfig { versions: vec![soyokaze::Version::V1_1], ..ServerConfig::default() });
 
-    let cluster = server.serve_workers(recorder.clone(), &[Port::TCP(0)], 1).expect("the cluster did not start");
+    let cluster = server.run(recorder.clone(), &[Port::TCP(0)], 1).expect("the cluster did not start");
 
     exercise(&cluster, 4);
     cluster.close(None);
@@ -126,6 +129,6 @@ fn a_single_worker_still_serves() {
 
 #[test]
 fn a_quic_port_needs_reuseport_across_workers() {
-    let server = Server::builder().reuseport(false).build();
-    assert!(server.serve_workers(Recorder::new(), &[Port::QUIC(0)], 2).is_err());
+    let server = Server::new(ServerConfig { reuseport: false, ..ServerConfig::default() });
+    assert!(server.run(Recorder::new(), &[Port::QUIC(0)], 2).is_err());
 }

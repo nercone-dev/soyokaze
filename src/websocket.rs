@@ -18,9 +18,11 @@
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
+use crate::api::common::Limits;
 use crate::helpers::{base64, sha1};
-use crate::models::{ConnectionID, Headers, Limits, Message, Method, Role, Version};
-use crate::protocol::common::{self, AnyConnection, Buffer, Connection, Error, Transport};
+use crate::models::{ConnectionID, Headers, Message, Method, Role, Version};
+use crate::protocol::base::{AnyConnection, Connection, Transport};
+use crate::protocol::common::{self, Buffer, Error};
 
 /// The fixed string a server hashes with the client's nonce to prove it read
 /// the handshake.

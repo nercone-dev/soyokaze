@@ -2,7 +2,8 @@ use bytes::BytesMut;
 
 use soyokaze::helpers::hpack::HeaderField;
 use soyokaze::helpers::qpack::{self, DecoderInstruction, Encoder, EncoderInstruction};
-use soyokaze::models::{Body, ConnectionID, Headers, Limits, Message, Method, Role, StreamID, Version};
+use soyokaze::api::common::Limits;
+use soyokaze::models::{Body, ConnectionID, Headers, Message, Method, Role, StreamID, Version};
 use soyokaze::protocol::h3::{self, Frame, FrameType, H3Connection, H3Session, H3Worker, Settings, StreamKind};
 use soyokaze::Error;
 

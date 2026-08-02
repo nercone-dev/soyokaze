@@ -24,7 +24,7 @@ pub enum Status {
     Protocol = 2,
     /// The peer went past one of the ceilings in [`Limits`].
     ///
-    /// [`Limits`]: crate::models::Limits
+    /// [`Limits`]: crate::api::common::Limits
     Limit = 3,
     /// One stream failed; the connection itself stays usable.
     Stream = 4,

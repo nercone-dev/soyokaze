@@ -20,10 +20,12 @@ use std::ops::Range;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
+use crate::api::common::Limits;
 use crate::helpers::scan;
 use crate::helpers::text::Text;
-use crate::models::{Body, ConnectionID, HeaderCase, Headers, Limits, Message, Method, Role, Version};
-use crate::protocol::common::{self, Buffer, Connection, Error};
+use crate::models::{Body, ConnectionID, HeaderCase, Headers, Message, Method, Role, Version};
+use crate::protocol::base::Connection;
+use crate::protocol::common::{self, Buffer, Error};
 
 /// The reason phrase conventionally paired with a status code.
 ///

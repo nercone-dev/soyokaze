@@ -1,7 +1,7 @@
 //! Binding ports, accepting connections and dispatching to a handler.
 //!
-//! [`Server`] holds the configuration; [`Server::serve`] binds ports and runs
-//! an accept loop on the current runtime, and [`Server::serve_workers`] runs
+//! [`Server`] holds a [`ServerConfig`]; [`Server::serve`] binds ports and runs
+//! an accept loop on the current runtime, and [`Server::run`] runs
 //! one runtime per thread instead, each with its own listener under
 //! `SO_REUSEPORT` so the kernel spreads connections between them.
 //!
@@ -22,199 +22,88 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::net::{TcpListener, UnixListener};
 
-use crate::api::tls::{self, Identity};
+use crate::api::common::{Limits, VERSIONS};
 use crate::helpers::sync::lock;
-use crate::models::{ConnectionID, Limits, Port, Role, Version};
-use crate::protocol::common::{self, AnyConnection, Buffer, Connection, Error, Transport};
-use crate::protocol::h1::H1Connection;
-use crate::protocol::h2::{self, H2Connection};
-use crate::protocol::h3::{H3Connection, H3Session};
-
-/// A QUIC connection that has arrived but not yet been given an application.
-pub type QuicIncoming = tokio_quiche::InitialQuicConnection<tokio::net::UdpSocket, tokio_quiche::metrics::DefaultMetrics>;
-
-/// The versions a server offers when the builder was not told which.
-pub const SUPPORTED: &[Version] = &[Version::V3_0, Version::V2_0, Version::V1_1];
+use crate::models::{ConnectionID, Port, Version};
+use crate::protocol::base::{AnyConnection, Connection, Transport};
+use crate::protocol::common::{self, Error};
+use crate::protocol::handler::{Incoming, Negotiation, QuicIncoming};
+use crate::tls::{self, Identity};
 
 /// The listen backlog for a TCP socket.
 pub const BACKLOG: i32 = 1024;
 
 /// How many threads the machine can run at once, or 1 if that cannot be found.
 ///
-/// Useful as the worker count for [`Server::serve_workers`].
+/// Useful as the worker count for [`Server::run`].
 pub fn cores() -> usize {
     std::thread::available_parallelism().map(|count| count.get()).unwrap_or(1)
 }
 
-/// Builds a [`Server`].
+/// How a [`Server`] is configured.
 ///
-/// Everything has a working default: every supported version offered, no
-/// admission limits, and `SO_REUSEPORT` on.
-pub struct ServerBuilder {
-    versions: Vec<Version>,
-    limits: Option<Limits>,
-    identity: Option<Identity>,
-    ech: Option<crate::api::tls::EchKeys>,
-    max_connections: u32,
-    max_connections_per_ip: u32,
-    max_connection_rate: Vec<(f64, u32)>,
-    hsts: Option<crate::helpers::hsts::HstsPolicy>,
-    reuseport: bool,
-}
+/// Every field has a working default: every supported version offered, no
+/// admission limits, `SO_REUSEPORT` on, and no identity, which leaves a TCP
+/// port in plaintext and a QUIC port unservable.
+#[derive(Clone)]
+pub struct ServerConfig {
+    /// The versions to offer. Each port narrows this to what it can carry.
+    pub versions: Vec<Version>,
 
-impl ServerBuilder {
-    /// A builder with the defaults described on [`ServerBuilder`].
-    pub fn new() -> Self {
-        Self {
-            versions: Vec::new(),
-            limits: None,
-            identity: None,
-            ech: None,
-            max_connections: 0,
-            max_connections_per_ip: 0,
-            max_connection_rate: Vec::new(),
-            hsts: None,
-            reuseport: true,
-        }
-    }
+    /// The limits this server and every connection it accepts hold themselves
+    /// to.
+    pub limits: ServerLimits,
 
-    /// Offers one more version. Call it repeatedly to offer several.
-    ///
-    /// Offering none at all leaves [`SUPPORTED`] on offer.
-    pub fn version(mut self, version: Version) -> Self {
-        self.versions.push(version);
-        self
-    }
-
-    /// Sets the limits every connection this server accepts will hold itself to.
-    pub fn limits(mut self, limits: Limits) -> Self {
-        self.limits = Some(limits);
-        self
-    }
-
-    /// Sets the certificate chain and key to serve.
+    /// The certificate chain and key to serve.
     ///
     /// Required for TLS and for any QUIC port; without one, a TCP port is
     /// served in plaintext.
     ///
-    /// Each blob is DER or PEM, so the chain may be one PEM bundle or one
-    /// certificate per entry, and the key PKCS#8, PKCS#1 or SEC1. A PKCS#12
-    /// archive goes through [`Identity::from_pkcs12`] and then
-    /// [`ServerBuilder::with_identity`].
-    pub fn identity(self, certificates: Vec<Vec<u8>>, key: Vec<u8>) -> Self {
-        self.with_identity(Identity::new(certificates, key))
-    }
+    /// Each blob [`Identity::new`] takes is DER or PEM, so the chain may be
+    /// one PEM bundle or one certificate per entry, and the key PKCS#8, PKCS#1
+    /// or SEC1. A PKCS#12 archive goes through [`Identity::from_pkcs12`].
+    pub identity: Option<Identity>,
 
-    /// Sets the [`Identity`] to serve.
-    ///
-    /// As [`ServerBuilder::identity`], for an identity that was built rather
-    /// than assembled from loose blobs.
-    pub fn with_identity(mut self, identity: Identity) -> Self {
-        self.identity = Some(identity);
-        self
-    }
+    /// The keys to offer Encrypted Client Hello with.
+    pub ech: Option<crate::tls::EchKeys>,
 
-    /// Offers Encrypted Client Hello with these keys.
-    pub fn ech(mut self, ech: crate::api::tls::EchKeys) -> Self {
-        self.ech = Some(ech);
-        self
-    }
-
-    /// Bounds how many connections may be open at once. Zero is unbounded.
-    pub fn max_connections(mut self, max_connections: u32) -> Self {
-        self.max_connections = max_connections;
-        self
-    }
-
-    /// Bounds how many connections one address may have open. Zero is unbounded.
-    pub fn max_connections_per_ip(mut self, max_connections_per_ip: u32) -> Self {
-        self.max_connections_per_ip = max_connections_per_ip;
-        self
-    }
-
-    /// Bounds how fast one address may connect.
-    ///
-    /// Each entry is a period in seconds and how many connections are allowed
-    /// within it; every entry has to be satisfied, so several together shape
-    /// both bursts and sustained rate.
-    pub fn max_connection_rate(mut self, max_connection_rate: Vec<(f64, u32)>) -> Self {
-        self.max_connection_rate = max_connection_rate;
-        self
-    }
-
-    /// Attaches an HSTS policy to every secure response.
-    pub fn hsts(mut self, hsts: crate::helpers::hsts::HstsPolicy) -> Self {
-        self.hsts = Some(hsts);
-        self
-    }
+    /// The HSTS policy to attach to every secure response.
+    pub hsts: Option<crate::helpers::hsts::HstsPolicy>,
 
     /// Whether sockets are opened with `SO_REUSEPORT`.
     ///
-    /// On by default, and needed for [`Server::serve_workers`] to give each
+    /// On by default, and needed for [`Server::run`] to give each
     /// worker its own listener. Turning it off makes a QUIC port single-worker.
-    pub fn reuseport(mut self, reuseport: bool) -> Self {
-        self.reuseport = reuseport;
-        self
-    }
-
-    /// Builds the server.
-    pub fn build(self) -> Server {
-        Server {
-            versions: if self.versions.is_empty() { SUPPORTED.to_vec() } else { self.versions },
-            limits: self.limits.unwrap_or_default(),
-            identity: self.identity,
-            ech: self.ech,
-            max_connections: self.max_connections,
-            max_connections_per_ip: self.max_connections_per_ip,
-            max_connection_rate: self.max_connection_rate,
-            hsts: self.hsts,
-            reuseport: self.reuseport,
-        }
-    }
+    pub reuseport: bool,
 }
 
-impl Default for ServerBuilder {
+impl Default for ServerConfig {
     fn default() -> Self {
-        Self::new()
+        Self {
+            versions: VERSIONS.to_vec(),
+            limits: ServerLimits::default(),
+            identity: None,
+            ech: None,
+            hsts: None,
+            reuseport: true,
+        }
     }
 }
 
 /// An HTTP server.
 ///
-/// Holds the configuration a listener is built from. Cheap to clone, since
-/// each worker in [`Server::serve_workers`] needs its own copy.
-#[derive(Clone)]
+/// Holds the [`ServerConfig`] a listener is built from. Cheap to clone, since
+/// each worker in [`Server::run`] needs its own copy.
+#[derive(Clone, Default)]
 pub struct Server {
-    versions: Vec<Version>,
-    limits: Limits,
-    identity: Option<Identity>,
-    ech: Option<crate::api::tls::EchKeys>,
-    max_connections: u32,
-    max_connections_per_ip: u32,
-    max_connection_rate: Vec<(f64, u32)>,
-    hsts: Option<crate::helpers::hsts::HstsPolicy>,
-    reuseport: bool,
+    /// How this server is configured.
+    pub config: ServerConfig,
 }
 
 impl Server {
-    /// A builder for a server.
-    pub fn builder() -> ServerBuilder {
-        ServerBuilder::new()
-    }
-
-    /// The versions this server offers.
-    pub fn versions(&self) -> &[Version] {
-        &self.versions
-    }
-
-    /// The limits every connection this server accepts holds itself to.
-    pub fn limits(&self) -> &Limits {
-        &self.limits
-    }
-
-    /// Whether sockets are opened with `SO_REUSEPORT`.
-    pub fn reuseport(&self) -> bool {
-        self.reuseport
+    /// A server with this configuration.
+    pub fn new(config: ServerConfig) -> Self {
+        Self { config }
     }
 
     /// Opens a port and makes a listener over it.
@@ -260,7 +149,7 @@ impl Server {
     pub fn socket(&self, port: u16, kind: socket2::Type) -> Result<socket2::Socket, Error> {
         let socket = socket2::Socket::new(socket2::Domain::IPV6, kind, None)?;
 
-        if self.reuseport {
+        if self.config.reuseport {
             socket.set_reuse_port(true)?;
         }
 
@@ -298,11 +187,12 @@ impl Server {
 
             RawSocket::QUIC(udp) => {
                 let identity = self
+                    .config
                     .identity
                     .as_ref()
                     .ok_or_else(|| Error::Tls("a QUIC port needs a certificate and a key".into()))?;
 
-                let versions: Vec<Version> = self.versions.iter().copied().filter(|version| version.major() == 3).collect();
+                let versions: Vec<Version> = self.config.versions.iter().copied().filter(|version| version.major() == 3).collect();
                 if versions.is_empty() {
                     return Err(Error::Version("a QUIC port only carries HTTP/3".into()));
                 }
@@ -311,12 +201,12 @@ impl Server {
 
                 let mut settings = tokio_quiche::settings::QuicSettings::default();
                 settings.alpn = versions.iter().map(|version| version.alpn().as_bytes().to_vec()).collect();
-                settings.max_idle_timeout = common::duration(self.limits.read_timeout);
-                settings.initial_max_streams_bidi = self.limits.max_concurrent_streams as u64;
+                settings.max_idle_timeout = common::duration(self.config.limits.message.read_timeout);
+                settings.initial_max_streams_bidi = self.config.limits.message.max_concurrent_streams as u64;
                 settings.enable_dgram = false;
 
                 let hooks = tokio_quiche::settings::Hooks {
-                    connection_hook: Some(std::sync::Arc::new(tls::QuicServerTls { identity: identity.clone(), ech: self.ech.clone() })),
+                    connection_hook: Some(std::sync::Arc::new(tls::QuicServerTls { identity: identity.clone(), ech: self.config.ech.clone() })),
                 };
 
                 let params = tokio_quiche::ConnectionParams::new_server(
@@ -333,16 +223,16 @@ impl Server {
         };
 
         let versions: Vec<Version> = match target {
-            Port::QUIC(_) => self.versions.iter().copied().filter(|version| version.major() == 3).collect(),
-            _ => self.versions.iter().copied().filter(|version| version.major() != 3).collect(),
+            Port::QUIC(_) => self.config.versions.iter().copied().filter(|version| version.major() == 3).collect(),
+            _ => self.config.versions.iter().copied().filter(|version| version.major() != 3).collect(),
         };
 
-        let acceptor = match (&self.identity, &socket) {
-            (Some(identity), Socket::TCP(_)) => Some(Arc::new(tls::server_config(identity, &versions, self.ech.as_ref())?)),
+        let acceptor = match (&self.config.identity, &socket) {
+            (Some(identity), Socket::TCP(_)) => Some(Arc::new(tls::server_config(identity, &versions, self.config.ech.as_ref())?)),
             _ => None,
         };
 
-        let negotiation = Negotiation { versions, limits: self.limits, acceptor, hsts: self.hsts };
+        let negotiation = Negotiation { versions, limits: self.config.limits.message, acceptor, hsts: self.config.hsts };
         let (negotiating, negotiated) = tokio::sync::mpsc::channel(negotiation.limits.max_pending_handshakes.max(1) as usize);
 
         Ok(Listener { socket, negotiation: Arc::new(negotiation), negotiating, negotiated })
@@ -440,118 +330,6 @@ impl Socket {
     }
 }
 
-/// A connection that has arrived but not yet been negotiated.
-#[allow(clippy::large_enum_variant)]
-pub enum Incoming {
-    /// A stream transport, over TCP or a Unix socket.
-    Stream {
-        /// The transport.
-        transport: Box<dyn Transport>,
-        /// The peer's address, or `unix` for a Unix socket.
-        id: ConnectionID,
-    },
-    /// A QUIC connection.
-    QUIC(QuicIncoming),
-}
-
-/// Everything needed to turn an [`Incoming`] into a connection.
-///
-/// Kept apart from the [`Listener`] so it can be shared by reference with the
-/// tasks that negotiate concurrently.
-#[derive(Clone)]
-pub struct Negotiation {
-    /// The versions on offer, already narrowed to what the port can carry.
-    pub versions: Vec<Version>,
-    /// The limits each connection will hold itself to.
-    pub limits: Limits,
-    /// The TLS acceptor, when the port is secure.
-    pub acceptor: Option<Arc<boring::ssl::SslAcceptor>>,
-    /// The HSTS policy to attach to responses, if any.
-    pub hsts: Option<crate::helpers::hsts::HstsPolicy>,
-}
-
-impl Negotiation {
-    /// Negotiates a version and builds the connection.
-    ///
-    /// A stream transport is held to [`Limits::read_timeout`], so a peer that
-    /// connects and then says nothing does not hold a slot indefinitely.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Timeout`] when the handshake stalls, [`Error::Tls`]
-    /// when it fails, and [`Error::Version`] when nothing usable is agreed.
-    pub async fn accept(&self, incoming: Incoming) -> Result<AnyConnection, Error> {
-        match incoming {
-            Incoming::Stream { transport, id } => {
-                common::within(self.limits.read_timeout, self.assemble(transport, id)).await?
-            }
-
-            Incoming::QUIC(incoming) => {
-                let id = ConnectionID(Bytes::from(incoming.peer_addr().to_string()));
-
-                let session = H3Session::new(Role::Origin, id, self.limits);
-                let (mut connection, worker) = H3Connection::pair(session, self.hsts);
-                let quic = incoming.start(worker);
-                connection.guard = Some(std::sync::Arc::new(quic));
-
-                Ok(AnyConnection::H3(connection))
-            }
-        }
-    }
-
-    /// Runs the TLS handshake and builds the negotiated connection.
-    ///
-    /// Falls through to [`Negotiation::assemble_plain`] when the port has no
-    /// acceptor.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Tls`] when the handshake fails and [`Error::Version`]
-    /// when nothing usable is negotiated.
-    pub async fn assemble(&self, transport: Box<dyn Transport>, id: ConnectionID) -> Result<AnyConnection, Error> {
-        let Some(acceptor) = &self.acceptor else {
-            return self.assemble_plain(transport, id).await;
-        };
-
-        let stream = tokio_boring::accept(acceptor, transport).await.map_err(|err| Error::Tls(err.to_string()))?;
-        let version = tls::negotiated(stream.ssl().selected_alpn_protocol(), &self.versions)?;
-
-        let transport = Box::new(stream) as Box<dyn Transport>;
-        Ok(match version {
-            Version::V2_0 => AnyConnection::H2(H2Connection::new(transport, Role::Origin, id, self.limits).with_hsts(self.hsts)),
-            _ => AnyConnection::H1(H1Connection::new(transport, Role::Origin, id, self.limits).with_hsts(self.hsts)),
-        })
-    }
-
-    /// Picks a version on a plaintext port by sniffing the first few octets.
-    ///
-    /// There is no ALPN without TLS, so the HTTP/2 preface is looked for
-    /// instead. Whatever was read is handed to the connection rather than
-    /// discarded, so an HTTP/1.1 request that happens to start with the same
-    /// octets is not damaged by the check.
-    ///
-    /// # Errors
-    ///
-    /// As [`Buffer::fill`].
-    pub async fn assemble_plain(&self, mut transport: Box<dyn Transport>, id: ConnectionID) -> Result<AnyConnection, Error> {
-        let mut buffer = Buffer::new();
-
-        let probe = h2::PREFACE.len().min(4);
-        while buffer.len() < probe && buffer.fill(&mut transport, self.limits.read_timeout).await? {}
-
-        let sniffed = buffer.len().min(probe);
-        let h2 = self.versions.contains(&Version::V2_0)
-            && sniffed > 0
-            && buffer.as_slice()[..sniffed] == h2::PREFACE[..sniffed];
-
-        if h2 {
-            return Ok(AnyConnection::H2(H2Connection::resume(transport, Role::Origin, id, self.limits, buffer)));
-        }
-
-        Ok(AnyConnection::H1(H1Connection::resume(transport, Role::Origin, id, self.limits, buffer)))
-    }
-}
-
 /// One bound port, accepting and negotiating connections.
 ///
 /// Handshakes run concurrently in their own tasks rather than in the accept
@@ -643,6 +421,9 @@ impl Listener {
 }
 
 /// The limits a server applies on top of the per-message [`Limits`].
+///
+/// These are what the admission [`Gate`] enforces. The defaults leave
+/// admission unbounded, so a server limits nothing it was not asked to.
 #[derive(Debug, Clone)]
 pub struct ServerLimits {
     /// The limits each connection holds itself to.
@@ -653,33 +434,20 @@ pub struct ServerLimits {
     /// The number of connections one address may have open. Zero is unbounded.
     pub max_connections_per_ip: u32,
     /// Rate limits as `[(period in seconds, count), ...]`; every entry must be
-    /// satisfied.
+    /// satisfied, so several together shape both bursts and sustained rate.
     pub max_connection_rate: Vec<(f64, u32)>,
     /// The number of addresses whose connection history is remembered.
     pub max_connection_history: usize,
-
-    /// The number of connections a listener may negotiate at once.
-    pub max_pending_handshakes: u32,
-    /// In seconds, how long one handshake may take.
-    pub handshake_timeout: f64,
-    /// In seconds, how long a connection may sit idle before it is closed.
-    pub idle_timeout: f64,
-    /// In seconds, how long a shutdown waits for connections to finish.
-    pub shutdown_timeout: f64,
 }
 
 impl Default for ServerLimits {
     fn default() -> Self {
         Self {
             message: Limits::default(),
-            max_connections: 16384,
+            max_connections: 0,
             max_connections_per_ip: 0,
-            max_connection_rate: vec![(1.0, 25), (5.0, 50), (60.0, 75)],
+            max_connection_rate: Vec::new(),
             max_connection_history: 1024,
-            max_pending_handshakes: 256,
-            handshake_timeout: 30.0,
-            idle_timeout: 60.0,
-            shutdown_timeout: 30.0,
         }
     }
 }
@@ -1043,7 +811,7 @@ impl Server {
     /// Binds every port and starts serving on the current runtime.
     ///
     /// Returns as soon as the ports are bound; the accept loops keep running
-    /// in the background. Use [`Server::serve_workers`] to spread the work
+    /// in the background. Use [`Server::run`] to spread the work
     /// across threads instead.
     ///
     /// # Errors
@@ -1051,7 +819,7 @@ impl Server {
     /// As [`Server::bind`]. Ports bound before the failure are closed when the
     /// error unwinds.
     pub async fn serve<H: Handler>(&self, handler: H, ports: &[Port]) -> Result<ServerHandle, Error> {
-        let gate = Gate::new(self.max_connections, self.max_connections_per_ip, self.max_connection_rate.clone(), 1024);
+        let gate = Gate::from_limits(&self.config.limits);
 
         let mut listeners = Vec::with_capacity(ports.len());
         for port in ports {
@@ -1142,16 +910,16 @@ impl Server {
     /// worker without reuseport, when a socket cannot be opened, or when a
     /// thread or runtime cannot be created. On failure every thread already
     /// started is wound down first.
-    pub fn serve_workers<H: Handler>(&self, handler: H, ports: &[Port], workers: usize) -> Result<Cluster, Error> {
+    pub fn run<H: Handler>(&self, handler: H, ports: &[Port], workers: usize) -> Result<Cluster, Error> {
         let workers = workers.max(1);
 
-        if workers > 1 && !self.reuseport && ports.iter().any(|port| matches!(port, Port::QUIC(_))) {
+        if workers > 1 && !self.config.reuseport && ports.iter().any(|port| matches!(port, Port::QUIC(_))) {
             let reason = "a QUIC port needs reuseport to run on more than one worker";
             return Err(Error::Io(std::io::Error::other(reason)));
         }
 
         let handler = Arc::new(handler);
-        let gate = Gate::new(self.max_connections, self.max_connections_per_ip, self.max_connection_rate.clone(), 1024);
+        let gate = Gate::from_limits(&self.config.limits);
 
         let mut targets = Vec::with_capacity(ports.len());
         let mut queues: Vec<Vec<RawSocket>> = Vec::with_capacity(ports.len());
@@ -1169,7 +937,7 @@ impl Server {
 
             addresses.extend(address);
 
-            let independent = self.reuseport && !matches!(target, Port::UDS(_));
+            let independent = self.config.reuseport && !matches!(target, Port::UDS(_));
 
             let mut queue = Vec::with_capacity(workers);
             queue.push(opened);
@@ -1264,7 +1032,7 @@ impl Server {
     }
 }
 
-/// A server running across several threads, as [`Server::serve_workers`]
+/// A server running across several threads, as [`Server::run`]
 /// returns it.
 ///
 /// Dropping this leaves the workers running; call [`Cluster::close`] to wind

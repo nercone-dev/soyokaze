@@ -552,9 +552,9 @@ impl EchKeys {
 
     /// The config wrapped as a one-entry `ECHConfigList`, ready to publish.
     ///
-    /// This is what a client passes to [`ClientBuilder::ech`].
+    /// This is what a client puts in [`ClientConfig::ech`].
     ///
-    /// [`ClientBuilder::ech`]: crate::api::client::ClientBuilder::ech
+    /// [`ClientConfig::ech`]: crate::api::client::ClientConfig::ech
     pub fn config_list(&self) -> Vec<u8> {
         let mut list = (self.config.len() as u16).to_be_bytes().to_vec();
         list.extend_from_slice(&self.config);

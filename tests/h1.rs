@@ -1,8 +1,10 @@
 use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use soyokaze::models::{Body, ConnectionID, HeaderCase, Headers, Limits, Message, Method, Role, Version};
-use soyokaze::protocol::common::{Buffer, Connection, IDLE_CAPACITY};
+use soyokaze::api::common::Limits;
+use soyokaze::models::{Body, ConnectionID, HeaderCase, Headers, Message, Method, Role, Version};
+use soyokaze::protocol::base::Connection;
+use soyokaze::protocol::common::{Buffer, IDLE_CAPACITY};
 use soyokaze::protocol::h1::{self, BodyLength, H1Connection};
 use soyokaze::Error;
 

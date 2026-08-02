@@ -10,9 +10,10 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::api::common::Limits;
 use crate::errors::Error;
 use crate::helpers::sync::lock;
-use crate::models::{Headers, Limits, Url, Version};
+use crate::models::{Headers, Url, Version};
 
 /// Whether the connection survives this message.
 ///

@@ -2,7 +2,7 @@
 //!
 //! Soyokaze speaks all three versions of HTTP through one set of types. A
 //! [`Message`] carries a request or a response regardless of the version that
-//! framed it, and every connection implements [`protocol::common::Connection`],
+//! framed it, and every connection implements [`protocol::base::Connection`],
 //! so code written against the trait works unchanged over HTTP/1.1, HTTP/2 and
 //! HTTP/3.
 //!
@@ -11,13 +11,15 @@
 //! The crate is arranged in three layers, each usable on its own:
 //!
 //! - [`api`] holds the entry points: [`Client`] dials an origin, [`Server`]
-//!   binds ports and accepts connections, and [`api::tls`] builds the BoringSSL
-//!   contexts both of them negotiate with.
+//!   binds ports and accepts connections, and [`api::common`] holds what the
+//!   two configure in common. The BoringSSL contexts both of them negotiate
+//!   with are built in [`tls`].
 //! - [`protocol`] holds one connection type per version — [`protocol::h1`],
-//!   [`protocol::h2`] and [`protocol::h3`] — over the shared vocabulary in
-//!   [`protocol::common`]. A higher layer drives a lower one exactly the way an
-//!   outside caller would; HTTP/1.1 over TCP is built from a `TCPServer` and an
-//!   `H1Connection` with no private back channel between them.
+//!   [`protocol::h2`] and [`protocol::h3`] — implementing the traits in
+//!   [`protocol::base`] over the shared vocabulary in [`protocol::common`],
+//!   with [`protocol::handler`] bridging each transport into a connection the
+//!   same way. A higher layer drives a lower one exactly the way an outside
+//!   caller would.
 //! - [`helpers`] holds the codecs the versions share: [`helpers::huffman`],
 //!   [`helpers::hpack`] for HTTP/2 and [`helpers::qpack`] for HTTP/3, plus the
 //!   small pieces ([`helpers::base64`], [`helpers::sha1`]) the WebSocket
@@ -30,7 +32,7 @@
 //! each pair shares the shape of its counterpart, and version-specific
 //! connections are drop-in replacements for one another wherever the protocol
 //! itself does not force a difference. Prefer naming the base type
-//! ([`protocol::common::Connection`], [`AnyConnection`]) over a concrete
+//! ([`protocol::base::Connection`], [`AnyConnection`]) over a concrete
 //! version wherever a choice exists.
 //!
 //! # Getting started
@@ -39,7 +41,7 @@
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), soyokaze::Error> {
-//! let client = soyokaze::Client::builder().build();
+//! let client = soyokaze::Client::default();
 //! let response = client.get("https://example.com/").await?;
 //!
 //! println!("{:?}", response.status_code);
@@ -56,7 +58,7 @@
 //! struct Echo;
 //! impl soyokaze::Handler for Echo {}
 //!
-//! let server = Server::builder().build();
+//! let server = Server::default();
 //! let handle = server.serve(Echo, &[Port::TCP(8080)]).await?;
 //!
 //! handle.close(None).await;
@@ -64,7 +66,7 @@
 //! # }
 //! ```
 //!
-//! [`AnyConnection`]: protocol::common::AnyConnection
+//! [`AnyConnection`]: protocol::base::AnyConnection
 
 pub mod ffi;
 pub mod models;
@@ -73,29 +75,39 @@ pub mod headers;
 pub mod responses;
 pub mod finalizer;
 pub mod websocket;
+pub mod tls;
 
 pub mod api {
     //! The entry points a user of the crate reaches for first.
     //!
     //! [`client`] dials an origin, [`server`] binds ports and accepts
-    //! connections, and [`tls`] builds the contexts both of them negotiate
-    //! with.
+    //! connections, and [`common`] holds what the two configure in common.
 
+    pub mod common;
     pub mod client;
     pub mod server;
-    pub mod tls;
 }
 
 pub mod protocol {
     //! One connection type per HTTP version, over a shared vocabulary.
     //!
-    //! [`common`] holds what every version shares, and [`h1`], [`h2`] and
-    //! [`h3`] each implement one version over it.
+    //! [`common`] holds what every version shares, [`base`] holds what a
+    //! connection is before any version makes it concrete, [`handler`] bridges
+    //! each transport into a connection, and [`h1`], [`h2`] and [`h3`] each
+    //! implement one version.
 
     pub mod common;
+    pub mod base;
+    pub mod handler;
     pub mod h1;
     pub mod h2;
     pub mod h3;
+
+    pub use base::{AnyConnection, Connection, Stream, Transport};
+    pub use handler::{Incoming, Negotiation};
+    pub use h1::H1Connection;
+    pub use h2::H2Connection;
+    pub use h3::H3Connection;
 }
 
 pub mod helpers {
@@ -118,12 +130,13 @@ pub mod helpers {
 }
 
 pub use errors::Error;
-pub use models::{Body, ConnectionID, HeaderCase, Headers, Limits, Message, Method, Port, Role, StreamID, Url, Version};
+pub use models::{Body, ConnectionID, HeaderCase, Headers, Message, Method, Port, Role, StreamID, Url, Version};
 pub use headers::{Cookie, CookieJar, SameSite, SetCookie};
 pub use finalizer::{http_date, DateCache};
-pub use api::client::{Client, ClientLimits};
-pub use api::server::{cores, Cluster, Gate, Handler, Permit, RawSocket, Server, ServerLimits};
-pub use api::tls::{EchConfig, EchConfigList, EchKeys, EchStatus, Format, Identity};
+pub use api::common::{Limits, VERSIONS};
+pub use api::client::{Client, ClientConfig, ClientLimits};
+pub use api::server::{cores, Cluster, Gate, Handler, Permit, RawSocket, Server, ServerConfig, ServerLimits};
+pub use tls::{EchConfig, EchConfigList, EchKeys, EchStatus, Format, Identity};
 pub use helpers::hsts::{HstsPolicy, HstsStore};
 pub use helpers::text::Text;
 pub use websocket::WebSocketConnection;

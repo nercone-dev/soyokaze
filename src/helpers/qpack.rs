@@ -27,10 +27,10 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::OnceLock;
 
+use crate::api::common::Limits;
 use crate::helpers::hpack::{self, HeaderField};
 use crate::helpers::huffman;
 use crate::helpers::text::Text;
-use crate::models::Limits;
 
 /// The dynamic table capacity assumed before the peer's settings arrive.
 ///

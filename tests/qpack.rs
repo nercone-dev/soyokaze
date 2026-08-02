@@ -3,7 +3,7 @@ use soyokaze::helpers::qpack::{
     self, Decoder, DecoderInstruction, DynamicTable, Encoder, EncoderInstruction, Error,
     ADVERTISED_TABLE_CAPACITY,
 };
-use soyokaze::models::Limits;
+use soyokaze::api::common::Limits;
 
 fn field(name: &str, value: &str) -> HeaderField {
     HeaderField::new(name, value)

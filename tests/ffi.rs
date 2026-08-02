@@ -441,8 +441,7 @@ fn a_request_crosses_to_the_callback_and_its_answer_crosses_back() {
 
     let mut response = ptr::null_mut();
     let mut error: *mut ErrorHandle = ptr::null_mut();
-    let status =
-        unsafe { soyokaze_client_fetch(runtime, client, Method::GET, url_data, url_len, request, &mut response, &mut error) };
+    let status = unsafe { soyokaze_client_fetch(runtime, client, Method::GET, url_data, url_len, request, &mut response, &mut error) };
 
     assert_eq!(status, Status::Ok, "the exchange failed");
     assert!(!response.is_null());
@@ -527,8 +526,7 @@ fn a_port_that_names_nothing_usable_is_refused() {
     let port = Port { kind: PortKind::UDS, number: 0, path: ptr::null(), path_len: 0 };
     let mut handle = ptr::null_mut();
 
-    let status =
-        unsafe { soyokaze_server_serve(runtime, server, echo, ptr::null_mut(), &port, 1, &mut handle, ptr::null_mut()) };
+    let status = unsafe { soyokaze_server_serve(runtime, server, echo, ptr::null_mut(), &port, 1, &mut handle, ptr::null_mut()) };
 
     assert_eq!(status, Status::Invalid, "a Unix port with no path names nothing");
     assert!(handle.is_null());

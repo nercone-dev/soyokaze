@@ -1,4 +1,5 @@
-use soyokaze::models::{ConnectionID, Headers, Limits, Message, Method, Role, Version};
+use soyokaze::api::common::Limits;
+use soyokaze::models::{ConnectionID, Headers, Message, Method, Role, Version};
 use soyokaze::websocket::{self, CloseCode, Frame, Opcode, WebSocketConnection};
 use soyokaze::Error;
 

@@ -22,9 +22,11 @@ use std::collections::VecDeque;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::api::common::Limits;
 use crate::helpers::hpack::{Decoder as HPACKDecoder, Encoder as HPACKEncoder, HeaderField};
-use crate::models::{Body, ConnectionID, Headers, Limits, Message, Method, Role, StreamID, Version};
-use crate::protocol::common::{self, Buffer, Connection, Error};
+use crate::models::{Body, ConnectionID, Headers, Message, Method, Role, StreamID, Version};
+use crate::protocol::base::{Connection, Stream};
+use crate::protocol::common::{self, Buffer, Error};
 
 /// The octets a client sends before anything else, to prove it means HTTP/2.
 pub const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -864,7 +866,7 @@ impl H2Stream {
     }
 }
 
-impl common::Stream for H2Stream {
+impl Stream for H2Stream {
     fn id(&self) -> StreamID {
         self.id
     }
@@ -1726,9 +1728,9 @@ where
         (!stream.body.is_empty()).then(|| std::mem::take(&mut stream.body).freeze())
     }
 
-    /// Queues a RST_STREAM for every stream that [`common::Stream::reset`] marked.
+    /// Queues a RST_STREAM for every stream that [`Stream::reset`] marked.
     ///
-    /// [`common::Stream::reset`] cannot write, so it records the intent and
+    /// [`Stream::reset`] cannot write, so it records the intent and
     /// this sends it the next time the connection is driven.
     ///
     /// # Errors
