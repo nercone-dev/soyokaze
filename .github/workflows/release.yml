@@ -61,8 +61,6 @@ jobs:
             target: aarch64-apple-darwin
           - os: macos-13
             target: x86_64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v5
         with:
@@ -75,12 +73,6 @@ jobs:
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install cmake go
-
-      # BoringSSL assembles its x86_64 primitives with NASM on MSVC; cmake, Go
-      # and Perl are already on the image.
-      - name: Install system dependencies (Windows)
-        if: runner.os == 'Windows'
-        run: choco install nasm --no-progress -y
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -116,29 +108,24 @@ jobs:
           cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c target/release/libsoyokaze.a $libs -o ffi-static
           ./ffi-static
 
-      # Everything cargo emitted for the library, whatever the platform names
-      # it: the rlib for a Rust caller, the cdylib and the staticlib for
-      # everyone else, the import library and the debug symbols Windows adds,
-      # and the dependency file. Both spellings are tried because Windows drops
-      # the `lib` prefix from some of them.
+      # Everything cargo emitted for the library: the rlib for a Rust caller,
+      # the cdylib and the staticlib for everyone else, and the dependency file.
       - name: Package
         shell: bash
         run: |
           name="soyokaze-${TAG}-${{ matrix.target }}"
           mkdir -p "staging/$name"
 
-          cp target/release/libsoyokaze.* "staging/$name/" 2>/dev/null || true
-          cp target/release/soyokaze.* "staging/$name/" 2>/dev/null || true
+          cp target/release/libsoyokaze.* "staging/$name/"
           cp include/soyokaze.h README.md LICENSE "staging/$name/"
 
           # A glob that matched nothing would otherwise ship an archive with no
           # library in it.
           case "$RUNNER_OS" in
-            Linux)   shared=libsoyokaze.so;    static=libsoyokaze.a ;;
-            macOS)   shared=libsoyokaze.dylib; static=libsoyokaze.a ;;
-            Windows) shared=soyokaze.dll;      static=soyokaze.lib ;;
+            Linux) shared=libsoyokaze.so ;;
+            macOS) shared=libsoyokaze.dylib ;;
           esac
-          for required in "$shared" "$static" libsoyokaze.rlib "soyokaze.h"; do
+          for required in "$shared" libsoyokaze.a libsoyokaze.rlib soyokaze.h; do
             if [ ! -f "staging/$name/$required" ]; then
               echo "::error::$required is missing from the archive"
               exit 1
@@ -147,13 +134,8 @@ jobs:
 
           ls -l "staging/$name"
 
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            (cd staging && 7z a -tzip "../$name.zip" "$name")
-            echo "ASSET=$name.zip" >> "$GITHUB_ENV"
-          else
-            tar -czf "$name.tar.gz" -C staging "$name"
-            echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
-          fi
+          tar -czf "$name.tar.gz" -C staging "$name"
+          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
         env:
           TAG: ${{ github.event.release.tag_name }}
 

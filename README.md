@@ -36,6 +36,10 @@ wherever the protocol itself does not force a difference.
 - Rust 1.88 or newer. The crate itself is on the 2024 edition, which needs 1.85;
   `quiche` and `tokio-quiche` raise the floor to 1.88.
 - A C/C++ toolchain and CMake, which building BoringSSL needs.
+- A Unix-like system — Linux and macOS are the ones built and tested. Windows is
+  not supported: `Port::UDS` binds a Unix domain socket, and `serve_workers`
+  gives each worker its own listener through `SO_REUSEPORT`, neither of which
+  Windows has.
 
 ## Installing
 
