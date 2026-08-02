@@ -1,0 +1,173 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  verify-version:
+    name: Verify the release matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - name: Compare the tag with the package version
+        run: |
+          tag_version="${TAG#v}"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::release $TAG does not match Cargo.toml version $cargo_version"
+            exit 1
+          fi
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features
+
+  assets:
+    name: ${{ matrix.target }}
+    needs: [verify-version, test]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake go
+
+      # BoringSSL assembles its x86_64 primitives with NASM on MSVC; cmake, Go
+      # and Perl are already on the image.
+      - name: Install system dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: choco install nasm --no-progress -y
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build the shared library
+        run: cargo build --release --lib
+
+      # Only on Linux. Linking against a macOS release dylib can trip an ld
+      # check on the symbol table's alignment that has nothing to do with this
+      # crate, and a release must not be blocked by it. The same check runs on
+      # both platforms in test.yml, against the debug build.
+      - name: Check the C header against what is about to ship
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c -Ltarget/release -lsoyokaze -o ffi-shared
+          LD_LIBRARY_PATH=target/release ./ffi-shared
+
+          libs=$(cargo rustc --release --lib --crate-type staticlib -- --print native-static-libs 2>&1 \
+                 | sed -n 's/^note: native-static-libs: //p' | tail -n1)
+          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c target/release/libsoyokaze.a $libs -o ffi-static
+          ./ffi-static
+
+      # Everything cargo emitted for the library, whatever the platform names
+      # it: the rlib for a Rust caller, the cdylib and the staticlib for
+      # everyone else, the import library and the debug symbols Windows adds,
+      # and the dependency file. Both spellings are tried because Windows drops
+      # the `lib` prefix from some of them.
+      - name: Package
+        shell: bash
+        run: |
+          name="soyokaze-${TAG}-${{ matrix.target }}"
+          mkdir -p "staging/$name"
+
+          cp target/release/libsoyokaze.* "staging/$name/" 2>/dev/null || true
+          cp target/release/soyokaze.* "staging/$name/" 2>/dev/null || true
+          cp include/soyokaze.h README.md LICENSE "staging/$name/"
+
+          # A glob that matched nothing would otherwise ship an archive with no
+          # library in it.
+          case "$RUNNER_OS" in
+            Linux)   shared=libsoyokaze.so;    static=libsoyokaze.a ;;
+            macOS)   shared=libsoyokaze.dylib; static=libsoyokaze.a ;;
+            Windows) shared=soyokaze.dll;      static=soyokaze.lib ;;
+          esac
+          for required in "$shared" "$static" libsoyokaze.rlib "soyokaze.h"; do
+            if [ ! -f "staging/$name/$required" ]; then
+              echo "::error::$required is missing from the archive"
+              exit 1
+            fi
+          done
+
+          ls -l "staging/$name"
+
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            (cd staging && 7z a -tzip "../$name.zip" "$name")
+            echo "ASSET=$name.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "$name.tar.gz" -C staging "$name"
+            echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+          fi
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+
+      - name: Attach to the release
+        shell: bash
+        run: gh release upload "$TAG" "$ASSET" --clobber
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          GH_TOKEN: ${{ github.token }}
+
+  publish:
+    name: Publish to crates.io
+    needs: assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Not `--locked`: Cargo.lock is deliberately untracked, so a fresh
+      # checkout has none for the flag to hold cargo to.
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

@@ -33,7 +33,8 @@ wherever the protocol itself does not force a difference.
 
 ## Requirements
 
-- Rust 1.85 or newer — the crate is on the 2024 edition.
+- Rust 1.88 or newer. The crate itself is on the 2024 edition, which needs 1.85;
+  `quiche` and `tokio-quiche` raise the floor to 1.88.
 - A C/C++ toolchain and CMake, which building BoringSSL needs.
 
 ## Installing
