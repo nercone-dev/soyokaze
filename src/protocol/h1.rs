@@ -1,0 +1,1068 @@
+use std::collections::VecDeque;
+use std::ops::Range;
+
+use bytes::{Bytes, BytesMut};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+
+use crate::helpers::scan;
+use crate::helpers::text::Text;
+use crate::models::{Body, ConnectionID, HeaderCase, Headers, Limits, Message, Method, Role, Version};
+use crate::protocol::common::{self, Buffer, Connection, Error};
+
+pub fn reason_phrase(status_code: u16) -> &'static str {
+    match status_code {
+        100 => "Continue",
+        101 => "Switching Protocols",
+        102 => "Processing",
+        103 => "Early Hints",
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        203 => "Non-Authoritative Information",
+        204 => "No Content",
+        205 => "Reset Content",
+        206 => "Partial Content",
+        207 => "Multi-Status",
+        208 => "Already Reported",
+        226 => "IM Used",
+        300 => "Multiple Choices",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        305 => "Use Proxy",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        402 => "Payment Required",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        406 => "Not Acceptable",
+        407 => "Proxy Authentication Required",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        410 => "Gone",
+        411 => "Length Required",
+        412 => "Precondition Failed",
+        413 => "Content Too Large",
+        414 => "URI Too Long",
+        415 => "Unsupported Media Type",
+        416 => "Range Not Satisfiable",
+        417 => "Expectation Failed",
+        418 => "I'm a teapot",
+        421 => "Misdirected Request",
+        422 => "Unprocessable Content",
+        423 => "Locked",
+        424 => "Failed Dependency",
+        425 => "Too Early",
+        426 => "Upgrade Required",
+        428 => "Precondition Required",
+        429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
+        451 => "Unavailable For Legal Reasons",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        505 => "HTTP Version Not Supported",
+        506 => "Variant Also Negotiates",
+        507 => "Insufficient Storage",
+        508 => "Loop Detected",
+        510 => "Not Extended",
+        511 => "Network Authentication Required",
+        _ => "Unknown",
+    }
+}
+
+pub fn write_number(mut value: u64, out: &mut BytesMut) {
+    let mut digits = [0u8; 20];
+    let mut index = digits.len();
+
+    loop {
+        index -= 1;
+        digits[index] = b'0' + (value % 10) as u8;
+        value /= 10;
+
+        if value == 0 {
+            break;
+        }
+    }
+
+    out.extend_from_slice(&digits[index..]);
+}
+
+pub fn write_start_line_into(message: &Message, out: &mut BytesMut) -> Result<(), Error> {
+    if message.version.major() != 1 {
+        return Err(Error::Version(format!("{} has no start line", message.version)));
+    }
+
+    let version = message.version.as_str();
+
+    if let Some(method) = message.method {
+        let method = method.as_str();
+        let target = message.target.as_deref().unwrap_or("/");
+
+        let start = out.len();
+        out.resize(start + method.len() + target.len() + version.len() + 2, 0);
+
+        let line = &mut out[start..];
+        scan::copy(line, method.as_bytes());
+        line[method.len()] = b' ';
+        scan::copy(&mut line[method.len() + 1..], target.as_bytes());
+        line[method.len() + target.len() + 1] = b' ';
+        scan::copy(&mut line[method.len() + target.len() + 2..], version.as_bytes());
+
+        return Ok(());
+    }
+
+    if let Some(status_code) = message.status_code {
+        let reason = reason_phrase(status_code);
+        let digits = [
+            b'0' + (status_code / 100 % 10) as u8,
+            b'0' + (status_code / 10 % 10) as u8,
+            b'0' + (status_code % 10) as u8,
+        ];
+
+        if (100..1000).contains(&status_code) {
+            let start = out.len();
+            out.resize(start + version.len() + reason.len() + 5, 0);
+
+            let line = &mut out[start..];
+            scan::copy(line, version.as_bytes());
+            line[version.len()] = b' ';
+            line[version.len() + 1..version.len() + 4].copy_from_slice(&digits);
+            line[version.len() + 4] = b' ';
+            scan::copy(&mut line[version.len() + 5..], reason.as_bytes());
+
+            return Ok(());
+        }
+
+        out.extend_from_slice(version.as_bytes());
+        out.extend_from_slice(b" ");
+        write_number(status_code as u64, out);
+        out.extend_from_slice(b" ");
+        out.extend_from_slice(reason.as_bytes());
+        return Ok(());
+    }
+
+    Err(Error::Protocol("message is neither a request nor a response".into()))
+}
+
+pub fn write_start_line(message: &Message) -> Result<String, Error> {
+    let mut out = BytesMut::new();
+    write_start_line_into(message, &mut out)?;
+    Ok(String::from_utf8(out.to_vec()).unwrap_or_default())
+}
+
+#[inline]
+pub fn parse_start_line_bytes(line: &[u8]) -> Result<Message, Error> {
+    let line = std::str::from_utf8(line).map_err(|_| Error::Protocol("start line is not valid UTF-8".into()))?;
+    parse_start_line(line)
+}
+
+pub fn split_once(line: &str, at: usize) -> (&str, &str) {
+    (&line[..at], &line[at + 1..])
+}
+
+pub fn parse_start_line(line: &str) -> Result<Message, Error> {
+    if line.as_bytes().starts_with(b"HTTP/") {
+        let Some(first) = scan::find(line.as_bytes(), b' ') else {
+            return Err(Error::Protocol("status line has no status code".into()));
+        };
+
+        let (version, rest) = split_once(line, first);
+        let (status_code, reason) = match scan::find(rest.as_bytes(), b' ') {
+            Some(second) => split_once(rest, second),
+            None => return Err(Error::Protocol("status line has no reason phrase".into())),
+        };
+
+        if status_code.len() != 3 || !status_code.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(Error::Protocol(format!("status code {status_code:?} is not three digits")));
+        }
+
+        if reason.bytes().any(is_control) {
+            return Err(Error::Protocol("reason phrase contains a control character".into()));
+        }
+
+        let status_code = status_code
+            .parse()
+            .map_err(|_| Error::Protocol(format!("status code {status_code:?} is not three digits")))?;
+
+        return Ok(Message::response(status_code, parse_version(version)?));
+    }
+
+    let Some(first) = scan::find(line.as_bytes(), b' ') else {
+        return Err(Error::Protocol("request line has no target".into()));
+    };
+
+    let (method, rest) = split_once(line, first);
+    let (target, version) = match scan::find(rest.as_bytes(), b' ') {
+        Some(second) => split_once(rest, second),
+        None => return Err(Error::Protocol("request line has no version".into())),
+    };
+
+    let method: Method = method.parse().map_err(|_| Error::Protocol(format!("method {method:?} is not recognised")))?;
+
+    if target.is_empty() || target.bytes().any(|byte| byte == b' ' || is_control(byte)) {
+        return Err(Error::Protocol(format!("request target {target:?} is malformed")));
+    }
+
+    Ok(Message::request(method, target, parse_version(version)?))
+}
+
+pub fn request_line_error_status_bytes(line: &[u8]) -> u16 {
+    match std::str::from_utf8(line) {
+        Ok(line) => request_line_error_status(line),
+        Err(_) => 400,
+    }
+}
+
+pub fn request_line_error_status(line: &str) -> u16 {
+    let Some(first) = scan::find(line.as_bytes(), b' ') else {
+        return 400;
+    };
+
+    let (method, rest) = split_once(line, first);
+    let (target, version) = match scan::find(rest.as_bytes(), b' ') {
+        Some(second) => split_once(rest, second),
+        None => return 400,
+    };
+
+    if method.parse::<Method>().is_err() {
+        return 501;
+    }
+
+    if target.is_empty() || target.bytes().any(|byte| byte == b' ' || is_control(byte)) {
+        return 400;
+    }
+
+    if parse_version(version).is_err() {
+        return 505;
+    }
+
+    400
+}
+
+pub fn parse_version(text: &str) -> Result<Version, Error> {
+    match text {
+        "HTTP/1.0" => Ok(Version::V1_0),
+        "HTTP/1.1" => Ok(Version::V1_1),
+        _ => Err(Error::Version(format!("{text:?} is not an HTTP/1.x version"))),
+    }
+}
+
+pub fn is_control(byte: u8) -> bool {
+    byte < 0x20 || byte == 0x7f
+}
+
+pub const TOKEN: u8 = 1 << 0;
+pub const FIELD: u8 = 1 << 1;
+
+pub static OCTETS: [u8; 256] = {
+    let mut octets = [0u8; 256];
+    let mut value = 0usize;
+
+    while value < 256 {
+        let byte = value as u8;
+
+        let token = byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            );
+
+        let field = byte == b'\t' || (byte >= 0x20 && byte != 0x7f);
+
+        octets[value] = (token as u8) | (field as u8) << 1;
+        value += 1;
+    }
+
+    octets
+};
+
+pub fn is_token(text: &str) -> bool {
+    is_token_bytes(text.as_bytes())
+}
+
+pub fn is_token_bytes(text: &[u8]) -> bool {
+    !text.is_empty() && text.iter().all(|byte| OCTETS[*byte as usize] & TOKEN != 0)
+}
+
+pub fn is_field_value(text: &[u8]) -> bool {
+    scan::is_field_value(text)
+}
+
+pub fn write_header_line_into(name: &str, value: &str, case: HeaderCase, out: &mut BytesMut) -> Result<(), Error> {
+    if !is_token(name) {
+        return Err(Error::Protocol(format!("field name {name:?} is not a token")));
+    }
+
+    if !is_field_value(value.as_bytes()) {
+        return Err(Error::Protocol(format!("field value of {name:?} contains a control character")));
+    }
+
+    let start = out.len();
+    let line = name.len() + value.len() + 4;
+    out.resize(start + line, 0);
+
+    let (head, tail) = out[start..].split_at_mut(name.len());
+    scan::copy(head, name.as_bytes());
+    case.apply_in_place(head);
+
+    tail[0] = b':';
+    tail[1] = b' ';
+    scan::copy(&mut tail[2..], value.as_bytes());
+    tail[value.len() + 2] = b'\r';
+    tail[value.len() + 3] = b'\n';
+
+    Ok(())
+}
+
+pub fn write_header_line(name: &str, value: &str, case: HeaderCase) -> Result<String, Error> {
+    let mut out = BytesMut::new();
+    write_header_line_into(name, value, case, &mut out)?;
+    Ok(String::from_utf8(out.to_vec()).unwrap_or_default())
+}
+
+pub fn write_headers_into(headers: &Headers, case: HeaderCase, out: &mut BytesMut) -> Result<(), Error> {
+    out.reserve(headers_size(headers) as usize);
+
+    for (name, value) in headers.iter() {
+        write_header_line_into(name, value, case, out)?;
+    }
+    Ok(())
+}
+
+pub fn write_headers(headers: &Headers, case: HeaderCase) -> Result<String, Error> {
+    let mut out = BytesMut::new();
+    write_headers_into(headers, case, &mut out)?;
+    Ok(String::from_utf8(out.to_vec()).unwrap_or_default())
+}
+
+pub fn write_content_length_into(length: u64, case: HeaderCase, out: &mut BytesMut) {
+    let mut digits = [0u8; 20];
+    let mut index = digits.len();
+    let mut value = length;
+
+    loop {
+        index -= 1;
+        digits[index] = b'0' + (value % 10) as u8;
+        value /= 10;
+
+        if value == 0 {
+            break;
+        }
+    }
+
+    let name = match case {
+        HeaderCase::Title => "Content-Length",
+        HeaderCase::Lower => "content-length",
+    };
+
+    let start = out.len();
+    let written = digits.len() - index;
+    out.resize(start + name.len() + written + 4, 0);
+
+    let line = &mut out[start..];
+    scan::copy(line, name.as_bytes());
+    line[name.len()] = b':';
+    line[name.len() + 1] = b' ';
+    scan::copy(&mut line[name.len() + 2..], &digits[index..]);
+    line[name.len() + written + 2] = b'\r';
+    line[name.len() + written + 3] = b'\n';
+}
+
+pub fn headers_size(headers: &Headers) -> u64 {
+    headers.iter().map(|(name, value)| (name.len() + value.len() + 4) as u64).sum()
+}
+
+pub struct FieldSpans {
+    pub name: Range<usize>,
+    pub value: Range<usize>,
+    pub ascii: bool,
+}
+
+#[inline]
+pub fn name_end(line: &[u8]) -> Result<usize, Error> {
+    let mut at = 0;
+
+    while let Some(octet) = line.get(at) {
+        if *octet == b':' {
+            if at == 0 {
+                return Err(Error::Protocol("field line has an empty name".into()));
+            }
+
+            return Ok(at);
+        }
+
+        if OCTETS[*octet as usize] & TOKEN == 0 {
+            let name = scan::find(line, b':').unwrap_or(line.len());
+            return Err(Error::Protocol(format!("field name {:?} is not a token", String::from_utf8_lossy(&line[..name]))));
+        }
+
+        at += 1;
+    }
+
+    Err(Error::Protocol(format!("field line {:?} has no colon", String::from_utf8_lossy(line))))
+}
+
+#[inline]
+pub fn field_spans(line: &[u8]) -> Result<FieldSpans, Error> {
+    let colon = name_end(line)?;
+
+    let rest = &line[colon + 1..];
+    let start = rest.iter().position(|byte| !matches!(byte, b' ' | b'\t')).unwrap_or(rest.len());
+    let end = rest.iter().rposition(|byte| !matches!(byte, b' ' | b'\t')).map_or(start, |index| index + 1);
+
+    let class = scan::classify_field_value(&rest[start..end]);
+    if class & scan::VALUE_CONTROL != 0 {
+        return Err(Error::Protocol(format!(
+            "field value of {:?} contains a control character",
+            String::from_utf8_lossy(&line[..colon])
+        )));
+    }
+
+    let value = colon + 1;
+    Ok(FieldSpans { name: 0..colon, value: value + start..value + end, ascii: class & scan::VALUE_OBS_TEXT == 0 })
+}
+
+pub fn parse_header_line(line: &str) -> Result<(String, String), Error> {
+    let spans = field_spans(line.as_bytes())?;
+
+    Ok((
+        line.get(spans.name).unwrap_or_default().to_ascii_lowercase(),
+        line.get(spans.value).unwrap_or_default().to_owned(),
+    ))
+}
+
+pub fn parse_headers(lines: impl IntoIterator<Item = String>) -> Result<Headers, Error> {
+    let mut headers = Headers::new();
+
+    for line in lines {
+        if line.starts_with([' ', '\t']) {
+            return Err(Error::Protocol("field line is folded onto a continuation line".into()));
+        }
+
+        let (name, value) = parse_field(line.as_bytes())?;
+        headers.append_lowercase(name, value);
+    }
+
+    Ok(headers)
+}
+
+pub fn parse_field(line: &[u8]) -> Result<(Text, Text), Error> {
+    let spans = field_spans(line)?;
+
+    let name = Text::from_verified_ascii_lowercase(&line[spans.name]);
+    let value = match spans.ascii {
+        true => Text::from_verified_ascii(&line[spans.value]),
+        false => Text::from_utf8_lossy(&line[spans.value]),
+    };
+
+    Ok((name, value))
+}
+
+pub fn block_end(data: &[u8], searched: &mut usize) -> Option<(usize, usize)> {
+    if data.len() >= 2 && data[0] == b'\r' && data[1] == b'\n' {
+        return Some((0, 2));
+    }
+
+    let mut at = *searched;
+
+    while let Some(offset) = scan::find(&data[at..], b'\n') {
+        let line_end = at + offset;
+
+        if data.len() < line_end + 3 {
+            break;
+        }
+
+        if data[line_end + 1] == b'\r' && data[line_end + 2] == b'\n' {
+            return Some((line_end + 1, line_end + 3));
+        }
+
+        at = line_end + 1;
+    }
+
+    *searched = at;
+    None
+}
+
+pub fn parse_header_block(block: &[u8], max_count: usize) -> Result<Headers, Error> {
+    let mut headers = Headers::with_capacity((block.len() / 32).min(max_count) + 1);
+    let mut rest = block;
+
+    while !rest.is_empty() {
+        let Some(end) = scan::find(rest, b'\n') else {
+            return Err(Error::Protocol("line is not terminated by CRLF".into()));
+        };
+
+        if end == 0 || rest[end - 1] != b'\r' {
+            return Err(Error::Protocol("line is not terminated by CRLF".into()));
+        }
+
+        let line = &rest[..end - 1];
+        rest = &rest[end + 1..];
+
+        if headers.len() >= max_count {
+            return Err(Error::Limit(format!("more than {max_count} header fields")));
+        }
+
+        if matches!(line.first(), Some(b' ' | b'\t')) {
+            return Err(Error::Protocol("field line is folded onto a continuation line".into()));
+        }
+
+        let (name, value) = parse_field(line)?;
+        headers.append_lowercase(name, value);
+    }
+
+    Ok(headers)
+}
+
+pub fn hex_digits(mut value: u64, digits: &mut [u8; 16]) -> usize {
+    let mut index = digits.len();
+
+    loop {
+        index -= 1;
+        digits[index] = b"0123456789abcdef"[(value & 0xf) as usize];
+        value >>= 4;
+
+        if value == 0 {
+            return index;
+        }
+    }
+}
+
+pub fn write_hex(value: u64, out: &mut Vec<u8>) {
+    let mut digits = [0u8; 16];
+    let index = hex_digits(value, &mut digits);
+    out.extend_from_slice(&digits[index..]);
+}
+
+pub fn write_chunk_into(data: &[u8], out: &mut BytesMut) {
+    let mut digits = [0u8; 16];
+    let index = hex_digits(data.len() as u64, &mut digits);
+
+    out.reserve(digits.len() - index + data.len() + 4);
+    out.extend_from_slice(&digits[index..]);
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"\r\n");
+}
+
+pub fn encode_chunk(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 20);
+
+    write_hex(data.len() as u64, &mut out);
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"\r\n");
+
+    out
+}
+
+pub fn parse_chunk_size(data: &[u8]) -> Result<Option<(usize, usize)>, Error> {
+    let Some(end) = scan::find(data, b'\n') else {
+        return Ok(None);
+    };
+
+    if end == 0 || data[end - 1] != b'\r' {
+        return Err(Error::Protocol("chunk size line is not terminated by CRLF".into()));
+    }
+
+    let line = String::from_utf8_lossy(&data[..end - 1]);
+    let (size, _) = line.split_once(';').unwrap_or((&line, ""));
+
+    let size = usize::from_str_radix(size.trim_end_matches([' ', '\t']), 16)
+        .map_err(|_| Error::Protocol(format!("chunk size {size:?} is not hexadecimal")))?;
+
+    Ok(Some((end + 1, size)))
+}
+
+pub fn decode_chunk(data: &[u8]) -> Result<(usize, Range<usize>), Error> {
+    let Some((start, size)) = parse_chunk_size(data)? else {
+        return Ok((0, 0..0));
+    };
+
+    if size == 0 {
+        return Ok((start, 0..0));
+    }
+
+    let overflow = || Error::Protocol("chunk size is too large to address".into());
+    let end = start.checked_add(size).ok_or_else(overflow)?;
+    let terminator = end.checked_add(2).ok_or_else(overflow)?;
+
+    if data.len() < terminator {
+        return Ok((0, 0..0));
+    }
+
+    if &data[end..terminator] != b"\r\n" {
+        return Err(Error::Protocol("chunk data is not terminated by CRLF".into()));
+    }
+
+    Ok((terminator, start..end))
+}
+
+pub fn parse_content_length(value: &str) -> Result<u64, Error> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(Error::Protocol(format!("Content-Length {value:?} is not a number")));
+    }
+
+    value.parse().map_err(|_| Error::Protocol(format!("Content-Length {value:?} does not fit")))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyLength {
+    None,
+    Chunked,
+    Fixed(u64),
+    Close,
+}
+
+pub fn body_length(message: &Message, method: Option<Method>) -> Result<BodyLength, Error> {
+    let headers = message.headers.as_ref();
+
+    if let Some(status_code) = message.status_code {
+        if matches!(status_code, 100..=199 | 204 | 304) || method == Some(Method::HEAD) {
+            return Ok(BodyLength::None);
+        }
+
+        if method == Some(Method::CONNECT) && (200..300).contains(&status_code) {
+            return Ok(BodyLength::None);
+        }
+    }
+
+    let encoded = headers.is_some_and(|headers| headers.contains("transfer-encoding"));
+    let measured = headers.is_some_and(|headers| headers.contains("content-length"));
+
+    if encoded && measured {
+        return Err(Error::Protocol("Transfer-Encoding and Content-Length are both present".into()));
+    }
+
+    if encoded {
+        let last = headers.and_then(|headers| headers.get_all("transfer-encoding").last()).unwrap_or_default();
+        let last = last.rsplit(',').next().unwrap_or_default().trim();
+
+        if !last.eq_ignore_ascii_case("chunked") {
+            return if message.is_request() {
+                Err(Error::Protocol("Transfer-Encoding on a request does not end with chunked".into()))
+            } else {
+                Ok(BodyLength::Close)
+            };
+        }
+
+        return Ok(BodyLength::Chunked);
+    }
+
+    if measured {
+        let mut values = headers
+            .into_iter()
+            .flat_map(|headers| headers.get_all("content-length"))
+            .flat_map(|value| value.split(','))
+            .map(str::trim);
+
+        let first = values.next().unwrap_or_default();
+        let length = parse_content_length(first)?;
+
+        for value in values {
+            if parse_content_length(value)? != length {
+                return Err(Error::Protocol("Content-Length values disagree".into()));
+            }
+        }
+
+        return Ok(BodyLength::Fixed(length));
+    }
+
+    if message.is_request() { Ok(BodyLength::None) } else { Ok(BodyLength::Close) }
+}
+
+pub const INLINE_BODY_LIMIT: usize = 64 * 1024;
+
+pub struct H1Connection<T> {
+    transport: T,
+    role: Role,
+    id: ConnectionID,
+    limits: Limits,
+    buffer: Buffer,
+    scratch: BytesMut,
+    pending: VecDeque<Method>,
+    closing: bool,
+    hsts: Option<crate::helpers::hsts::HstsPolicy>,
+}
+
+impl<T> H1Connection<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    pub fn new(transport: T, role: Role, id: ConnectionID, limits: Limits) -> Self {
+        Self::resume(transport, role, id, limits, Buffer::new())
+    }
+
+    pub fn resume(transport: T, role: Role, id: ConnectionID, limits: Limits, buffer: Buffer) -> Self {
+        Self {
+            transport,
+            role,
+            id,
+            limits,
+            buffer,
+            scratch: BytesMut::new(),
+            pending: VecDeque::new(),
+            closing: false,
+            hsts: None,
+        }
+    }
+
+    pub fn with_hsts(mut self, hsts: Option<crate::helpers::hsts::HstsPolicy>) -> Self {
+        self.hsts = hsts;
+        self
+    }
+
+    pub fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    pub fn buffer_capacity(&self) -> usize {
+        self.buffer.capacity()
+    }
+
+    pub fn scratch_capacity(&self) -> usize {
+        self.scratch.capacity()
+    }
+
+    pub fn upgrade(self) -> (T, Buffer) {
+        (self.transport, self.buffer)
+    }
+
+    pub async fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        common::within(self.limits.write_timeout, self.transport.write_all(data)).await??;
+        Ok(())
+    }
+
+    pub async fn write_flushed(&mut self, data: &[u8]) -> Result<(), Error> {
+        let transport = &mut self.transport;
+
+        common::within(self.limits.write_timeout, async move {
+            transport.write_all(data).await?;
+            transport.flush().await
+        })
+        .await??;
+
+        Ok(())
+    }
+
+    pub async fn flush(&mut self) -> Result<(), Error> {
+        common::within(self.limits.write_timeout, self.transport.flush()).await??;
+        Ok(())
+    }
+
+    pub async fn reject(&mut self, status_code: u16) -> Result<(), Error> {
+        self.closing = true;
+        self.send_message(Message::response(status_code, Version::V1_1)).await
+    }
+
+    pub fn pipeline_depth(&self) -> usize {
+        (self.limits.max_concurrent_streams as usize).max(1)
+    }
+
+    pub async fn send_message(&mut self, message: Message) -> Result<(), Error> {
+        if message.method.is_some() && self.pending.len() >= self.pipeline_depth() {
+            let reason = format!("more than {} requests are awaiting a response", self.pipeline_depth());
+            return Err(Error::Limit(reason));
+        }
+
+        let mut message = message;
+        if self.role.is_server() && message.is_response() {
+            if self.hsts.is_some() {
+                message.secure = true;
+            }
+            crate::finalizer::finalize_response(&mut message, crate::finalizer::date_cache(), self.hsts.as_ref());
+        }
+
+        let body = match message.body.take().map(Body::into_inline) {
+            Some(Ok(data)) => Some(data),
+            Some(Err(path)) => Some(Bytes::from(tokio::fs::read(path).await?)),
+            None => None,
+        };
+
+        let case = HeaderCase::from_version(message.version);
+        let headers = message.headers.as_ref();
+
+        let chunked = headers.is_some_and(|headers| {
+            headers
+                .get_all("transfer-encoding")
+                .any(|value| value.rsplit(',').next().unwrap_or_default().trim().eq_ignore_ascii_case("chunked"))
+        });
+
+        let bodyless = matches!(message.status_code, Some(100..=199 | 204 | 304));
+        let has_length = headers.is_some_and(|headers| headers.contains("content-length"));
+
+        let inline = body.as_ref().is_some_and(|body| body.len() <= INLINE_BODY_LIMIT);
+
+        let estimate = 64
+            + headers.map_or(0, |headers| headers.len() * 40)
+            + if inline { body.as_ref().map_or(0, Bytes::len) + 16 } else { 0 };
+
+        let mut out = std::mem::take(&mut self.scratch);
+        out.clear();
+        out.reserve(estimate);
+
+        let closing = self.closing;
+        let head = (|| -> Result<(), Error> {
+            write_start_line_into(&message, &mut out)?;
+            out.extend_from_slice(b"\r\n");
+
+            if let Some(headers) = headers {
+                write_headers_into(headers, case, &mut out)?;
+            }
+
+            if !chunked && !has_length && !bodyless {
+                match &body {
+                    Some(body) => write_content_length_into(body.len() as u64, case, &mut out),
+                    None if message.is_response() => write_content_length_into(0, case, &mut out),
+                    None => {}
+                }
+            }
+
+            if closing && !headers.is_some_and(|headers| headers.contains("connection")) {
+                write_header_line_into("connection", "close", case, &mut out)?;
+            }
+
+            out.extend_from_slice(b"\r\n");
+            Ok(())
+        })();
+
+        if let Err(error) = head {
+            self.scratch = out;
+            return Err(error);
+        }
+
+        match (chunked, body) {
+            (true, body) => {
+                if let Some(body) = body.filter(|body| !body.is_empty()) {
+                    write_chunk_into(&body, &mut out);
+                }
+
+                out.extend_from_slice(b"0\r\n");
+                if let Some(trailers) = &message.trailers {
+                    write_headers_into(trailers, case, &mut out)?;
+                }
+                out.extend_from_slice(b"\r\n");
+
+                self.write_flushed(&out).await?;
+            }
+
+            (false, Some(body)) => {
+                if inline {
+                    out.extend_from_slice(&body);
+                    self.write_flushed(&out).await?;
+                } else {
+                    self.write(&out).await?;
+                    self.write_flushed(&body).await?;
+                }
+            }
+
+            (false, None) => self.write_flushed(&out).await?,
+        }
+
+        out.clear();
+        common::reclaim(&mut out);
+        self.scratch = out;
+
+        if let Some(method) = message.method {
+            self.pending.push_back(method);
+        }
+
+        Ok(())
+    }
+
+    pub async fn receive_message(&mut self) -> Result<Message, Error> {
+        let length = self
+            .buffer
+            .line_end(&mut self.transport, self.limits.max_startline_size as usize, self.limits.read_timeout)
+            .await?;
+
+        let mut message = match parse_start_line_bytes(&self.buffer.as_slice()[..length]) {
+            Ok(message) => {
+                self.buffer.consume(length + 2);
+                message
+            }
+            Err(error) => {
+                let status = self
+                    .role
+                    .is_server()
+                    .then(|| request_line_error_status_bytes(&self.buffer.as_slice()[..length]));
+
+                self.buffer.consume(length + 2);
+
+                if let Some(status) = status {
+                    let _ = self.reject(status).await;
+                }
+
+                return Err(error);
+            }
+        };
+
+        let (headers, block) = self.read_header_block().await?;
+        let head = length as u64 + 4 + block as u64;
+
+        message.headers = Some(headers);
+        message.connection_id = Some(self.id.clone());
+
+        self.closing = self.closing || !crate::headers::keep_alive(message.headers.as_ref(), message.version);
+
+        let limit = self.limits.max_message_size;
+        let Some(budget) = limit.checked_sub(head) else {
+            return Err(Error::Limit(format!("message head of {head} octets exceeds {limit}")));
+        };
+
+        let method = if message.is_response() { self.pending.pop_front() } else { None };
+
+        let length = body_length(&message, method)?;
+
+        message.body = match length {
+            BodyLength::None => None,
+            _ => self.receive_body(length, budget).await?.map(Body::Data),
+        };
+
+        if length == BodyLength::Chunked {
+            message.trailers = Some(self.read_header_block().await?.0);
+        }
+
+        self.buffer.reclaim();
+        Ok(message)
+    }
+
+    pub async fn receive_headers(&mut self) -> Result<Headers, Error> {
+        Ok(self.read_header_block().await?.0)
+    }
+
+    pub async fn read_header_block(&mut self) -> Result<(Headers, usize), Error> {
+        let max = self.limits.max_headers_size;
+        let mut searched = 0usize;
+
+        let (fields, consumed) = loop {
+            if let Some(found) = block_end(self.buffer.as_slice(), &mut searched) {
+                break found;
+            }
+
+            if self.buffer.len() as u64 > max {
+                return Err(Error::Limit(format!("header block exceeds {max} octets")));
+            }
+
+            if !self.buffer.fill(&mut self.transport, self.limits.read_timeout).await? {
+                return Err(Error::Closed);
+            }
+        };
+
+        if fields as u64 > max {
+            return Err(Error::Limit(format!("header block exceeds {max} octets")));
+        }
+
+        let headers = parse_header_block(&self.buffer.as_slice()[..fields], self.limits.max_header_count as usize)?;
+        self.buffer.consume(consumed);
+
+        Ok((headers, consumed))
+    }
+
+    pub async fn receive_body(&mut self, length: BodyLength, budget: u64) -> Result<Option<Bytes>, Error> {
+        Ok(self.read_body(length, budget).await?.filter(|body| !body.is_empty()))
+    }
+
+    pub async fn read_body(&mut self, length: BodyLength, budget: u64) -> Result<Option<Bytes>, Error> {
+        let limit = self.limits.max_message_body_size.min(budget);
+
+        match length {
+            BodyLength::None => Ok(None),
+
+            BodyLength::Fixed(size) => {
+                if size > limit {
+                    return Err(Error::Limit(format!("body of {size} octets exceeds {limit}")));
+                }
+
+                let size = usize::try_from(size).map_err(|_| Error::Limit(format!("body of {size} octets exceeds what this platform can address")))?;
+
+                self.buffer.require(&mut self.transport, size, self.limits.read_timeout).await?;
+                Ok(Some(self.buffer.take(size).freeze()))
+            }
+
+            BodyLength::Chunked => {
+                let mut body = BytesMut::new();
+
+                loop {
+                    match parse_chunk_size(self.buffer.as_slice())? {
+                        Some((_, size)) if (body.len() as u64).saturating_add(size as u64) > limit => {
+                            return Err(Error::Limit(format!("chunked body exceeds {limit} octets")));
+                        }
+                        None if self.buffer.len() > self.limits.max_chunk_header_size as usize => {
+                            return Err(Error::Limit(format!("chunk size line exceeds {} octets", self.limits.max_chunk_header_size)));
+                        }
+                        _ => {}
+                    }
+
+                    let (consumed, chunk) = decode_chunk(self.buffer.as_slice())?;
+                    if consumed == 0 {
+                        if !self.buffer.fill(&mut self.transport, self.limits.read_timeout).await? {
+                            return Err(Error::Closed);
+                        }
+                        continue;
+                    }
+
+                    if chunk.is_empty() {
+                        self.buffer.consume(consumed);
+                        return Ok(Some(body.freeze()));
+                    }
+
+                    body.extend_from_slice(&self.buffer.as_slice()[chunk]);
+                    self.buffer.consume(consumed);
+                }
+            }
+
+            BodyLength::Close => {
+                while self.buffer.fill(&mut self.transport, self.limits.read_timeout).await? {
+                    if self.buffer.len() as u64 > limit {
+                        return Err(Error::Limit(format!("body exceeds {limit} octets")));
+                    }
+                }
+
+                let size = self.buffer.len();
+                Ok(Some(self.buffer.take(size).freeze()))
+            }
+        }
+    }
+}
+
+impl<T> Connection for H1Connection<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    fn version(&self) -> Version {
+        Version::V1_1
+    }
+
+    fn role(&self) -> Role {
+        self.role
+    }
+
+    fn id(&self) -> ConnectionID {
+        self.id.clone()
+    }
+
+    fn reusable(&self) -> bool {
+        !self.closing
+    }
+
+    async fn send(&mut self, message: Message) -> Result<(), Error> {
+        common::within(self.limits.send_timeout, self.send_message(message)).await?
+    }
+
+    async fn receive(&mut self) -> Result<Message, Error> {
+        common::within(self.limits.receive_timeout, self.receive_message()).await?
+    }
+
+    async fn close(&mut self) {
+        let _ = self.transport.flush().await;
+        let _ = self.transport.shutdown().await;
+    }
+}

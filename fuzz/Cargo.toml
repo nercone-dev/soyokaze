@@ -1,0 +1,55 @@
+[package]
+name = "soyokaze-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Its own workspace root: the fuzz crate needs a nightly toolchain and sanitizer flags
+# that the library itself does not, so it stays out of the parent's build.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1.12.1"
+libfuzzer-sys = "0.4"
+soyokaze = { path = ".." }
+
+[profile.release]
+debug = true
+
+[[bin]]
+name = "huffman"
+path = "fuzz_targets/huffman.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hpack"
+path = "fuzz_targets/hpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "qpack"
+path = "fuzz_targets/qpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frames"
+path = "fuzz_targets/frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "everything"
+path = "fuzz_targets/everything.rs"
+test = false
+doc = false
+bench = false
