@@ -72,7 +72,7 @@ fn every_frame_round_trips() {
     let frames = [
         Frame::Data { stream_id: StreamID(1), end_stream: true, data: b"hello".to_vec().into() },
         Frame::Data { stream_id: StreamID(1), end_stream: false, data: Vec::new().into() },
-        Frame::Headers { stream_id: StreamID(3), end_stream: false, end_headers: true, block: vec![0x82] },
+        Frame::Headers { stream_id: StreamID(3), end_stream: false, end_headers: true, block: vec![0x82].into() },
         Frame::Priority { stream_id: StreamID(5), dependency: StreamID(3), exclusive: true, weight: 16 },
         Frame::RstStream { stream_id: StreamID(7), error_code: h2::CANCEL },
         Frame::Settings { ack: false, params: vec![(h2::SETTINGS_MAX_FRAME_SIZE, 16_384)] },
@@ -80,7 +80,7 @@ fn every_frame_round_trips() {
         Frame::Ping { ack: false, payload: [1, 2, 3, 4, 5, 6, 7, 8] },
         Frame::GoAway { last_stream_id: StreamID(9), error_code: h2::NO_ERROR, debug_data: b"bye".to_vec() },
         Frame::WindowUpdate { stream_id: StreamID(0), increment: 65_535 },
-        Frame::Continuation { stream_id: StreamID(3), end_headers: true, block: vec![0x86] },
+        Frame::Continuation { stream_id: StreamID(3), end_headers: true, block: vec![0x86].into() },
     ];
 
     for frame in frames {
@@ -93,7 +93,7 @@ fn a_push_promise_round_trips_with_its_promised_stream() {
     let frame = Frame::PushPromise {
         stream_id: StreamID(1),
         promised_stream_id: StreamID(2),
-        block: vec![0x82, 0x86],
+        block: vec![0x82, 0x86].into(),
     };
 
     assert_eq!(reencode(&frame).as_ref(), Some(&frame));
@@ -128,7 +128,7 @@ fn a_priority_prefix_is_stripped_from_a_header_block() {
 
     assert_eq!(
         Frame::decode(header, &payload).ok(),
-        Some(Frame::Headers { stream_id: StreamID(1), end_stream: false, end_headers: false, block: vec![0x82] }),
+        Some(Frame::Headers { stream_id: StreamID(1), end_stream: false, end_headers: false, block: vec![0x82].into() }),
     );
 }
 
@@ -451,7 +451,7 @@ async fn refuses_a_preface_that_is_not_the_preface() {
 async fn refuses_a_stream_the_peer_may_not_open() {
     let (mut client, mut server) = pair().await;
 
-    let block = Frame::Headers { stream_id: StreamID(2), end_stream: true, end_headers: true, block: vec![0x82, 0x86, 0x84] };
+    let block = Frame::Headers { stream_id: StreamID(2), end_stream: true, end_headers: true, block: vec![0x82, 0x86, 0x84].into() };
     client.write(&block).await.expect("the frame did not send");
 
     assert!(matches!(server.receive().await, Err(Error::Protocol(_))));
@@ -465,7 +465,7 @@ async fn refuses_a_stream_identifier_that_goes_backwards() {
         stream_id,
         end_stream: true,
         end_headers: true,
-        block: vec![0x82, 0x86, 0x84],
+        block: vec![0x82, 0x86, 0x84].into(),
     };
 
     client.write(&request(StreamID(3))).await.expect("the frame did not send");
@@ -479,7 +479,7 @@ async fn refuses_a_stream_identifier_that_goes_backwards() {
 async fn refuses_a_continuation_that_starts_a_block() {
     let (mut client, mut server) = pair().await;
 
-    let stray = Frame::Continuation { stream_id: StreamID(1), end_headers: true, block: vec![0x82] };
+    let stray = Frame::Continuation { stream_id: StreamID(1), end_headers: true, block: vec![0x82].into() };
     client.write(&stray).await.expect("the frame did not send");
 
     assert!(matches!(server.receive().await, Err(Error::Protocol(_))));
@@ -624,4 +624,55 @@ async fn opening_streams_without_reading_them_does_not_grow_without_limit() {
 
     assert!(matches!(refused, Error::Limit(_)), "an unanswered client was refused with {refused:?}");
     assert_eq!(opened, ceiling, "the client stopped opening streams at the wrong point");
+}
+
+#[tokio::test]
+async fn unread_bodies_are_bounded_across_every_stream_together() {
+    let ceiling = 4 * 1024u64;
+
+    let mut bounded = limits();
+    bounded.max_connection_buffer_size = ceiling;
+
+    let (client_pipe, server_pipe) = tokio::io::duplex(1024 * 1024);
+    let mut client = H2Connection::new(client_pipe, Role::UserAgent, id(), bounded);
+    let mut server = H2Connection::new(server_pipe, Role::Origin, id(), bounded);
+
+    client.start().await.expect("the client preface did not send");
+    server.start().await.expect("the server did not accept the preface");
+
+    let chunk = vec![0u8; 512];
+    let mut streams = 0u64;
+
+    loop {
+        let mut request = Message::request(Method::CONNECT, "example.test:443", Version::V2_0);
+        request.headers = Some(Headers::new());
+        client.send(request).await.expect("the CONNECT did not send");
+
+        let opened = loop {
+            match server.pump().await.expect("the CONNECT was refused") {
+                Some(message) => break message.stream_id.expect("the request named no stream"),
+                None => continue,
+            }
+        };
+
+        client.write_data(opened, &chunk, false).await.expect("the body did not send");
+        client.flush_out().await.expect("the body did not flush");
+
+        let held = server.buffered();
+        let outcome = server.pump().await;
+        let after = held + chunk.len() as u64;
+
+        if after <= ceiling {
+            outcome.unwrap_or_else(|error| panic!("{after} octets were refused below the {ceiling} ceiling: {error:?}"));
+            assert_eq!(server.buffered(), after, "the connection lost track of what it is holding");
+            streams += 1;
+            continue;
+        }
+
+        let error = outcome.expect_err(&format!("{after} octets passed the {ceiling} ceiling"));
+        assert!(matches!(error, Error::Limit(_)), "the ceiling refused with {error:?}");
+        break;
+    }
+
+    assert!(streams > 1, "the ceiling should be reached across several streams, not one");
 }

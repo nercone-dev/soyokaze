@@ -69,7 +69,8 @@ impl Negotiation {
     pub async fn accept(&self, incoming: Incoming) -> Result<AnyConnection, Error> {
         match incoming {
             Incoming::Stream { transport, id } => {
-                common::within(self.limits.read_timeout, self.assemble(transport, id)).await?
+                let assembling = std::pin::pin!(self.assemble(transport, id));
+                common::within(self.limits.read_timeout, assembling).await?
             }
 
             Incoming::QUIC(incoming) => {

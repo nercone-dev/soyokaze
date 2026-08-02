@@ -153,15 +153,30 @@ fn halves(group: &mut Group) {
     });
 }
 
+fn held_streams(session: &mut H3Session, held: usize) {
+    for index in 0..held {
+        let mut state = StreamState::default();
+        state.buffer.extend_from_slice(&[0u8; 64]);
+
+        session.streams.insert(StreamID(index as u64 * 4), state);
+        session.buffered_bound += 64;
+    }
+}
+
 fn deadline(group: &mut Group) {
     for held in [1usize, 100, 1_000, 10_000, 50_000] {
         let mut session = server();
-        for index in 0..held {
-            session.streams.insert(StreamID(index as u64 * 4), StreamState::default());
-        }
+        held_streams(&mut session, held);
 
         let (_connection, worker) = H3Connection::pair(session, None);
         group.bench(&format!("block_deadline ({held} streams held)"), || opaque(&worker).block_deadline());
+    }
+
+    for held in [1usize, 100, 1_000, 10_000, 50_000] {
+        let mut session = server();
+        held_streams(&mut session, held);
+
+        group.bench(&format!("overbuffered ({held} streams held)"), || opaque(session.overbuffered()));
     }
 }
 
@@ -238,7 +253,7 @@ fn main() {
     }
 
     if only("deadline") {
-        let mut group = Group::new("h3 worker per-I/O-cycle scan");
+        let mut group = Group::new("h3 per-I/O-cycle scans");
         deadline(&mut group);
     }
 

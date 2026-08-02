@@ -1050,7 +1050,7 @@ where
 
         let body = match message.body.take().map(Body::into_inline) {
             Some(Ok(data)) => Some(data),
-            Some(Err(path)) => Some(Bytes::from(tokio::fs::read(path).await?)),
+            Some(Err(path)) => Some(Bytes::from(Box::pin(tokio::fs::read(path)).await?)),
             None => None,
         };
 
@@ -1176,7 +1176,7 @@ where
                 self.buffer.consume(length + 2);
 
                 if let Some(status) = status {
-                    let _ = self.reject(status).await;
+                    let _ = Box::pin(self.reject(status)).await;
                 }
 
                 return Err(error);
@@ -1362,11 +1362,15 @@ where
     }
 
     async fn send(&mut self, message: Message) -> Result<(), Error> {
-        common::within(self.limits.send_timeout, self.send_message(message)).await?
+        let timeout = self.limits.send_timeout;
+        let sending = std::pin::pin!(self.send_message(message));
+        common::within(timeout, sending).await?
     }
 
     async fn receive(&mut self) -> Result<Message, Error> {
-        common::within(self.limits.receive_timeout, self.receive_message()).await?
+        let timeout = self.limits.receive_timeout;
+        let receiving = std::pin::pin!(self.receive_message());
+        common::within(timeout, receiving).await?
     }
 
     async fn close(&mut self) {

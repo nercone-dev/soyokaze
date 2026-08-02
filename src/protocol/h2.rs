@@ -259,7 +259,7 @@ pub enum Frame {
         /// Whether the field section is complete.
         end_headers: bool,
         /// The compressed field block, priority information already stripped.
-        block: Vec<u8>,
+        block: Bytes,
     },
     /// A priority hint, which this implementation reads and ignores.
     Priority {
@@ -293,7 +293,7 @@ pub enum Frame {
         /// The stream being promised.
         promised_stream_id: StreamID,
         /// The compressed field block of the promised request.
-        block: Vec<u8>,
+        block: Bytes,
     },
     /// A liveness probe, or its acknowledgement.
     Ping {
@@ -325,7 +325,7 @@ pub enum Frame {
         /// Whether the field section is complete.
         end_headers: bool,
         /// The next part of the compressed field block.
-        block: Vec<u8>,
+        block: Bytes,
     },
 }
 
@@ -484,6 +484,11 @@ impl Frame {
             return Err(Error::Protocol(format!("{:?} frame on stream {}", header.kind, header.stream_id.0)));
         }
 
+        let borrow = |slice: &[u8]| match shared {
+            Some(whole) => whole.slice_ref(slice),
+            None => Bytes::copy_from_slice(slice),
+        };
+
         let stream_id = header.stream_id;
         let payload = if header.flags & PADDED != 0 && matches!(header.kind, FrameType::Data | FrameType::Headers | FrameType::PushPromise)
         {
@@ -501,10 +506,7 @@ impl Frame {
             FrameType::Data => Ok(Self::Data {
                 stream_id,
                 end_stream: header.flags & END_STREAM != 0,
-                data: match shared {
-                    Some(whole) => whole.slice_ref(payload),
-                    None => Bytes::copy_from_slice(payload),
-                },
+                data: borrow(payload),
             }),
 
             FrameType::Headers => {
@@ -518,7 +520,7 @@ impl Frame {
                     stream_id,
                     end_stream: header.flags & END_STREAM != 0,
                     end_headers: header.flags & END_HEADERS != 0,
-                    block: block.to_vec(),
+                    block: borrow(block),
                 })
             }
 
@@ -572,7 +574,7 @@ impl Frame {
                 Ok(Self::PushPromise {
                     stream_id,
                     promised_stream_id: StreamID((promised & MAXIMUM_WINDOW_SIZE) as u64),
-                    block: payload[4..].to_vec(),
+                    block: borrow(&payload[4..]),
                 })
             }
 
@@ -607,7 +609,7 @@ impl Frame {
             FrameType::Continuation => Ok(Self::Continuation {
                 stream_id,
                 end_headers: header.flags & END_HEADERS != 0,
-                block: payload.to_vec(),
+                block: borrow(payload),
             }),
         }
     }
@@ -911,6 +913,7 @@ pub struct H2Connection<T> {
     ready: VecDeque<Message>,
     out: BytesMut,
     block: Vec<u8>,
+    buffered_bound: u64,
 
     premature_resets: u32,
     idle_frames: u32,
@@ -956,6 +959,7 @@ where
             ready: VecDeque::new(),
             out: BytesMut::new(),
             block: Vec::new(),
+            buffered_bound: 0,
 
             premature_resets: 0,
             idle_frames: 0,
@@ -1283,6 +1287,27 @@ where
         self.streams.values().map(|stream| stream.body.len() as u64).sum()
     }
 
+    /// Whether the connection is holding more than
+    /// [`Limits::max_connection_buffer_size`] across all of its streams.
+    ///
+    /// [`H2Connection::buffered`] walks every stream, and this is asked on
+    /// every DATA frame, which would make one pass over the connection's
+    /// streams cost a walk per stream. So [`H2Connection::buffered_bound`] is
+    /// kept instead: it grows with every octet taken in and is never reduced as
+    /// octets are read away, so it can read high but never low. The exact sum
+    /// is taken only once the bound reaches the ceiling, which is at most once
+    /// per ceiling's worth of octets rather than once per frame.
+    pub fn overbuffered(&mut self) -> bool {
+        let limit = self.limits.max_connection_buffer_size;
+
+        if self.buffered_bound <= limit {
+            return false;
+        }
+
+        self.buffered_bound = self.buffered();
+        self.buffered_bound > limit
+    }
+
     /// Drops a stream if it has finished, so its state is not held forever.
     pub fn retire(&mut self, stream_id: StreamID) {
         if self.streams.get(&stream_id).is_some_and(|stream| stream.state == StreamState::Closed) {
@@ -1460,13 +1485,16 @@ where
 
             Frame::Headers { stream_id, end_stream, end_headers, block } => {
                 self.begin_stream(stream_id)?;
-                self.open_stream(stream_id)?.block = block;
 
-                if !end_headers {
-                    return self.continue_headers(stream_id, end_stream).await;
+                if end_headers {
+                    return self.finish_headers(stream_id, &block, end_stream);
                 }
 
-                self.finish_headers(stream_id, end_stream)
+                let gathered = &mut self.open_stream(stream_id)?.block;
+                gathered.clear();
+                gathered.extend_from_slice(&block);
+
+                self.continue_headers(stream_id, end_stream).await
             }
 
             Frame::Continuation { .. } => {
@@ -1500,6 +1528,8 @@ where
                 let body = stream.body.len() as u64;
                 let received = stream.received();
 
+                self.buffered_bound = self.buffered_bound.saturating_add(data.len() as u64);
+
                 let limit = self.limits.max_message_body_size;
                 if body > limit {
                     return Err(Error::Limit(format!("body exceeds {limit} octets")));
@@ -1510,8 +1540,8 @@ where
                     return Err(Error::Limit(format!("message exceeds {limit} octets")));
                 }
 
-                let limit = self.limits.max_connection_buffer_size;
-                if self.buffered() > limit {
+                if self.overbuffered() {
+                    let limit = self.limits.max_connection_buffer_size;
                     return Err(Error::Limit(format!("buffered messages exceed {limit} octets")));
                 }
 
@@ -1573,7 +1603,15 @@ where
                     self.open_stream(stream_id)?.block.extend_from_slice(&block);
 
                     if end_headers {
-                        return self.finish_headers(stream_id, end_stream);
+                        let gathered = std::mem::take(&mut self.open_stream(stream_id)?.block);
+                        let finished = self.finish_headers(stream_id, &gathered, end_stream);
+
+                        if let Ok(stream) = self.open_stream(stream_id) {
+                            stream.block = gathered;
+                            stream.block.clear();
+                        }
+
+                        return finished;
                     }
                 }
 
@@ -1624,6 +1662,11 @@ where
 
     /// Decodes a complete field section and folds it into the stream's message.
     ///
+    /// `block` is the whole compressed section, which is passed in rather than
+    /// read off the stream so that a section arriving in one HEADERS frame can
+    /// be decoded where it already sits in the read buffer; only one gathered
+    /// across CONTINUATION frames comes from [`H2Stream`]'s own buffer.
+    ///
     /// The first section on a stream becomes the message; a second becomes its
     /// trailers. Informational responses are handed back as they are, since
     /// the real response follows on the same stream.
@@ -1634,13 +1677,13 @@ where
     /// [`Limits::max_header_count`], [`Error::Protocol`] when a trailer
     /// section carries a pseudo-header, and otherwise as the HPACK decoder and
     /// [`common::message_from`].
-    pub fn finish_headers(&mut self, stream_id: StreamID, end_stream: bool) -> Result<Option<Message>, Error> {
+    pub fn finish_headers(&mut self, stream_id: StreamID, block: &[u8], end_stream: bool) -> Result<Option<Message>, Error> {
         self.idle_frames = 0;
 
-        let (block, received) = {
+        let received = {
             let stream = self.open_stream(stream_id)?;
-            stream.head += stream.block.len() as u64;
-            (std::mem::take(&mut stream.block), stream.received())
+            stream.head += block.len() as u64;
+            stream.received()
         };
 
         let limit = self.limits.max_message_size;
@@ -1648,7 +1691,7 @@ where
             return Err(Error::Limit(format!("message exceeds {limit} octets")));
         }
 
-        let decoded = self.hpack_decoder.decode(&block)?;
+        let decoded = self.hpack_decoder.decode(block)?;
 
         if decoded.len() > self.limits.max_header_count as usize {
             return Err(Error::Limit(format!("more than {} header fields", self.limits.max_header_count)));
@@ -1948,11 +1991,15 @@ where
     }
 
     async fn send(&mut self, message: Message) -> Result<(), Error> {
-        common::within(self.limits.send_timeout, self.send_message(message)).await?
+        let timeout = self.limits.send_timeout;
+        let sending = std::pin::pin!(self.send_message(message));
+        common::within(timeout, sending).await?
     }
 
     async fn receive(&mut self) -> Result<Message, Error> {
-        common::within(self.limits.receive_timeout, self.receive_message()).await?
+        let timeout = self.limits.receive_timeout;
+        let receiving = std::pin::pin!(self.receive_message());
+        common::within(timeout, receiving).await?
     }
 
     async fn close(&mut self) {

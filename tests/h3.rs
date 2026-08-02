@@ -689,3 +689,41 @@ fn a_tunnel_nobody_claims_is_not_buffered_without_limit() {
 
     assert!(refused.is_some(), "an unclaimed tunnel buffered octets without limit");
 }
+
+#[test]
+fn unread_data_is_bounded_across_every_stream_together() {
+    let ceiling = 4 * 1024u64;
+
+    let mut bounded = limits();
+    bounded.max_connection_buffer_size = ceiling;
+
+    let mut session = H3Session::new(Role::Origin, id(), bounded);
+    let settings = Frame::Settings(Settings::default().parameters()).encode();
+    session.on_control_bytes(&settings).expect("the peer settings were refused");
+
+    let mut chunk = BytesMut::new();
+    h3::encode_varint(&mut chunk, FrameType::Data.code());
+    h3::encode_varint(&mut chunk, 1 << 20);
+    chunk.extend_from_slice(&[0u8; 512]);
+
+    let mut streams = 0u64;
+
+    loop {
+        let held = session.buffered();
+        let outcome = session.on_stream_bytes(StreamID(streams * 4), &chunk, false);
+        let after = held + chunk.len() as u64;
+
+        if after <= ceiling {
+            outcome.unwrap_or_else(|error| panic!("{after} octets were refused below the {ceiling} ceiling: {error:?}"));
+            assert_eq!(session.buffered(), after, "the connection lost track of what it is holding");
+            streams += 1;
+            continue;
+        }
+
+        let error = outcome.expect_err(&format!("{after} octets passed the {ceiling} ceiling"));
+        assert!(matches!(error, Error::Limit(_)), "the ceiling refused with {error:?}");
+        break;
+    }
+
+    assert!(streams > 1, "the ceiling should be reached across several streams, not one");
+}

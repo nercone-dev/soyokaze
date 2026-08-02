@@ -48,6 +48,12 @@ pub fn duration(seconds: f64) -> Option<Duration> {
 /// operation is simply awaited. The operation is polled once before the timer
 /// is armed, so work that is already finished never pays for one.
 ///
+/// The operation is taken by value, so a caller whose operation is a large
+/// future — one whole message going out or coming in, rather than a single
+/// read — should hand over a `Pin<&mut _>` from [`std::pin::pin!`] instead.
+/// That leaves the state machine where the caller built it rather than copying
+/// it into this one, which for a message-sized future is kilobytes a message.
+///
 /// # Errors
 ///
 /// Returns [`Error::Timeout`] when the deadline passes first.

@@ -622,6 +622,9 @@ pub struct H3Session {
     /// Messages that have completed and are waiting to be handed over.
     pub ready: VecDeque<Message>,
 
+    /// An upper bound on [`H3Session::buffered`]; see [`H3Session::overbuffered`].
+    pub buffered_bound: u64,
+
     /// QPACK encoder instructions waiting to go out.
     pub encoder_out: Vec<u8>,
     /// QPACK decoder instructions waiting to go out.
@@ -663,6 +666,7 @@ impl H3Session {
             streams: common::StreamMap::default(),
             blocked: common::StreamMap::default(),
             ready: VecDeque::new(),
+            buffered_bound: 0,
             encoder_out: Vec::new(),
             decoder_out: Vec::new(),
             encoder_recv: BytesMut::new(),
@@ -828,8 +832,12 @@ impl H3Session {
             }
         }
 
-        let blocked: Vec<StreamID> = self.streams.iter().filter(|(_, state)| state.pending.is_some()).map(|(id, _)| *id).collect();
-        for stream_id in blocked {
+        if self.blocked.is_empty() {
+            return Ok(());
+        }
+
+        let waiting: Vec<StreamID> = self.blocked.keys().copied().collect();
+        for stream_id in waiting {
             self.advance(stream_id)?;
         }
 
@@ -943,15 +951,18 @@ impl H3Session {
         if fin {
             state.eof = true;
         }
+        let unparsed = state.buffer.len() as u64;
+
+        self.buffered_bound = self.buffered_bound.saturating_add(bytes.len() as u64);
 
         let limit = self.limits.max_message_size;
-        if state.buffer.len() as u64 > limit {
+        if unparsed > limit {
             let reason = format!("unparsed stream data exceeds {limit} octets");
             return Err(Error::stream(stream_id, H3_EXCESSIVE_LOAD, reason));
         }
 
-        let limit = self.limits.max_connection_buffer_size;
-        if self.buffered() > limit {
+        if self.overbuffered() {
+            let limit = self.limits.max_connection_buffer_size;
             return Err(Error::Limit(format!("buffered messages exceed {limit} octets")));
         }
 
@@ -962,6 +973,27 @@ impl H3Session {
     /// its streams.
     pub fn buffered(&self) -> u64 {
         self.streams.values().map(|state| (state.buffer.len() + state.body.len()) as u64).sum()
+    }
+
+    /// Whether the connection is holding more than
+    /// [`Limits::max_connection_buffer_size`] across all of its streams.
+    ///
+    /// [`H3Session::buffered`] walks every stream, and this is asked on every
+    /// read, which would make one pass over the connection's streams cost a
+    /// walk per stream. So [`H3Session::buffered_bound`] is kept instead: it
+    /// grows with every octet taken in and is never reduced as octets are
+    /// parsed away, so it can read high but never low. The exact sum is taken
+    /// only once the bound reaches the ceiling, which is at most once per
+    /// ceiling's worth of octets rather than once per read.
+    pub fn overbuffered(&mut self) -> bool {
+        let limit = self.limits.max_connection_buffer_size;
+
+        if self.buffered_bound <= limit {
+            return false;
+        }
+
+        self.buffered_bound = self.buffered();
+        self.buffered_bound > limit
     }
 
     /// Parses as far as it can on one stream, and delivers the message if it
@@ -1548,11 +1580,15 @@ impl Connection for H3Connection {
     }
 
     async fn send(&mut self, message: Message) -> Result<(), Error> {
-        common::within(self.limits.send_timeout, self.send_message(message)).await?
+        let timeout = self.limits.send_timeout;
+        let sending = std::pin::pin!(self.send_message(message));
+        common::within(timeout, sending).await?
     }
 
     async fn receive(&mut self) -> Result<Message, Error> {
-        common::within(self.limits.receive_timeout, self.receive_message()).await?
+        let timeout = self.limits.receive_timeout;
+        let receiving = std::pin::pin!(self.receive_message());
+        common::within(timeout, receiving).await?
     }
 
     async fn close(&mut self) {

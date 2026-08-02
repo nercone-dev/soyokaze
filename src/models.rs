@@ -419,6 +419,10 @@ impl Body {
 
     /// The body as octets, reading the file if there is one.
     ///
+    /// The filesystem read is boxed, so that a caller awaiting this does not
+    /// carry its state machine on the far commoner path where the body is
+    /// already in memory.
+    ///
     /// # Errors
     ///
     /// Returns the I/O error from reading a [`Body::File`].
@@ -426,11 +430,13 @@ impl Body {
         match self {
             Self::Data(data) => Ok(data.clone()),
             Self::Text(text) => Ok(Bytes::copy_from_slice(text.as_bytes())),
-            Self::File(path) => Ok(Bytes::from(tokio::fs::read(path).await?)),
+            Self::File(path) => Ok(Bytes::from(Box::pin(tokio::fs::read(path)).await?)),
         }
     }
 
     /// Consumes the body and returns its octets, reading the file if there is one.
+    ///
+    /// The filesystem read is boxed, for the reason [`Body::bytes`] gives.
     ///
     /// # Errors
     ///
@@ -438,7 +444,7 @@ impl Body {
     pub async fn into_bytes(self) -> Result<Bytes, std::io::Error> {
         match self.into_inline() {
             Ok(data) => Ok(data),
-            Err(path) => Ok(Bytes::from(tokio::fs::read(path).await?)),
+            Err(path) => Ok(Bytes::from(Box::pin(tokio::fs::read(path)).await?)),
         }
     }
 
