@@ -66,6 +66,7 @@
 //!
 //! [`AnyConnection`]: protocol::common::AnyConnection
 
+pub mod ffi;
 pub mod models;
 pub mod errors;
 pub mod headers;

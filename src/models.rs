@@ -135,6 +135,7 @@ impl Url {
 }
 
 /// An HTTP version.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Version {
     /// HTTP/1.0.
@@ -215,6 +216,7 @@ impl FromStr for Version {
 }
 
 /// A request method.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     /// `GET`.
