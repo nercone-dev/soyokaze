@@ -75,7 +75,9 @@ impl ClientBuilder {
         self
     }
 
-    /// Trusts exactly these DER certificates instead of the platform store.
+    /// Trusts exactly these certificates instead of the platform store.
+    ///
+    /// Each entry is DER or PEM, so a whole bundle of roots may be one entry.
     pub fn roots(mut self, roots: Vec<Vec<u8>>) -> Self {
         self.roots = Some(roots);
         self

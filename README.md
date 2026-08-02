@@ -165,12 +165,29 @@ use soyokaze::Server;
 let server = Server::builder()
     .version(Version::V3_0)
     .version(Version::V2_0)
-    .identity(vec![certificate_der], private_key_der)
+    .identity(vec![std::fs::read("chain.pem")?], std::fs::read("key.pem")?)
     .max_connections_per_ip(64)
     .build();
 
 let handle = server.serve(Site, &[Port::TCP(443), Port::QUIC(443)]).await?;
 ```
+
+Certificates and keys are read in whichever encoding they arrive in — nothing has to be
+declared. A certificate is DER or PEM, and one PEM blob may hold a whole chain, so a chain can
+be a single bundle or one entry per certificate. A key is PKCS#8, PKCS#1 or SEC1, in either
+encoding. Each side reads only its own sections, so a combined file holding a certificate and
+its key can be passed as both. `Client::builder().roots(..)` takes the same shapes. A PKCS#12
+archive — a `.p12` or `.pfx` — is unwrapped first:
+
+```rust
+use soyokaze::Identity;
+
+let identity = Identity::from_pkcs12(&std::fs::read("site.p12")?, "passphrase")?;
+let server = Server::builder().with_identity(identity).build();
+```
+
+Keys encrypted under a passphrase are not read directly; ship them as PKCS#12, or decrypt them
+first.
 
 WebSocket works the same way from either end. `Client::websocket` performs whichever
 handshake the negotiated version calls for, and a server overrides `Handler::on_websocket`:

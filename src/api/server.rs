@@ -96,8 +96,21 @@ impl ServerBuilder {
     ///
     /// Required for TLS and for any QUIC port; without one, a TCP port is
     /// served in plaintext.
-    pub fn identity(mut self, certificates: Vec<Vec<u8>>, key: Vec<u8>) -> Self {
-        self.identity = Some(Identity::new(certificates, key));
+    ///
+    /// Each blob is DER or PEM, so the chain may be one PEM bundle or one
+    /// certificate per entry, and the key PKCS#8, PKCS#1 or SEC1. A PKCS#12
+    /// archive goes through [`Identity::from_pkcs12`] and then
+    /// [`ServerBuilder::with_identity`].
+    pub fn identity(self, certificates: Vec<Vec<u8>>, key: Vec<u8>) -> Self {
+        self.with_identity(Identity::new(certificates, key))
+    }
+
+    /// Sets the [`Identity`] to serve.
+    ///
+    /// As [`ServerBuilder::identity`], for an identity that was built rather
+    /// than assembled from loose blobs.
+    pub fn with_identity(mut self, identity: Identity) -> Self {
+        self.identity = Some(identity);
         self
     }
 

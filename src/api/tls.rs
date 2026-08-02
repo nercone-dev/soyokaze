@@ -9,12 +9,21 @@
 //! watcher sees only the public name. [`EchKeys`] is what a server holds,
 //! [`EchConfigList`] is what a client is given, and [`EchStatus`] is how
 //! either finds out whether it was actually used.
+//!
+//! Certificates and keys are taken in whichever encoding they arrive in:
+//! [`Format`] tells DER and PEM apart by their contents, so nothing has to be
+//! declared. [`certificates`] and [`private_key`] are what read them, and
+//! [`Identity::from_pkcs12`] unwraps a `.p12` or `.pfx` archive into the same
+//! shape.
 
 use boring::hpke::HpkeKey;
-use boring::pkey::PKey;
+use boring::pkcs12::Pkcs12;
+use boring::pkey::{PKey, Private};
 use boring::ssl::{AlpnError, SslAcceptor, SslConnector, SslContextBuilder, SslEchKeys, SslMethod, SslVerifyMode};
+use boring::stack::Stack;
 use boring::x509::store::X509StoreBuilder;
 use boring::x509::X509;
+use foreign_types::ForeignType;
 
 use crate::errors::Error;
 use crate::models::Version;
@@ -93,10 +102,133 @@ pub fn negotiated(alpn: Option<&[u8]>, versions: &[Version]) -> Result<Version, 
         .ok_or_else(|| Error::Version(format!("the peer selected {:?}", String::from_utf8_lossy(alpn))))
 }
 
+/// How a certificate or a private key was encoded.
+///
+/// The two are the same bytes either way round: PEM is DER in Base64 between
+/// `-----BEGIN`/`-----END` lines. The difference that matters here is that one
+/// DER blob holds exactly one object, while one PEM blob holds as many as were
+/// concatenated into it — which is how a chain, or a chain and its key, is
+/// usually shipped in a single file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    /// Binary DER.
+    Der,
+    /// Base64 DER between armour lines.
+    Pem,
+}
+
+impl Format {
+    /// The ASN.1 tag every DER object read here opens with: a SEQUENCE.
+    pub const SEQUENCE: u8 = 0x30;
+
+    /// The format a blob is in, recognised from its contents.
+    ///
+    /// The first byte that is not whitespace decides it: DER starts with
+    /// [`Format::SEQUENCE`], and anything else is text, so it is read as PEM.
+    /// Nothing insists on armour coming first, since a PEM file may open with
+    /// a human-readable description of what follows.
+    pub fn of(raw: &[u8]) -> Self {
+        match raw.iter().find(|byte| !byte.is_ascii_whitespace()) {
+            Some(&Self::SEQUENCE) => Self::Der,
+            _ => Self::Pem,
+        }
+    }
+}
+
+/// Parses every certificate in one blob, DER or PEM.
+///
+/// A DER blob carries exactly one certificate; a PEM blob carries as many as
+/// it holds, returned in the order they appear. PEM sections that are not
+/// certificates are skipped, so a file holding a chain and its key parses to
+/// the chain alone.
+///
+/// # Errors
+///
+/// Returns [`Error::Tls`] when the blob will not parse, or when a PEM blob
+/// carries no certificate at all.
+pub fn certificates(raw: &[u8]) -> Result<Vec<X509>, Error> {
+    match Format::of(raw) {
+        Format::Der => Ok(vec![X509::from_der(raw).map_err(tls_error)?]),
+        Format::Pem => {
+            let parsed = X509::stack_from_pem(raw).map_err(tls_error)?;
+
+            if parsed.is_empty() {
+                return Err(Error::Tls("PEM data carries no certificate".into()));
+            }
+
+            Ok(parsed)
+        }
+    }
+}
+
+/// Parses every certificate across several blobs, each DER or PEM.
+///
+/// Certificates come back in the order the blobs give them, so a chain may
+/// arrive as one PEM bundle, as one blob per certificate, or as a mixture of
+/// the two.
+///
+/// # Errors
+///
+/// As [`certificates`].
+pub fn certificate_list(blobs: &[Vec<u8>]) -> Result<Vec<X509>, Error> {
+    let mut list = Vec::with_capacity(blobs.len());
+
+    for blob in blobs {
+        list.extend(certificates(blob)?);
+    }
+
+    Ok(list)
+}
+
+/// Parses a private key, DER or PEM.
+///
+/// PKCS#8 (`PRIVATE KEY`), PKCS#1 (`RSA PRIVATE KEY`) and SEC1
+/// (`EC PRIVATE KEY`) are all accepted, in either format; which one it is is
+/// read off the key itself. A key encrypted under a passphrase is not
+/// accepted — decrypt it first, or ship it as PKCS#12 and use
+/// [`Identity::from_pkcs12`].
+///
+/// # Errors
+///
+/// Returns [`Error::Tls`] when the blob will not parse as any of those.
+pub fn private_key(raw: &[u8]) -> Result<PKey<Private>, Error> {
+    match Format::of(raw) {
+        Format::Der => PKey::private_key_from_der(raw).map_err(tls_error),
+        Format::Pem => PKey::private_key_from_pem(raw).map_err(tls_error),
+    }
+}
+
+/// Points a context at the roots it should verify against.
+///
+/// An empty `roots` leaves the platform's trust store in place; otherwise only
+/// the certificates given are trusted. Each is DER or PEM, so one PEM bundle
+/// of roots is as good as one blob apiece.
+///
+/// # Errors
+///
+/// Returns [`Error::Tls`] when a certificate will not parse or BoringSSL
+/// rejects the store.
+pub fn install_roots(roots: &[Vec<u8>], builder: &mut SslContextBuilder) -> Result<(), Error> {
+    if roots.is_empty() {
+        builder.set_default_verify_paths().map_err(tls_error)?;
+        return Ok(());
+    }
+
+    let mut store = X509StoreBuilder::new().map_err(tls_error)?;
+
+    for root in certificate_list(roots)? {
+        store.add_cert(root).map_err(tls_error)?;
+    }
+
+    builder.set_verify_cert_store(store.build()).map_err(tls_error)?;
+    Ok(())
+}
+
 /// Builds the TLS configuration a client dials with.
 ///
-/// An empty `roots` uses the platform's trust store; otherwise only the DER
-/// certificates given are trusted. Certificates are verified either way.
+/// An empty `roots` uses the platform's trust store; otherwise only the
+/// certificates given are trusted, each in DER or PEM. Certificates are
+/// verified either way.
 ///
 /// # Errors
 ///
@@ -105,16 +237,7 @@ pub fn negotiated(alpn: Option<&[u8]>, versions: &[Version]) -> Result<Version, 
 pub fn client_config(roots: &[Vec<u8>], versions: &[Version]) -> Result<SslConnector, Error> {
     let mut builder = SslConnector::builder(SslMethod::tls()).map_err(tls_error)?;
     builder.set_alpn_protos(&alpn_wire(versions)).map_err(tls_error)?;
-
-    if roots.is_empty() {
-        builder.set_default_verify_paths().map_err(tls_error)?;
-    } else {
-        let mut store = X509StoreBuilder::new().map_err(tls_error)?;
-        for der in roots {
-            store.add_cert(X509::from_der(der).map_err(tls_error)?).map_err(tls_error)?;
-        }
-        builder.set_verify_cert_store(store.build()).map_err(tls_error)?;
-    }
+    install_roots(roots, &mut builder)?;
 
     Ok(builder.build())
 }
@@ -131,19 +254,7 @@ pub fn client_config(roots: &[Vec<u8>], versions: &[Version]) -> Result<SslConne
 /// configuration.
 pub fn server_config(identity: &Identity, versions: &[Version], ech: Option<&EchKeys>) -> Result<SslAcceptor, Error> {
     let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).map_err(tls_error)?;
-
-    let mut certificates = identity.certificates.iter();
-    let leaf = certificates.next().ok_or_else(|| Error::Tls("identity has no certificate".into()))?;
-    let leaf = X509::from_der(leaf).map_err(tls_error)?;
-    builder.set_certificate(&leaf).map_err(tls_error)?;
-
-    for extra in certificates {
-        let extra = X509::from_der(extra).map_err(tls_error)?;
-        builder.add_extra_chain_cert(extra).map_err(tls_error)?;
-    }
-
-    let key = PKey::private_key_from_pkcs8(&identity.key).map_err(tls_error)?;
-    builder.set_private_key(&key).map_err(tls_error)?;
+    identity.install(&mut builder)?;
 
     let offered = alpn(versions);
     builder.set_alpn_select_callback(move |_ssl, client| select_alpn(&offered, client).ok_or(AlpnError::NOACK));
@@ -156,21 +267,108 @@ pub fn server_config(identity: &Identity, versions: &[Version], ech: Option<&Ech
 }
 
 /// A certificate chain and the private key that goes with it.
+///
+/// Every blob is read in whichever format it turns out to be, so the chain can
+/// arrive as one PEM bundle, as one DER certificate per entry, or as a mixture
+/// of the two, and the key in PKCS#8, PKCS#1 or SEC1 either way round. Each
+/// side reads only the PEM sections that are its own, so a combined file may
+/// be given as both the chain and the key.
 #[derive(Debug, Clone)]
 pub struct Identity {
-    /// The chain in DER, leaf first, then whatever intermediates are needed.
+    /// The chain, leaf first, then whatever intermediates are needed.
     pub certificates: Vec<Vec<u8>>,
-    /// The private key, in PKCS#8 DER.
+    /// The private key.
     pub key: Vec<u8>,
 }
 
 impl Identity {
-    /// An identity from a DER chain and a PKCS#8 key.
+    /// An identity from a certificate chain and a private key.
     ///
     /// Nothing is parsed here; a malformed chain or key surfaces when a
     /// context is built from it.
     pub fn new(certificates: Vec<Vec<u8>>, key: Vec<u8>) -> Self {
         Self { certificates, key }
+    }
+
+    /// An identity from a PKCS#12 archive, as `.p12` and `.pfx` files carry.
+    ///
+    /// One archive holds the leaf, its chain and the key together under a
+    /// single passphrase; pass `""` for an archive protected by none. Unlike
+    /// [`Identity::new`], everything is parsed here, and kept as DER
+    /// afterwards, so the passphrase is not retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Tls`] when the archive will not parse, the passphrase
+    /// does not open it, it carries no certificate for its key, or its
+    /// contents will not re-encode.
+    pub fn from_pkcs12(raw: &[u8], passphrase: &str) -> Result<Self, Error> {
+        let archive = Pkcs12::from_der(raw).map_err(tls_error)?;
+        let passphrase = std::ffi::CString::new(passphrase).map_err(tls_error)?;
+
+        let mut key = std::ptr::null_mut();
+        let mut leaf = std::ptr::null_mut();
+        let mut rest = std::ptr::null_mut();
+
+        let opened = unsafe { boring_sys::PKCS12_parse(archive.as_ptr(), passphrase.as_ptr(), &mut key, &mut leaf, &mut rest) };
+
+        let key = (!key.is_null()).then(|| unsafe { PKey::<Private>::from_ptr(key) });
+        let leaf = (!leaf.is_null()).then(|| unsafe { X509::from_ptr(leaf) });
+        let rest = (!rest.is_null()).then(|| unsafe { Stack::<X509>::from_ptr(rest) });
+
+        if opened != 1 {
+            return Err(tls_error(boring::error::ErrorStack::get()));
+        }
+
+        let (Some(key), Some(leaf)) = (key, leaf) else {
+            return Err(Error::Tls("the PKCS#12 archive carries no certificate for its key".into()));
+        };
+
+        let mut certificates = vec![leaf.to_der().map_err(tls_error)?];
+
+        for extra in rest.into_iter().flatten() {
+            certificates.push(extra.to_der().map_err(tls_error)?);
+        }
+
+        Ok(Self { certificates, key: key.private_key_to_der_pkcs8().map_err(tls_error)? })
+    }
+
+    /// The chain as parsed certificates, leaf first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Tls`] when a certificate will not parse.
+    pub fn chain(&self) -> Result<Vec<X509>, Error> {
+        certificate_list(&self.certificates)
+    }
+
+    /// The private key, parsed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Tls`] when the key will not parse.
+    pub fn private_key(&self) -> Result<PKey<Private>, Error> {
+        private_key(&self.key)
+    }
+
+    /// Gives a context the chain and key to serve.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Tls`] when the identity carries no certificate, when a
+    /// certificate or the key will not parse, or when BoringSSL rejects them.
+    pub fn install(&self, builder: &mut SslContextBuilder) -> Result<(), Error> {
+        let mut chain = self.chain()?.into_iter();
+        let leaf = chain.next().ok_or_else(|| Error::Tls("identity has no certificate".into()))?;
+        builder.set_certificate(&leaf).map_err(tls_error)?;
+
+        for extra in chain {
+            builder.add_extra_chain_cert(extra).map_err(tls_error)?;
+        }
+
+        let key = self.private_key()?;
+        builder.set_private_key(&key).map_err(tls_error)?;
+        Ok(())
     }
 }
 
@@ -412,19 +610,7 @@ impl EchStatus {
 /// As [`server_config`].
 pub fn quic_server_context(identity: &Identity, ech: Option<&EchKeys>) -> Result<SslContextBuilder, Error> {
     let mut builder = SslContextBuilder::new(SslMethod::tls()).map_err(tls_error)?;
-
-    let mut certificates = identity.certificates.iter();
-    let leaf = certificates.next().ok_or_else(|| Error::Tls("identity has no certificate".into()))?;
-    let leaf = X509::from_der(leaf).map_err(tls_error)?;
-    builder.set_certificate(&leaf).map_err(tls_error)?;
-
-    for extra in certificates {
-        let extra = X509::from_der(extra).map_err(tls_error)?;
-        builder.add_extra_chain_cert(extra).map_err(tls_error)?;
-    }
-
-    let key = PKey::private_key_from_pkcs8(&identity.key).map_err(tls_error)?;
-    builder.set_private_key(&key).map_err(tls_error)?;
+    identity.install(&mut builder)?;
     builder.set_verify(SslVerifyMode::NONE);
 
     if let Some(ech) = ech {
@@ -444,16 +630,7 @@ pub fn quic_server_context(identity: &Identity, ech: Option<&EchKeys>) -> Result
 /// As [`client_config`].
 pub fn quic_client_context(roots: &[Vec<u8>]) -> Result<SslContextBuilder, Error> {
     let mut builder = SslContextBuilder::new(SslMethod::tls()).map_err(tls_error)?;
-
-    if roots.is_empty() {
-        builder.set_default_verify_paths().map_err(tls_error)?;
-    } else {
-        let mut store = X509StoreBuilder::new().map_err(tls_error)?;
-        for der in roots {
-            store.add_cert(X509::from_der(der).map_err(tls_error)?).map_err(tls_error)?;
-        }
-        builder.set_verify_cert_store(store.build()).map_err(tls_error)?;
-    }
+    install_roots(roots, &mut builder)?;
 
     builder.set_verify(SslVerifyMode::PEER);
     Ok(builder)
@@ -483,7 +660,7 @@ impl tokio_quiche::quic::ConnectionHook for QuicServerTls {
 
 /// Gives a QUIC client its TLS context.
 pub struct QuicClientTls {
-    /// The trusted roots in DER; empty uses the platform trust store.
+    /// The trusted roots, each DER or PEM; empty uses the platform trust store.
     pub roots: Vec<Vec<u8>>,
 }
 

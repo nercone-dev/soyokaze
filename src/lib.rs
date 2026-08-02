@@ -122,7 +122,7 @@ pub use headers::{Cookie, CookieJar, SameSite, SetCookie};
 pub use finalizer::{http_date, DateCache};
 pub use api::client::{Client, ClientLimits};
 pub use api::server::{cores, Cluster, Gate, Handler, Permit, RawSocket, Server, ServerLimits};
-pub use api::tls::{EchConfig, EchConfigList, EchKeys, EchStatus, Identity};
+pub use api::tls::{EchConfig, EchConfigList, EchKeys, EchStatus, Format, Identity};
 pub use helpers::hsts::{HstsPolicy, HstsStore};
 pub use helpers::text::Text;
 pub use websocket::WebSocketConnection;
