@@ -89,14 +89,73 @@ typedef struct {
     size_t path_len;
 } soyokaze_port_t;
 
+/* Which end of a connection this is. */
+typedef enum {
+    SOYOKAZE_ROLE_CLIENT = 0,
+    SOYOKAZE_ROLE_SERVER = 1
+} soyokaze_role_t;
+
+/* What one connection is allowed to spend on the peer's behalf. Every field
+ * is a ceiling; timeouts are in seconds and zero waits forever. Start from
+ * soyokaze_limits_default() and adjust. */
+typedef struct {
+    uint64_t max_message_size;
+    uint64_t max_message_body_size;
+
+    uint32_t max_startline_size;
+    uint64_t max_headers_size;
+    uint16_t max_header_count;
+    uint32_t max_chunk_header_size;
+
+    uint32_t max_pending_handshakes;
+
+    double read_timeout;
+    double write_timeout;
+    double receive_timeout;
+    double send_timeout;
+
+    uint32_t max_concurrent_streams;
+    uint64_t max_connection_buffer_size;
+    uint32_t max_premature_resets;
+
+    uint32_t max_idle_frames;
+
+    double qpack_block_timeout;
+    uint32_t max_peer_uni_streams;
+    uint32_t max_outstanding_sections;
+
+    double ws_linger_timeout;
+    uint16_t ws_max_fragments;
+
+    uint32_t max_cookies;
+    uint16_t max_cookies_per_domain;
+    uint32_t max_hsts_entries;
+} soyokaze_limits_t;
+
+soyokaze_limits_t soyokaze_limits_default(void);
+
 typedef struct soyokaze_runtime soyokaze_runtime_t;
 typedef struct soyokaze_error soyokaze_error_t;
 typedef struct soyokaze_url soyokaze_url_t;
 typedef struct soyokaze_message soyokaze_message_t;
+typedef struct soyokaze_cookie soyokaze_cookie_t;
+typedef struct soyokaze_setcookie soyokaze_setcookie_t;
+typedef struct soyokaze_cookiejar soyokaze_cookiejar_t;
+typedef struct soyokaze_identity soyokaze_identity_t;
+typedef struct soyokaze_ech_keys soyokaze_ech_keys_t;
+typedef struct soyokaze_ech_config_list soyokaze_ech_config_list_t;
 typedef struct soyokaze_client soyokaze_client_t;
 typedef struct soyokaze_connection soyokaze_connection_t;
+typedef struct soyokaze_websocket soyokaze_websocket_t;
 typedef struct soyokaze_server soyokaze_server_t;
 typedef struct soyokaze_server_handle soyokaze_server_handle_t;
+typedef struct soyokaze_cluster soyokaze_cluster_t;
+typedef struct soyokaze_fields soyokaze_fields_t;
+typedef struct soyokaze_hpack_encoder soyokaze_hpack_encoder_t;
+typedef struct soyokaze_hpack_decoder soyokaze_hpack_decoder_t;
+typedef struct soyokaze_qpack_encoder soyokaze_qpack_encoder_t;
+typedef struct soyokaze_qpack_decoder soyokaze_qpack_decoder_t;
+typedef struct soyokaze_hsts_store soyokaze_hsts_store_t;
 
 void soyokaze_buffer_free(soyokaze_buffer_t buffer);
 soyokaze_slice_t soyokaze_version(void);
@@ -127,6 +186,7 @@ soyokaze_buffer_t soyokaze_url_authority(const soyokaze_url_t *url);
 
 /* ----------------------------------------------------------------- message */
 
+soyokaze_message_t *soyokaze_message_new(soyokaze_version_t version);
 soyokaze_message_t *soyokaze_message_request(soyokaze_method_t method,
                                              const uint8_t *target,
                                              size_t target_len,
@@ -143,6 +203,7 @@ bool soyokaze_message_is_request(const soyokaze_message_t *message);
 bool soyokaze_message_is_response(const soyokaze_message_t *message);
 bool soyokaze_message_is_informational(const soyokaze_message_t *message);
 bool soyokaze_message_secure(const soyokaze_message_t *message);
+bool soyokaze_message_set_secure(soyokaze_message_t *message, bool secure);
 
 size_t soyokaze_message_header_count(const soyokaze_message_t *message);
 soyokaze_slice_t soyokaze_message_header_name(const soyokaze_message_t *message, size_t index);
@@ -158,6 +219,31 @@ bool soyokaze_message_insert_header(soyokaze_message_t *message,
 bool soyokaze_message_remove_header(soyokaze_message_t *message,
                                     const uint8_t *name, size_t name_len);
 
+size_t soyokaze_message_trailer_count(const soyokaze_message_t *message);
+soyokaze_slice_t soyokaze_message_trailer_name(const soyokaze_message_t *message, size_t index);
+soyokaze_slice_t soyokaze_message_trailer_value(const soyokaze_message_t *message, size_t index);
+soyokaze_slice_t soyokaze_message_trailer(const soyokaze_message_t *message,
+                                          const uint8_t *name, size_t name_len);
+bool soyokaze_message_append_trailer(soyokaze_message_t *message,
+                                     const uint8_t *name, size_t name_len,
+                                     const uint8_t *value, size_t value_len);
+bool soyokaze_message_insert_trailer(soyokaze_message_t *message,
+                                     const uint8_t *name, size_t name_len,
+                                     const uint8_t *value, size_t value_len);
+bool soyokaze_message_remove_trailer(soyokaze_message_t *message,
+                                     const uint8_t *name, size_t name_len);
+
+int64_t soyokaze_message_stream_id(const soyokaze_message_t *message); /* -1 when none */
+bool soyokaze_message_set_stream_id(soyokaze_message_t *message, int64_t stream_id);
+soyokaze_slice_t soyokaze_message_connection_id(const soyokaze_message_t *message);
+bool soyokaze_message_early_data(const soyokaze_message_t *message);
+bool soyokaze_message_tls(const soyokaze_message_t *message);
+int32_t soyokaze_message_tls_version(const soyokaze_message_t *message); /* wire code, -1 when none */
+int32_t soyokaze_message_tls_group(const soyokaze_message_t *message);   /* wire code, -1 when none */
+int32_t soyokaze_message_tls_cipher(const soyokaze_message_t *message);  /* wire code, -1 when none */
+bool soyokaze_message_quic(const soyokaze_message_t *message);
+int64_t soyokaze_message_quic_version(const soyokaze_message_t *message); /* -1 when none */
+
 bool soyokaze_message_set_body_data(soyokaze_message_t *message, const uint8_t *data, size_t data_len);
 bool soyokaze_message_set_body_text(soyokaze_message_t *message, const uint8_t *text, size_t text_len);
 bool soyokaze_message_set_body_file(soyokaze_message_t *message, const uint8_t *path, size_t path_len);
@@ -167,13 +253,154 @@ soyokaze_status_t soyokaze_message_body(soyokaze_runtime_t *runtime,
                                         soyokaze_buffer_t *out,
                                         soyokaze_error_t **error);
 
-/* ------------------------------------------------------------------ client */
+/* --------------------------------------------------------------- responses */
+
+soyokaze_message_t *soyokaze_response_content(const uint8_t *content_type, size_t content_type_len,
+                                              const uint8_t *body, size_t body_len,
+                                              soyokaze_version_t version);
+soyokaze_message_t *soyokaze_response_text(const uint8_t *content, size_t content_len, soyokaze_version_t version);
+soyokaze_message_t *soyokaze_response_html(const uint8_t *content, size_t content_len, soyokaze_version_t version);
+soyokaze_message_t *soyokaze_response_markdown(const uint8_t *content, size_t content_len, soyokaze_version_t version);
+soyokaze_message_t *soyokaze_response_json(const uint8_t *content, size_t content_len, soyokaze_version_t version);
+soyokaze_message_t *soyokaze_response_file(const uint8_t *path, size_t path_len, soyokaze_version_t version);
+soyokaze_message_t *soyokaze_response_redirect(const uint8_t *target, size_t target_len, soyokaze_version_t version);
+soyokaze_status_t soyokaze_message_set_cookie(soyokaze_message_t *message,
+                                              const soyokaze_setcookie_t *cookie,
+                                              soyokaze_error_t **error);
+soyokaze_status_t soyokaze_message_delete_cookie(soyokaze_message_t *message,
+                                                 const soyokaze_setcookie_t *cookie,
+                                                 soyokaze_error_t **error);
+
+/* ----------------------------------------------------------------- cookies */
+
+soyokaze_cookie_t *soyokaze_cookie_new(void);
+soyokaze_cookie_t *soyokaze_cookie_parse(const uint8_t *value, size_t value_len);
+void soyokaze_cookie_free(soyokaze_cookie_t *cookie);
+size_t soyokaze_cookie_count(const soyokaze_cookie_t *cookie);
+soyokaze_slice_t soyokaze_cookie_name(const soyokaze_cookie_t *cookie, size_t index);
+soyokaze_slice_t soyokaze_cookie_value(const soyokaze_cookie_t *cookie, size_t index);
+soyokaze_slice_t soyokaze_cookie_get(const soyokaze_cookie_t *cookie,
+                                     const uint8_t *name, size_t name_len);
+bool soyokaze_cookie_append(soyokaze_cookie_t *cookie,
+                            const uint8_t *name, size_t name_len,
+                            const uint8_t *value, size_t value_len);
+soyokaze_buffer_t soyokaze_cookie_build(const soyokaze_cookie_t *cookie);
+
+soyokaze_setcookie_t *soyokaze_setcookie_new(const uint8_t *name, size_t name_len,
+                                             const uint8_t *value, size_t value_len);
+soyokaze_status_t soyokaze_setcookie_parse(const uint8_t *value, size_t value_len,
+                                           soyokaze_setcookie_t **out,
+                                           soyokaze_error_t **error);
+void soyokaze_setcookie_free(soyokaze_setcookie_t *cookie);
+soyokaze_slice_t soyokaze_setcookie_name(const soyokaze_setcookie_t *cookie);
+soyokaze_slice_t soyokaze_setcookie_value(const soyokaze_setcookie_t *cookie);
+soyokaze_slice_t soyokaze_setcookie_expires(const soyokaze_setcookie_t *cookie);
+bool soyokaze_setcookie_max_age(const soyokaze_setcookie_t *cookie, int64_t *out);
+soyokaze_slice_t soyokaze_setcookie_domain(const soyokaze_setcookie_t *cookie);
+soyokaze_slice_t soyokaze_setcookie_path(const soyokaze_setcookie_t *cookie);
+bool soyokaze_setcookie_secure(const soyokaze_setcookie_t *cookie);
+bool soyokaze_setcookie_httponly(const soyokaze_setcookie_t *cookie);
+int32_t soyokaze_setcookie_samesite(const soyokaze_setcookie_t *cookie); /* 0 Strict, 1 Lax, 2 None, -1 unset */
+bool soyokaze_setcookie_set_value(soyokaze_setcookie_t *cookie, const uint8_t *value, size_t value_len);
+bool soyokaze_setcookie_set_expires(soyokaze_setcookie_t *cookie, const uint8_t *value, size_t value_len);
+bool soyokaze_setcookie_set_max_age(soyokaze_setcookie_t *cookie, bool present, int64_t max_age);
+bool soyokaze_setcookie_set_domain(soyokaze_setcookie_t *cookie, const uint8_t *value, size_t value_len);
+bool soyokaze_setcookie_set_path(soyokaze_setcookie_t *cookie, const uint8_t *value, size_t value_len);
+bool soyokaze_setcookie_set_secure(soyokaze_setcookie_t *cookie, bool secure);
+bool soyokaze_setcookie_set_httponly(soyokaze_setcookie_t *cookie, bool httponly);
+bool soyokaze_setcookie_set_samesite(soyokaze_setcookie_t *cookie, int32_t samesite);
+soyokaze_status_t soyokaze_setcookie_build(const soyokaze_setcookie_t *cookie,
+                                           soyokaze_buffer_t *out,
+                                           soyokaze_error_t **error);
+
+soyokaze_cookiejar_t *soyokaze_cookiejar_new(const soyokaze_limits_t *limits);
+void soyokaze_cookiejar_free(soyokaze_cookiejar_t *jar);
+bool soyokaze_cookiejar_learn(const soyokaze_cookiejar_t *jar, const soyokaze_url_t *url,
+                              const soyokaze_slice_t *values, size_t value_count);
+soyokaze_buffer_t soyokaze_cookiejar_cookie(const soyokaze_cookiejar_t *jar, const soyokaze_url_t *url);
+void soyokaze_cookiejar_prune(const soyokaze_cookiejar_t *jar);
+
+/* -------------------------------------------------------------------- hsts */
 
 typedef struct {
-    int32_t version; /* a soyokaze_version_t, or -1 to negotiate */
+    int64_t max_age; /* seconds; zero withdraws the policy */
+    bool include_subdomains;
+    bool preload;
+} soyokaze_hsts_policy_t;
+
+bool soyokaze_hsts_policy_parse(const uint8_t *value, size_t value_len, soyokaze_hsts_policy_t *out);
+soyokaze_buffer_t soyokaze_hsts_policy_build(const soyokaze_hsts_policy_t *policy);
+
+soyokaze_hsts_store_t *soyokaze_hsts_store_new(const soyokaze_limits_t *limits);
+void soyokaze_hsts_store_free(soyokaze_hsts_store_t *store);
+bool soyokaze_hsts_store_learn(const soyokaze_hsts_store_t *store,
+                               const uint8_t *host, size_t host_len,
+                               const uint8_t *header, size_t header_len,
+                               bool secure);
+bool soyokaze_hsts_store_secure(const soyokaze_hsts_store_t *store,
+                                const uint8_t *host, size_t host_len);
+
+/* --------------------------------------------------------------------- tls */
+
+soyokaze_identity_t *soyokaze_identity_new(const soyokaze_slice_t *certificates, size_t certificate_count,
+                                           const uint8_t *key, size_t key_len);
+soyokaze_status_t soyokaze_identity_from_pkcs12(const uint8_t *data, size_t data_len,
+                                                const uint8_t *passphrase, size_t passphrase_len,
+                                                soyokaze_identity_t **out,
+                                                soyokaze_error_t **error);
+void soyokaze_identity_free(soyokaze_identity_t *identity);
+
+soyokaze_status_t soyokaze_ech_keys_generate(const uint8_t *public_name, size_t public_name_len,
+                                             uint8_t config_id,
+                                             soyokaze_ech_keys_t **out,
+                                             soyokaze_error_t **error);
+soyokaze_ech_keys_t *soyokaze_ech_keys_new(const uint8_t *config, size_t config_len,
+                                           const uint8_t *private_key, size_t private_key_len);
+void soyokaze_ech_keys_free(soyokaze_ech_keys_t *keys);
+soyokaze_slice_t soyokaze_ech_keys_config(const soyokaze_ech_keys_t *keys);
+soyokaze_slice_t soyokaze_ech_keys_private_key(const soyokaze_ech_keys_t *keys);
+soyokaze_buffer_t soyokaze_ech_keys_config_list(const soyokaze_ech_keys_t *keys);
+
+soyokaze_status_t soyokaze_ech_config_list_parse(const uint8_t *data, size_t data_len,
+                                                 soyokaze_ech_config_list_t **out,
+                                                 soyokaze_error_t **error);
+void soyokaze_ech_config_list_free(soyokaze_ech_config_list_t *list);
+size_t soyokaze_ech_config_list_count(const soyokaze_ech_config_list_t *list);
+uint16_t soyokaze_ech_config_version(const soyokaze_ech_config_list_t *list, size_t index);
+soyokaze_slice_t soyokaze_ech_config_public_name(const soyokaze_ech_config_list_t *list, size_t index);
+int32_t soyokaze_ech_config_maximum_name_length(const soyokaze_ech_config_list_t *list, size_t index);
+
+/* ------------------------------------------------------------------ client */
+
+/* The limits a client applies on top of the per-message ones. Start from
+ * soyokaze_client_limits_default() and adjust. */
+typedef struct {
+    soyokaze_limits_t message;
+    double connection_timeout; /* seconds; zero waits forever */
+} soyokaze_client_limits_t;
+
+soyokaze_client_limits_t soyokaze_client_limits_default(void);
+
+/* One host's ECH configuration list; a host of "*" applies wherever no exact
+ * entry matches. */
+typedef struct {
+    soyokaze_slice_t host;
+    soyokaze_slice_t config_list;
+} soyokaze_ech_entry_t;
+
+/* NULL wherever a config is asked for takes every default; a NULL pointer
+ * inside the struct takes that field's default the same way. */
+typedef struct {
+    const int32_t *versions; /* soyokaze_version_t values, most preferred first */
+    size_t version_count;
+    const soyokaze_client_limits_t *limits;
     bool secure;
     bool cookies;
     bool hsts;
+    const soyokaze_slice_t *roots; /* each DER or PEM; NULL keeps the platform store */
+    size_t root_count;
+    const soyokaze_ech_entry_t *ech;
+    size_t ech_count;
 } soyokaze_client_config_t;
 
 soyokaze_client_t *soyokaze_client_new(const soyokaze_client_config_t *config);
@@ -218,11 +445,61 @@ soyokaze_status_t soyokaze_client_request(soyokaze_runtime_t *runtime, const soy
                                           soyokaze_connection_t *connection,
                                           soyokaze_message_t *request,
                                           soyokaze_message_t **out, soyokaze_error_t **error);
+soyokaze_status_t soyokaze_client_websocket(soyokaze_runtime_t *runtime, const soyokaze_client_t *client,
+                                            const uint8_t *url, size_t url_len,
+                                            soyokaze_websocket_t **out, soyokaze_error_t **error);
 
 soyokaze_version_t soyokaze_connection_version(const soyokaze_connection_t *connection);
+soyokaze_role_t soyokaze_connection_role(const soyokaze_connection_t *connection);
+soyokaze_buffer_t soyokaze_connection_id(const soyokaze_connection_t *connection);
 bool soyokaze_connection_reusable(const soyokaze_connection_t *connection);
+/* `message` is consumed. */
+soyokaze_status_t soyokaze_connection_send(soyokaze_runtime_t *runtime,
+                                           soyokaze_connection_t *connection,
+                                           soyokaze_message_t *message,
+                                           soyokaze_error_t **error);
+soyokaze_status_t soyokaze_connection_receive(soyokaze_runtime_t *runtime,
+                                              soyokaze_connection_t *connection,
+                                              soyokaze_message_t **out,
+                                              soyokaze_error_t **error);
+/* `connection` is consumed, whether the handshake succeeds or not. */
+soyokaze_status_t soyokaze_connection_open_websocket(soyokaze_runtime_t *runtime,
+                                                     soyokaze_connection_t *connection,
+                                                     const uint8_t *authority, size_t authority_len,
+                                                     const uint8_t *target, size_t target_len,
+                                                     soyokaze_websocket_t **out,
+                                                     soyokaze_error_t **error);
 void soyokaze_connection_close(soyokaze_runtime_t *runtime, soyokaze_connection_t *connection);
 void soyokaze_connection_free(soyokaze_connection_t *connection);
+
+/* --------------------------------------------------------------- websocket */
+
+/* Opcodes and close codes cross as their wire numbers: opcodes 0x0
+ * continuation, 0x1 text, 0x2 binary, 0x8 close, 0x9 ping, 0xa pong; close
+ * codes 1000-1011 as defined. These calls take no runtime — the socket
+ * carries its own, so they may be made from a server callback. */
+void soyokaze_websocket_free(soyokaze_websocket_t *socket);
+soyokaze_role_t soyokaze_websocket_role(const soyokaze_websocket_t *socket);
+bool soyokaze_websocket_closing(const soyokaze_websocket_t *socket);
+soyokaze_buffer_t soyokaze_websocket_id(const soyokaze_websocket_t *socket);
+soyokaze_status_t soyokaze_websocket_send(soyokaze_websocket_t *socket,
+                                          bool fin, uint8_t opcode,
+                                          const uint8_t *payload, size_t payload_len,
+                                          soyokaze_error_t **error);
+soyokaze_status_t soyokaze_websocket_receive(soyokaze_websocket_t *socket,
+                                             bool *fin, uint8_t *opcode,
+                                             soyokaze_buffer_t *out,
+                                             soyokaze_error_t **error);
+soyokaze_status_t soyokaze_websocket_send_message(soyokaze_websocket_t *socket,
+                                                  uint8_t opcode,
+                                                  const uint8_t *payload, size_t payload_len,
+                                                  soyokaze_error_t **error);
+soyokaze_status_t soyokaze_websocket_receive_message(soyokaze_websocket_t *socket,
+                                                     uint8_t *opcode,
+                                                     soyokaze_buffer_t *out,
+                                                     soyokaze_error_t **error);
+bool soyokaze_websocket_close(soyokaze_websocket_t *socket, uint16_t code,
+                              const uint8_t *reason, size_t reason_len);
 
 /* ------------------------------------------------------------------ server */
 
@@ -231,13 +508,42 @@ void soyokaze_connection_free(soyokaze_connection_t *connection);
  * 500. Runs on a runtime thread and may block. */
 typedef soyokaze_message_t *(*soyokaze_on_request_t)(void *context, soyokaze_message_t *request);
 
+/* Takes ownership of `socket` — drive it, then free it with
+ * soyokaze_websocket_free. Runs on its own blocking thread. */
+typedef void (*soyokaze_on_websocket_t)(void *context, soyokaze_websocket_t *socket);
+
+/* One sliding-window rate limit: `count` connections per `period` seconds. */
 typedef struct {
-    const uint8_t *certificate; /* DER or PEM; NULL serves TCP in plaintext */
-    size_t certificate_len;
-    const uint8_t *key;
-    size_t key_len;
+    double period;
+    uint32_t count;
+} soyokaze_rate_t;
+
+/* The limits a server applies on top of the per-message ones. Start from
+ * soyokaze_server_limits_default() and adjust. */
+typedef struct {
+    soyokaze_limits_t message;
     uint32_t max_connections;        /* 0 is unbounded */
     uint32_t max_connections_per_ip; /* 0 is unbounded */
+    const soyokaze_rate_t *max_connection_rate; /* NULL means none */
+    size_t rate_count;
+    size_t max_connection_history;
+} soyokaze_server_limits_t;
+
+soyokaze_server_limits_t soyokaze_server_limits_default(void);
+
+uint32_t soyokaze_cores(void);
+
+/* NULL wherever a config is asked for takes every default. The identity and
+ * ECH handles are borrowed: the server copies what it needs. */
+typedef struct {
+    const int32_t *versions; /* soyokaze_version_t values; NULL offers every one */
+    size_t version_count;
+    const soyokaze_server_limits_t *limits;
+    const soyokaze_identity_t *identity;   /* takes precedence over certificate/key */
+    soyokaze_slice_t certificate;          /* DER or PEM; absent serves TCP in plaintext */
+    soyokaze_slice_t key;
+    const soyokaze_ech_keys_t *ech;
+    const soyokaze_hsts_policy_t *hsts;
     bool reuseport;
 } soyokaze_server_config_t;
 
@@ -246,23 +552,116 @@ void soyokaze_server_free(soyokaze_server_t *server);
 
 /* Returns once the ports are bound; the accept loops keep running on
  * `runtime`, which must outlive the handle. `context` is reached from more
- * than one thread. */
+ * than one thread. A NULL `on_websocket` hands upgrade requests to
+ * `on_request` like any other. */
 soyokaze_status_t soyokaze_server_serve(soyokaze_runtime_t *runtime,
                                         const soyokaze_server_t *server,
                                         soyokaze_on_request_t on_request,
+                                        soyokaze_on_websocket_t on_websocket,
                                         void *context,
                                         const soyokaze_port_t *ports, size_t port_count,
                                         soyokaze_server_handle_t **out,
                                         soyokaze_error_t **error);
 uint16_t soyokaze_server_handle_port(const soyokaze_server_handle_t *handle);
+size_t soyokaze_server_handle_address_count(const soyokaze_server_handle_t *handle);
+uint16_t soyokaze_server_handle_port_at(const soyokaze_server_handle_t *handle, size_t index);
 /* Consumes `handle`. A negative `timeout` waits as long as it takes. */
 void soyokaze_server_handle_close(soyokaze_runtime_t *runtime,
                                   soyokaze_server_handle_t *handle,
                                   double timeout);
 
+/* The multi-worker counterpart of soyokaze_server_serve: each worker brings
+ * its own runtime. A `workers` of 0 takes one per core. */
+soyokaze_status_t soyokaze_server_run(const soyokaze_server_t *server,
+                                      soyokaze_on_request_t on_request,
+                                      soyokaze_on_websocket_t on_websocket,
+                                      void *context,
+                                      const soyokaze_port_t *ports, size_t port_count,
+                                      uint32_t workers,
+                                      soyokaze_cluster_t **out,
+                                      soyokaze_error_t **error);
+uint16_t soyokaze_cluster_port(const soyokaze_cluster_t *cluster);
+size_t soyokaze_cluster_address_count(const soyokaze_cluster_t *cluster);
+uint16_t soyokaze_cluster_port_at(const soyokaze_cluster_t *cluster, size_t index);
+uint32_t soyokaze_cluster_workers(const soyokaze_cluster_t *cluster);
+/* Consumes `cluster` and blocks until the workers finish. A negative
+ * `timeout` waits as long as it takes. */
+void soyokaze_cluster_close(soyokaze_cluster_t *cluster, double timeout);
+
 soyokaze_message_t *soyokaze_response_with_body(uint16_t status_code,
                                                 soyokaze_version_t version,
                                                 const uint8_t *body, size_t body_len);
+
+/* --------------------------------------------------------------- finalizer */
+
+/* The IMF-fixdate for a Unix timestamp; always 29 octets. */
+soyokaze_buffer_t soyokaze_http_date(uint64_t unix_seconds);
+
+/* ----------------------------------------------------------------- helpers */
+
+soyokaze_buffer_t soyokaze_base64_encode(const uint8_t *data, size_t data_len);
+bool soyokaze_base64_decode(const uint8_t *text, size_t text_len, soyokaze_buffer_t *out);
+
+/* Always 20 octets. */
+soyokaze_buffer_t soyokaze_sha1(const uint8_t *data, size_t data_len);
+
+soyokaze_buffer_t soyokaze_huffman_encode(const uint8_t *data, size_t data_len);
+bool soyokaze_huffman_decode(const uint8_t *data, size_t data_len, soyokaze_buffer_t *out);
+
+/* One field going into an encoder. */
+typedef struct {
+    soyokaze_slice_t name;
+    soyokaze_slice_t value;
+} soyokaze_field_t;
+
+/* A decoded field section. */
+void soyokaze_fields_free(soyokaze_fields_t *fields);
+size_t soyokaze_fields_count(const soyokaze_fields_t *fields);
+soyokaze_slice_t soyokaze_fields_name(const soyokaze_fields_t *fields, size_t index);
+soyokaze_slice_t soyokaze_fields_value(const soyokaze_fields_t *fields, size_t index);
+
+/* HPACK. An encoder and a decoder are stateful; feed blocks in order. */
+soyokaze_hpack_encoder_t *soyokaze_hpack_encoder_new(void);
+void soyokaze_hpack_encoder_free(soyokaze_hpack_encoder_t *encoder);
+bool soyokaze_hpack_encoder_set_dynamic_table_size(soyokaze_hpack_encoder_t *encoder, size_t max_size);
+soyokaze_buffer_t soyokaze_hpack_encode(soyokaze_hpack_encoder_t *encoder,
+                                        const soyokaze_field_t *fields, size_t field_count);
+soyokaze_hpack_decoder_t *soyokaze_hpack_decoder_new(void);
+void soyokaze_hpack_decoder_free(soyokaze_hpack_decoder_t *decoder);
+bool soyokaze_hpack_decoder_set_max_decoded_size(soyokaze_hpack_decoder_t *decoder, size_t max_size);
+bool soyokaze_hpack_decoder_set_dynamic_table_size(soyokaze_hpack_decoder_t *decoder, size_t max_size);
+soyokaze_status_t soyokaze_hpack_decode(soyokaze_hpack_decoder_t *decoder,
+                                        const uint8_t *block, size_t block_len,
+                                        soyokaze_fields_t **out,
+                                        soyokaze_error_t **error);
+
+/* QPACK. Instruction streams cross as raw octets, exactly as they travel. */
+soyokaze_qpack_encoder_t *soyokaze_qpack_encoder_new(void);
+void soyokaze_qpack_encoder_free(soyokaze_qpack_encoder_t *encoder);
+bool soyokaze_qpack_encoder_set_max_capacity(soyokaze_qpack_encoder_t *encoder, size_t max_capacity);
+bool soyokaze_qpack_encoder_set_max_outstanding_sections(soyokaze_qpack_encoder_t *encoder, size_t max_sections);
+bool soyokaze_qpack_encoder_set_capacity(soyokaze_qpack_encoder_t *encoder, size_t capacity,
+                                         soyokaze_buffer_t *instructions);
+bool soyokaze_qpack_encode(soyokaze_qpack_encoder_t *encoder, uint64_t stream_id,
+                           const soyokaze_field_t *fields, size_t field_count,
+                           soyokaze_buffer_t *block, soyokaze_buffer_t *instructions);
+soyokaze_status_t soyokaze_qpack_encoder_on_decoder_instructions(soyokaze_qpack_encoder_t *encoder,
+                                                                 const uint8_t *data, size_t data_len,
+                                                                 soyokaze_error_t **error);
+bool soyokaze_qpack_encoder_cancel(soyokaze_qpack_encoder_t *encoder, uint64_t stream_id);
+soyokaze_qpack_decoder_t *soyokaze_qpack_decoder_new(void);
+void soyokaze_qpack_decoder_free(soyokaze_qpack_decoder_t *decoder);
+bool soyokaze_qpack_decoder_set_max_decoded_size(soyokaze_qpack_decoder_t *decoder, size_t max_size);
+bool soyokaze_qpack_decoder_set_max_capacity(soyokaze_qpack_decoder_t *decoder, size_t max_capacity);
+soyokaze_status_t soyokaze_qpack_decoder_on_encoder_instructions(soyokaze_qpack_decoder_t *decoder,
+                                                                 const uint8_t *data, size_t data_len,
+                                                                 soyokaze_buffer_t *instructions,
+                                                                 soyokaze_error_t **error);
+soyokaze_status_t soyokaze_qpack_decode(soyokaze_qpack_decoder_t *decoder, uint64_t stream_id,
+                                        const uint8_t *block, size_t block_len,
+                                        soyokaze_fields_t **out,
+                                        soyokaze_buffer_t *instructions,
+                                        soyokaze_error_t **error);
 
 #ifdef __cplusplus
 }

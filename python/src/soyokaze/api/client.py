@@ -1,0 +1,281 @@
+"""Dialling an origin and issuing requests.
+
+:class:`Client` is the entry point. Build one from a :class:`ClientConfig` —
+or with no arguments to take every default — then use :meth:`Client.get` and
+friends for one-off requests, or :meth:`Client.connect` when the connection
+itself is wanted, mirroring the crate's ``api::client`` module.
+"""
+
+import ctypes
+
+from .. import ffi
+from ..errors import InvalidError, error_out, raise_for
+from ..ffi import library
+from ..models import Message, Method, Role, Version
+from ..runtime import default_runtime
+from ..websocket import WebSocketConnection
+from .common import Limits
+
+
+class ClientLimits:
+    """The limits a client applies on top of the per-message :class:`Limits`."""
+
+    def __init__(self, message=None, connection_timeout=None):
+        defaults = library.soyokaze_client_limits_default()
+        self.message = message if message is not None else Limits()
+        self.connection_timeout = connection_timeout if connection_timeout is not None else defaults.connection_timeout
+
+    def build(self):
+        """The ``soyokaze_client_limits_t`` this stands for."""
+        return ffi.ClientLimits(self.message.build(), self.connection_timeout)
+
+
+class ClientConfig:
+    """How a :class:`Client` is configured.
+
+    Every field has a working default: every supported version offered, TLS
+    on, cookies kept, HSTS remembered, and the platform trust store.
+    """
+
+    def __init__(self, versions=None, limits=None, secure=True, roots=None, ech=None, cookies=True, hsts=True):
+        self.versions = versions
+        self.limits = limits
+        self.secure = secure
+        self.roots = roots
+        self.ech = ech
+        self.cookies = cookies
+        self.hsts = hsts
+
+    def build(self):
+        """The ``soyokaze_client_config_t`` this stands for.
+
+        The struct keeps everything it points at alive on itself.
+        """
+        struct = ffi.ClientConfig()
+        keepalive = []
+
+        if self.versions is not None:
+            versions = (ctypes.c_int32 * len(self.versions))(*[int(Version(version)) for version in self.versions])
+            keepalive.append(versions)
+            struct.versions = versions
+            struct.version_count = len(self.versions)
+
+        if self.limits is not None:
+            limits = self.limits.build()
+            keepalive.append(limits)
+            struct.limits = ctypes.pointer(limits)
+
+        struct.secure = self.secure
+        struct.cookies = self.cookies
+        struct.hsts = self.hsts
+
+        if self.roots is not None:
+            slices = [ffi.slice_of(ffi.encoded(root)) for root in self.roots]
+            array = (ffi.Slice * len(slices))(*slices)
+            keepalive.extend((slices, array))
+            struct.roots = array
+            struct.root_count = len(slices)
+
+        if self.ech is not None:
+            entries = []
+            for host, config_list in self.ech.items():
+                entry = ffi.EchEntry(ffi.slice_of(ffi.encoded(host)), ffi.slice_of(ffi.encoded(config_list)))
+                entries.append(entry)
+            array = (ffi.EchEntry * len(entries))(*entries)
+            keepalive.extend((entries, array))
+            struct.ech = array
+            struct.ech_count = len(entries)
+
+        struct.keepalive = keepalive
+        return struct
+
+
+class Connection:
+    """A connection of whichever version was negotiated.
+
+    What :meth:`Client.open` and :meth:`Client.connect` hand back; several
+    messages may go over one.
+    """
+
+    def __init__(self, handle, runtime):
+        self.handle = handle
+        self.runtime = runtime
+
+    def __del__(self):
+        if getattr(self, "handle", None):
+            library.soyokaze_connection_free(self.handle)
+            self.handle = None
+
+    @property
+    def version(self):
+        """The version the connection settled on."""
+        return Version(library.soyokaze_connection_version(self.handle))
+
+    @property
+    def role(self):
+        """Which end of the connection this is."""
+        return Role(library.soyokaze_connection_role(self.handle))
+
+    def id(self):
+        """The connection's identifier."""
+        return ffi.take(library.soyokaze_connection_id(self.handle))
+
+    def reusable(self):
+        """Whether another message may go over the connection."""
+        return library.soyokaze_connection_reusable(self.handle)
+
+    def send(self, message):
+        """Sends one message, without waiting for anything back.
+
+        The raw half of :meth:`Client.request`, for pipelining requests or
+        streaming responses by hand. ``message`` is consumed.
+        """
+        error = error_out()
+        raise_for(library.soyokaze_connection_send(self.runtime.handle, self.handle, message.take(), ctypes.byref(error)), error)
+
+    def receive(self):
+        """Receives the next message.
+
+        Unlike :meth:`Client.request`, informational (1xx) responses are
+        handed over rather than read past.
+        """
+        out = ctypes.c_void_p()
+        error = error_out()
+        raise_for(library.soyokaze_connection_receive(self.runtime.handle, self.handle, ctypes.byref(out), ctypes.byref(error)), error)
+        return Message(handle=out)
+
+    def open_websocket(self, authority, target):
+        """Opens a WebSocket and takes the connection over.
+
+        The connection is consumed whether the handshake succeeds or not.
+        """
+        handle = self.handle
+        if not handle:
+            raise InvalidError("the connection was already consumed")
+        self.handle = None
+
+        out = ctypes.c_void_p()
+        error = error_out()
+        authority, target = ffi.encoded(authority), ffi.encoded(target)
+        raise_for(library.soyokaze_connection_open_websocket(self.runtime.handle, handle, authority, len(authority), target, len(target), ctypes.byref(out), ctypes.byref(error)), error)
+        return WebSocketConnection(out)
+
+    def close(self):
+        """Closes the connection, leaving the object to be dropped."""
+        if self.handle:
+            library.soyokaze_connection_close(self.runtime.handle, self.handle)
+
+
+def request_argument(headers, body, version):
+    """The consumed request handle for a fetch, or ``None`` when both are absent."""
+    if headers is None and body is None:
+        return None
+
+    message = Message(version)
+    for name, value in headers or []:
+        message.append_header(name, value)
+    if body is not None:
+        message.set_body(body)
+
+    return message.take()
+
+
+class Client:
+    """An HTTP client.
+
+    Holds the configuration a connection is made with, and the cookie and
+    HSTS state that outlives one request. It does not pool connections: each
+    :meth:`fetch` dials, exchanges, and closes.
+    """
+
+    def __init__(self, config=None, runtime=None):
+        self.runtime = runtime if runtime is not None else default_runtime()
+
+        struct = config.build() if config is not None else None
+        self.handle = library.soyokaze_client_new(ctypes.byref(struct) if struct is not None else None)
+        if not self.handle:
+            raise InvalidError("the configuration was refused")
+
+    def __del__(self):
+        if getattr(self, "handle", None):
+            library.soyokaze_client_free(self.handle)
+            self.handle = None
+
+    def fetch(self, method, url, headers=None, body=None):
+        """Makes one request and returns the response.
+
+        Dials, exchanges, and closes the connection. ``Host`` and ``Cookie``
+        are filled in unless ``headers`` carries them, and redirects are not
+        followed — the response is returned as it came.
+
+        ``headers`` is an iterable of name and value pairs, and ``body`` is
+        whatever :meth:`Message.set_body` accepts.
+        """
+        request = request_argument(headers, body, Version.V1_1)
+
+        out = ctypes.c_void_p()
+        error = error_out()
+        encoded = ffi.encoded(url)
+        raise_for(library.soyokaze_client_fetch(self.runtime.handle, self.handle, int(Method(method)), encoded, len(encoded), request, ctypes.byref(out), ctypes.byref(error)), error)
+        return Message(handle=out)
+
+    def get(self, url):
+        """A ``GET``; see :meth:`fetch`."""
+        return self.fetch(Method.GET, url)
+
+    def head(self, url):
+        """A ``HEAD``; see :meth:`fetch`."""
+        return self.fetch(Method.HEAD, url)
+
+    def post(self, url, body):
+        """A ``POST``; see :meth:`fetch`."""
+        return self.fetch(Method.POST, url, body=body)
+
+    def put(self, url, body):
+        """A ``PUT``; see :meth:`fetch`."""
+        return self.fetch(Method.PUT, url, body=body)
+
+    def delete(self, url):
+        """A ``DELETE``; see :meth:`fetch`."""
+        return self.fetch(Method.DELETE, url)
+
+    def open(self, url):
+        """Opens a connection for a :class:`Url`, taking the transport from its scheme."""
+        out = ctypes.c_void_p()
+        error = error_out()
+        raise_for(library.soyokaze_client_open(self.runtime.handle, self.handle, url.handle, ctypes.byref(out), ctypes.byref(error)), error)
+        return Connection(out, self.runtime)
+
+    def connect(self, host, port):
+        """Opens a connection to a host on a given :class:`Port`.
+
+        The port decides the transport, and so which versions are available.
+        """
+        out = ctypes.c_void_p()
+        error = error_out()
+        encoded = ffi.encoded(host)
+        struct = port.build()
+        raise_for(library.soyokaze_client_connect(self.runtime.handle, self.handle, encoded, len(encoded), ctypes.byref(struct), ctypes.byref(out), ctypes.byref(error)), error)
+        return Connection(out, self.runtime)
+
+    def request(self, connection, request):
+        """Sends a request over an open connection and waits for the response.
+
+        Informational (1xx) responses are read past. ``request`` is consumed.
+        """
+        out = ctypes.c_void_p()
+        error = error_out()
+        raise_for(library.soyokaze_client_request(self.runtime.handle, self.handle, connection.handle, request.take(), ctypes.byref(out), ctypes.byref(error)), error)
+        return Message(handle=out)
+
+    def websocket(self, url):
+        """Opens a WebSocket connection.
+
+        The handshake follows whichever version is negotiated: an HTTP/1.1
+        upgrade, or extended CONNECT over HTTP/2 and HTTP/3.
+        """
+        out = ctypes.c_void_p()
+        error = error_out()
+        encoded = ffi.encoded(url)
+        raise_for(library.soyokaze_client_websocket(self.runtime.handle, self.handle, encoded, len(encoded), ctypes.byref(out), ctypes.byref(error)), error)
+        return WebSocketConnection(out)

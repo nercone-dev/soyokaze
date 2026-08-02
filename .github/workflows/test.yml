@@ -125,6 +125,56 @@ jobs:
           cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c target/debug/libsoyokaze.a $libs -o ffi-static
           ./ffi-static
 
+  python-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python-linux
+
+      - name: Build the shared library
+        run: cargo build --lib
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - name: Run the Python test suite
+        working-directory: python
+        run: uv run pytest
+
+  python-macos:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: brew install cmake go
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python-macos
+
+      - name: Build the shared library
+        run: cargo build --lib
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - name: Run the Python test suite
+        working-directory: python
+        run: uv run pytest
+
   doc:
     runs-on: ubuntu-latest
 

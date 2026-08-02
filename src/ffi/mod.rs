@@ -7,11 +7,14 @@
 //!
 //! # Layout
 //!
-//! The modules mirror the crate they wrap: [`errors`] carries [`Error`] across
-//! the boundary, [`models`] carries [`Url`] and [`Message`], and [`client`] and
-//! [`server`] are the two entry points. What every module shares lives here —
-//! the [`Slice`] and [`Buffer`] octet views, and the [`Runtime`] that turns the
-//! crate's async surface into blocking calls.
+//! The modules mirror the crate they wrap: [`models`] carries [`Url`] and
+//! [`Message`], [`errors`] carries [`Error`] across the boundary, [`headers`]
+//! carries the cookie types, [`responses`] the response constructors,
+//! [`finalizer`] the date formatting, [`websocket`] the WebSocket connection,
+//! [`tls`] the identities and Encrypted Client Hello, [`api`] the two entry
+//! points, and [`helpers`] the codecs. What every module shares lives here —
+//! the [`Slice`] and [`Buffer`] octet views, and the [`Runtime`] that turns
+//! the crate's async surface into blocking calls.
 //!
 //! [`Error`]: crate::errors::Error
 //! [`Url`]: crate::models::Url
@@ -34,10 +37,39 @@
 //! - A null handle is treated as absent wherever that is meaningful, and is
 //!   never dereferenced.
 
-pub mod errors;
 pub mod models;
-pub mod client;
-pub mod server;
+pub mod errors;
+pub mod headers;
+pub mod responses;
+pub mod finalizer;
+pub mod websocket;
+pub mod tls;
+
+pub mod api {
+    //! The two entry points a caller of the library reaches for first, from C.
+    //!
+    //! [`client`] dials an origin, [`server`] binds ports and accepts
+    //! connections, and [`common`] holds what the two configure in common.
+    //!
+    //! Each module wraps its namesake in [`crate::api`].
+
+    pub mod common;
+    pub mod client;
+    pub mod server;
+}
+
+pub mod helpers {
+    //! The codecs and utilities the protocol implementations share, from C.
+    //!
+    //! Each module wraps its namesake in [`crate::helpers`].
+
+    pub mod base64;
+    pub mod sha1;
+    pub mod huffman;
+    pub mod hpack;
+    pub mod qpack;
+    pub mod hsts;
+}
 
 pub use errors::Status;
 
@@ -162,8 +194,8 @@ pub unsafe fn borrow_text<'a>(data: *const u8, len: usize) -> Option<&'a str> {
 ///
 /// The crate's own surface is async; every FFI call that has to wait runs on
 /// one of these. It is multi-threaded, so work a call leaves running — the
-/// accept loops [`server::soyokaze_server_serve`] starts, most of all — keeps
-/// running after that call returns.
+/// accept loops [`api::server::soyokaze_server_serve`] starts, most of all —
+/// keeps running after that call returns.
 pub struct Runtime(pub tokio::runtime::Runtime);
 
 /// Builds a [`Runtime`] with `workers` threads, or one thread per core when

@@ -84,6 +84,62 @@ static void check_null_handles(void) {
     soyokaze_runtime_free(NULL);
 }
 
+/* The struct layouts, exercised through the C compiler's own offsets — a
+ * field order that drifted from the Rust side shows up here and nowhere
+ * else. */
+static void check_layouts(void) {
+    soyokaze_limits_t limits = soyokaze_limits_default();
+    assert(limits.max_header_count == 100);
+    assert(limits.read_timeout == 30.0);
+    assert(limits.max_hsts_entries == 4096);
+
+    soyokaze_client_limits_t client_limits = soyokaze_client_limits_default();
+    assert(client_limits.connection_timeout == 10.0);
+    assert(client_limits.message.max_header_count == 100);
+
+    soyokaze_server_limits_t server_limits = soyokaze_server_limits_default();
+    assert(server_limits.max_connections == 0);
+    assert(server_limits.max_connection_history == 1024);
+
+    soyokaze_hsts_policy_t policy;
+    assert(soyokaze_hsts_policy_parse(LIT("max-age=60; preload"), &policy));
+    assert(policy.max_age == 60 && policy.preload && !policy.include_subdomains);
+
+    soyokaze_buffer_t built = soyokaze_hsts_policy_build(&policy);
+    assert(built.len == strlen("max-age=60; preload"));
+    soyokaze_buffer_free(built);
+}
+
+/* The codecs, driven with soyokaze_field_t arrays built in C. */
+static void check_codecs(void) {
+    soyokaze_buffer_t encoded = soyokaze_base64_encode(LIT("foobar"));
+    assert(encoded.len == 8 && memcmp(encoded.data, "Zm9vYmFy", 8) == 0);
+    soyokaze_buffer_free(encoded);
+
+    soyokaze_hpack_encoder_t *encoder = soyokaze_hpack_encoder_new();
+    soyokaze_hpack_decoder_t *decoder = soyokaze_hpack_decoder_new();
+
+    soyokaze_field_t fields[2] = {
+        {{(const uint8_t *)":method", 7}, {(const uint8_t *)"GET", 3}},
+        {{(const uint8_t *)"x-custom", 8}, {(const uint8_t *)"value", 5}},
+    };
+
+    soyokaze_buffer_t block = soyokaze_hpack_encode(encoder, fields, 2);
+    assert(block.data != NULL && block.len > 0);
+
+    soyokaze_fields_t *decoded = NULL;
+    assert(soyokaze_hpack_decode(decoder, block.data, block.len, &decoded, NULL) == SOYOKAZE_OK);
+    assert(soyokaze_fields_count(decoded) == 2);
+
+    soyokaze_slice_t name = soyokaze_fields_name(decoded, 1);
+    assert(name.len == 8 && memcmp(name.data, "x-custom", 8) == 0);
+
+    soyokaze_fields_free(decoded);
+    soyokaze_buffer_free(block);
+    soyokaze_hpack_decoder_free(decoder);
+    soyokaze_hpack_encoder_free(encoder);
+}
+
 int main(void) {
     soyokaze_slice_t crate = soyokaze_version();
     printf("soyokaze %.*s\n", (int)crate.len, crate.data);
@@ -91,6 +147,8 @@ int main(void) {
 
     check_url();
     check_null_handles();
+    check_layouts();
+    check_codecs();
 
     soyokaze_runtime_t *runtime = soyokaze_runtime_new(0);
     assert(runtime != NULL);
@@ -104,7 +162,7 @@ int main(void) {
     soyokaze_server_handle_t *handle = NULL;
     soyokaze_error_t *error = NULL;
 
-    if (soyokaze_server_serve(runtime, server, on_request, &seen_header, &port, 1, &handle, &error) != SOYOKAZE_OK) {
+    if (soyokaze_server_serve(runtime, server, on_request, NULL, &seen_header, &port, 1, &handle, &error) != SOYOKAZE_OK) {
         soyokaze_slice_t why = soyokaze_error_message(error);
         fprintf(stderr, "serve failed: %.*s\n", (int)why.len, why.data);
         return 1;

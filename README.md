@@ -15,6 +15,7 @@ The crate is arranged in layers, each usable on its own: `api` for the entry poi
 - **Built-in admission control** — a `Gate` bounds total and per-address connection counts and sliding-window rate limits before a handler is ever reached, and `Cluster` runs one runtime per core under `SO_REUSEPORT` so the kernel spreads connections between them.
 - **Cookies and HSTS handled for you** — `Client` keeps a `CookieJar` and an `HstsStore` by default, consulting and updating both automatically on every request.
 - **A C ABI for other languages** — every symbol is `extern "C"` and prefixed `soyokaze_`, built as `libsoyokaze.so`/`.dylib`/`.dll` with a matching `include/soyokaze.h`, so the crate is usable from outside Rust without a second implementation to keep in sync.
+- **Python bindings over that same ABI** — the `python/` package wraps the shared library through `ctypes`, mirroring the crate module for module (`soyokaze.Client`, `soyokaze.Server`, cookies, HSTS, TLS identities and ECH, WebSocket, and the HPACK/QPACK/Huffman codecs), so Python exercises exactly the surface the header promises.
 - **Tested for both correctness and performance** — fuzz targets cover HPACK, QPACK, Huffman and full connection handling end to end, and dedicated benchmarks track the codecs and protocol pipeline.
 
 ## Requirements

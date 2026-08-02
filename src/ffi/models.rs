@@ -167,6 +167,15 @@ pub unsafe extern "C" fn soyokaze_url_authority(url: *const Url) -> Buffer {
     }
 }
 
+/// Builds an empty message, neither a request nor a response yet.
+///
+/// [`soyokaze_message_request`] and [`soyokaze_message_response`] are the
+/// usual entry points; this is for the rare caller assembling one by hand.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_message_new(version: Version) -> *mut Message {
+    Box::into_raw(Box::new(Message::new(version)))
+}
+
 /// Builds a request.
 ///
 /// # Safety
@@ -403,6 +412,271 @@ pub unsafe extern "C" fn soyokaze_message_remove_header(message: *mut Message, n
     };
 
     message.headers.as_mut().is_some_and(|headers| headers.remove(name))
+}
+
+/// How many fields the message's trailer section holds.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_trailer_count(message: *const Message) -> usize {
+    unsafe { message.as_ref() }.and_then(|message| message.trailers.as_ref()).map_or(0, |trailers| trailers.len())
+}
+
+/// The name of the trailer field at `index`, borrowed from `message`.
+///
+/// Absent when there is no such field. Names are stored lowercase.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_trailer_name(message: *const Message, index: usize) -> Slice {
+    Slice::maybe(
+        unsafe { message.as_ref() }
+            .and_then(|message| message.trailers.as_ref())
+            .and_then(|trailers| trailers.iter().nth(index))
+            .map(|(name, _)| name),
+    )
+}
+
+/// The value of the trailer field at `index`, borrowed from `message`.
+///
+/// Absent when there is no such field.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_trailer_value(message: *const Message, index: usize) -> Slice {
+    Slice::maybe(
+        unsafe { message.as_ref() }
+            .and_then(|message| message.trailers.as_ref())
+            .and_then(|trailers| trailers.iter().nth(index))
+            .map(|(_, value)| value),
+    )
+}
+
+/// The first trailer value stored under `name`, borrowed from `message`.
+///
+/// Absent when the field is not there. The name is matched case-insensitively.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_header`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_trailer(message: *const Message, name: *const u8, name_len: usize) -> Slice {
+    let Some(name) = (unsafe { borrow_text(name, name_len) }) else {
+        return Slice::ABSENT;
+    };
+
+    Slice::maybe(unsafe { message.as_ref() }.and_then(|message| message.trailers.as_ref()).and_then(|trailers| trailers.get(name)))
+}
+
+/// Adds a trailer field, keeping any field already stored under the same name.
+///
+/// Returns whether it was added, as [`soyokaze_message_append_header`].
+///
+/// # Safety
+///
+/// As [`soyokaze_message_append_header`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_append_trailer(message: *mut Message, name: *const u8, name_len: usize, value: *const u8, value_len: usize) -> bool {
+    let (Some(message), Some(name), Some(value)) = (unsafe { message.as_mut() }, unsafe { borrow_text(name, name_len) }, unsafe { borrow_text(value, value_len) })
+    else {
+        return false;
+    };
+
+    message.trailers.get_or_insert_default().append(name, value);
+    true
+}
+
+/// Adds a trailer field, dropping any field already stored under the same name.
+///
+/// Returns whether it was set, as [`soyokaze_message_append_header`].
+///
+/// # Safety
+///
+/// As [`soyokaze_message_append_header`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_insert_trailer(message: *mut Message, name: *const u8, name_len: usize, value: *const u8, value_len: usize) -> bool {
+    let (Some(message), Some(name), Some(value)) = (unsafe { message.as_mut() }, unsafe { borrow_text(name, name_len) }, unsafe { borrow_text(value, value_len) })
+    else {
+        return false;
+    };
+
+    message.trailers.get_or_insert_default().insert(name, value);
+    true
+}
+
+/// Drops every trailer field stored under `name`.
+///
+/// Returns whether anything was there to drop.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_remove_header`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_remove_trailer(message: *mut Message, name: *const u8, name_len: usize) -> bool {
+    let (Some(message), Some(name)) = (unsafe { message.as_mut() }, unsafe { borrow_text(name, name_len) }) else {
+        return false;
+    };
+
+    message.trailers.as_mut().is_some_and(|trailers| trailers.remove(name))
+}
+
+/// The stream the message belongs to, or `-1` when it belongs to none.
+///
+/// HTTP/1.x has no streams; HTTP/2 and HTTP/3 stamp this on every message they
+/// hand over.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_stream_id(message: *const Message) -> i64 {
+    match unsafe { message.as_ref() }.and_then(|message| message.stream_id) {
+        Some(stream_id) => stream_id.0 as i64,
+        None => -1,
+    }
+}
+
+/// Stamps the message with a stream, or clears it with a negative `stream_id`.
+///
+/// A server sending responses through `soyokaze_connection_send` must echo the
+/// request's stream identifier this way; the serve callbacks do it themselves.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_set_stream_id(message: *mut Message, stream_id: i64) -> bool {
+    let Some(message) = (unsafe { message.as_mut() }) else {
+        return false;
+    };
+
+    message.stream_id = u64::try_from(stream_id).ok().map(crate::models::StreamID);
+    true
+}
+
+/// The identifier of the connection the message arrived on, borrowed from
+/// `message`.
+///
+/// Absent when the message has not crossed a connection.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_connection_id(message: *const Message) -> Slice {
+    match unsafe { message.as_ref() }.and_then(|message| message.connection_id.as_ref()) {
+        Some(id) => Slice::new(&id.0),
+        None => Slice::ABSENT,
+    }
+}
+
+/// Marks the message as travelling over a secure transport, or not.
+///
+/// This is what the `:scheme` pseudo-header reflects on HTTP/2 and HTTP/3.
+/// [`soyokaze_client_fetch`] sets it from the URL itself; this is for requests
+/// sent through `soyokaze_connection_send`.
+///
+/// [`soyokaze_client_fetch`]: crate::ffi::api::client::soyokaze_client_fetch
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_set_secure(message: *mut Message, secure: bool) -> bool {
+    let Some(message) = (unsafe { message.as_mut() }) else {
+        return false;
+    };
+
+    message.secure = secure;
+    true
+}
+
+/// Whether the request arrived in TLS early data, and so may be a replay.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_early_data(message: *const Message) -> bool {
+    unsafe { message.as_ref() }.is_some_and(|message| message.early_data)
+}
+
+/// Whether the transport underneath was TLS.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_tls(message: *const Message) -> bool {
+    unsafe { message.as_ref() }.is_some_and(|message| message.tls)
+}
+
+/// The negotiated TLS version as its two-octet wire code, or `-1`.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_tls_version(message: *const Message) -> i32 {
+    match unsafe { message.as_ref() }.and_then(|message| message.tls_version) {
+        Some(version) => version.0 as i32,
+        None => -1,
+    }
+}
+
+/// The negotiated TLS named group as its two-octet wire code, or `-1`.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_tls_group(message: *const Message) -> i32 {
+    match unsafe { message.as_ref() }.and_then(|message| message.tls_group) {
+        Some(group) => group.0 as i32,
+        None => -1,
+    }
+}
+
+/// The negotiated TLS cipher suite as its two-octet wire code, or `-1`.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_tls_cipher(message: *const Message) -> i32 {
+    match unsafe { message.as_ref() }.and_then(|message| message.tls_cipher) {
+        Some(cipher) => cipher.0 as i32,
+        None => -1,
+    }
+}
+
+/// Whether the transport underneath was QUIC.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_quic(message: *const Message) -> bool {
+    unsafe { message.as_ref() }.is_some_and(|message| message.quic)
+}
+
+/// The negotiated QUIC version, or `-1`.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_quic_version(message: *const Message) -> i64 {
+    match unsafe { message.as_ref() }.and_then(|message| message.quic_version) {
+        Some(version) => version as i64,
+        None => -1,
+    }
 }
 
 /// Sets the body to octets held in memory, copied out of `data`.
