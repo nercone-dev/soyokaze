@@ -1,3 +1,12 @@
+//! Cookies and connection persistence.
+//!
+//! [`Cookie`] and [`SetCookie`] are the two sides of the exchange — what a
+//! client sends and what a server sets — and [`CookieJar`] is the client-side
+//! store that turns one into the other across requests.
+//!
+//! [`keep_alive`] answers the other question a field section decides: whether
+//! the connection survives this message.
+
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -5,6 +14,11 @@ use crate::errors::Error;
 use crate::helpers::sync::lock;
 use crate::models::{Headers, Limits, Url, Version};
 
+/// Whether the connection survives this message.
+///
+/// A `close` token in `Connection` ends it whatever the version says.
+/// Otherwise HTTP/1.0 needs an explicit `keep-alive` to stay up, and every
+/// later version stays up by default.
 pub fn keep_alive(headers: Option<&Headers>, version: Version) -> bool {
     let mut close = false;
     let mut keep = false;
@@ -33,14 +47,19 @@ pub fn keep_alive(headers: Option<&Headers>, version: Version) -> bool {
     }
 }
 
+/// The `SameSite` attribute of a cookie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SameSite {
+    /// Never sent on a cross-site request.
     Strict,
+    /// Sent on a cross-site request only when it is a top-level navigation.
     Lax,
+    /// Sent on every cross-site request; browsers require `Secure` alongside it.
     None,
 }
 
 impl SameSite {
+    /// The attribute value as it belongs in a `Set-Cookie` field.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Strict => "Strict",
@@ -49,6 +68,7 @@ impl SameSite {
         }
     }
 
+    /// Reads an attribute value, ignoring case. `None` when it names nothing.
     pub fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "strict" => Some(Self::Strict),
@@ -59,20 +79,30 @@ impl SameSite {
     }
 }
 
+/// The contents of a `Cookie` field: the pairs a client sends back.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cookie {
+    /// The name and value pairs, in the order they were sent.
     pub pairs: Vec<(String, String)>,
 }
 
 impl Cookie {
+    /// An empty set of pairs.
     pub fn new() -> Self {
         Self { pairs: Vec::new() }
     }
 
+    /// The value stored under this exact name, if there is one.
     pub fn get(&self, name: &str) -> Option<&str> {
         self.pairs.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
     }
 
+    /// Reads a `Cookie` field value.
+    ///
+    /// Pairs with no `=`, and pairs with an empty name, are skipped; where a
+    /// name repeats, the first pair wins. A value wrapped in double quotes is
+    /// unwrapped. Parsing never fails — a malformed field yields whatever
+    /// pairs could be read from it.
     pub fn parse(value: &str) -> Self {
         let mut cookie = Self::new();
 
@@ -92,25 +122,37 @@ impl Cookie {
         cookie
     }
 
+    /// Writes the pairs back out as a `Cookie` field value.
     pub fn build(&self) -> String {
         self.pairs.iter().map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>().join("; ")
     }
 }
 
+/// One `Set-Cookie` field: the cookie a server asks a client to keep.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetCookie {
+    /// The cookie name, which must be a token.
     pub name: String,
+    /// The cookie value.
     pub value: String,
+    /// The `Expires` attribute, kept verbatim as the peer wrote it.
     pub expires: Option<String>,
+    /// The `Max-Age` attribute in seconds; zero or less deletes the cookie.
     pub max_age: Option<i64>,
+    /// The `Domain` attribute; absent makes the cookie host-only.
     pub domain: Option<String>,
+    /// The `Path` attribute; absent defaults to [`default_path`] of the request target.
     pub path: Option<String>,
+    /// The `Secure` attribute, which confines the cookie to secure transports.
     pub secure: bool,
+    /// The `HttpOnly` attribute, which hides the cookie from scripts.
     pub httponly: bool,
+    /// The `SameSite` attribute.
     pub samesite: Option<SameSite>,
 }
 
 impl SetCookie {
+    /// A cookie with no attributes set.
     pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -125,6 +167,14 @@ impl SetCookie {
         }
     }
 
+    /// Reads a `Set-Cookie` field value.
+    ///
+    /// Attribute names are matched case-insensitively, and ones that are not
+    /// recognised are ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when the field carries no `name=value` pair.
     pub fn parse(value: &str) -> Result<Self, Error> {
         let mut parts = value.split(';');
 
@@ -156,6 +206,10 @@ impl SetCookie {
         Ok(cookie)
     }
 
+    /// Reads a `Max-Age` value: an optional `-` and then digits.
+    ///
+    /// `None` when the text is not that shape. A value too large for an `i64`
+    /// saturates rather than failing.
     pub fn age(text: &str) -> Option<i64> {
         let (sign, digits) = match text.strip_prefix('-') {
             Some(rest) => (-1, rest),
@@ -169,6 +223,14 @@ impl SetCookie {
         Some(sign * digits.parse::<i64>().unwrap_or(i64::MAX))
     }
 
+    /// Writes the cookie out as a `Set-Cookie` field value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when the name is not a token, or when the
+    /// value carries an octet that would let it break out of the field —
+    /// whitespace, a quote, a comma, a semicolon, a backslash, or anything
+    /// outside printable ASCII.
     pub fn build(&self) -> Result<String, Error> {
         if self.name.is_empty() || self.name.bytes().any(is_separator) {
             return Err(Error::Protocol(format!("cookie name {:?} is not a token", self.name)));
@@ -212,22 +274,39 @@ impl SetCookie {
     }
 }
 
+/// Whether an octet is a separator, and so cannot appear in a token.
 pub fn is_separator(byte: u8) -> bool {
     byte <= 0x20 || byte == 0x7f || b"()<>@,;:\\\"/[]?={}".contains(&byte)
 }
 
+/// A cookie as a [`CookieJar`] holds it, with its attributes resolved.
+///
+/// A stored cookie differs from the [`SetCookie`] it came from in that the
+/// domain and path have been filled in from the request when the server left
+/// them out, and the lifetime has become a deadline on the local clock.
 #[derive(Debug, Clone)]
 pub struct StoredCookie {
+    /// The cookie name.
     pub name: String,
+    /// The cookie value.
     pub value: String,
+    /// The domain this cookie belongs to, lowercased and without a leading dot.
     pub domain: String,
+    /// Whether the cookie is confined to exactly `domain` rather than its subdomains.
     pub host_only: bool,
+    /// The path prefix this cookie is scoped to.
     pub path: String,
+    /// Whether the cookie may only travel over a secure transport.
     pub secure: bool,
+    /// When the cookie expires; `None` makes it last as long as the jar does.
     pub expires: Option<Instant>,
 }
 
 impl StoredCookie {
+    /// Whether this cookie belongs on a request for `url` at `now`.
+    ///
+    /// The cookie has to be unexpired, allowed on the transport, and matched
+    /// by both domain and path.
     pub fn matches(&self, url: &Url, now: Instant) -> bool {
         if self.expires.is_some_and(|expiry| expiry <= now) {
             return false;
@@ -248,6 +327,10 @@ impl StoredCookie {
     }
 }
 
+/// Whether a request target falls under a cookie's path.
+///
+/// The two match when they are equal, or when the target continues past the
+/// cookie path at a `/` boundary.
 pub fn path_matches(target: &str, cookie_path: &str) -> bool {
     let request_path = target.split(['?', '#']).next().unwrap_or("/");
     if request_path == cookie_path {
@@ -259,6 +342,8 @@ pub fn path_matches(target: &str, cookie_path: &str) -> bool {
     false
 }
 
+/// The path a cookie takes when the server sets no `Path` attribute: the
+/// request target up to, but not including, its last `/`.
 pub fn default_path(target: &str) -> String {
     let path = target.split(['?', '#']).next().unwrap_or("/");
     match path.rfind('/') {
@@ -267,22 +352,39 @@ pub fn default_path(target: &str) -> String {
     }
 }
 
+/// A client-side cookie store.
+///
+/// The jar is shared and internally locked, so a [`Client`] can hand the same
+/// jar to every request it makes. Its size is bounded by
+/// [`Limits::max_cookies`] and [`Limits::max_cookies_per_domain`], and the
+/// oldest entry is evicted when either ceiling is reached.
+///
+/// [`Client`]: crate::api::client::Client
 #[derive(Default)]
 pub struct CookieJar {
+    /// The cookies held, in the order they were stored.
     pub entries: Mutex<Vec<StoredCookie>>,
+    /// The ceilings the jar keeps itself under.
     pub limits: Limits,
 }
 
 impl CookieJar {
+    /// An empty jar with the default [`Limits`].
     pub fn new() -> Self {
         Self { entries: Mutex::new(Vec::new()), limits: Limits::default() }
     }
 
+    /// The same jar, bounded by `limits`.
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
         self
     }
 
+    /// Takes in the `Set-Cookie` values a response for `url` carried.
+    ///
+    /// A cookie replaces any it shares a name, domain and path with. One whose
+    /// `Max-Age` has already passed deletes rather than stores. Values that do
+    /// not parse are skipped rather than failing the whole batch.
     pub fn learn(&self, url: &Url, values: &[&str], now: Instant) {
         let mut entries = lock(&self.entries);
 
@@ -323,6 +425,7 @@ impl CookieJar {
         }
     }
 
+    /// The `Cookie` field value for a request to `url`, if any cookie matches.
     pub fn cookie(&self, url: &Url, now: Instant) -> Option<String> {
         let entries = lock(&self.entries);
         let pairs: Vec<String> = entries
@@ -334,11 +437,17 @@ impl CookieJar {
         (!pairs.is_empty()).then(|| pairs.join("; "))
     }
 
+    /// Drops every cookie that has expired by `now`.
     pub fn prune(&self, now: Instant) {
         lock(&self.entries).retain(|cookie| !cookie.expires.is_some_and(|expiry| expiry <= now));
     }
 }
 
+/// Makes room for one more cookie in `domain`.
+///
+/// Drops the oldest cookie for the domain when it is at
+/// [`Limits::max_cookies_per_domain`], and then the oldest cookies overall
+/// until the jar is under [`Limits::max_cookies`].
 pub fn evict(entries: &mut Vec<StoredCookie>, domain: &str, limits: &Limits) {
     if entries.iter().filter(|stored| stored.domain == domain).count() >= limits.max_cookies_per_domain as usize
         && let Some(oldest) = entries.iter().position(|stored| stored.domain == domain)

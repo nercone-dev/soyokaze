@@ -1,3 +1,21 @@
+//! Binding ports, accepting connections and dispatching to a handler.
+//!
+//! [`Server`] holds the configuration; [`Server::serve`] binds ports and runs
+//! an accept loop on the current runtime, and [`Server::serve_workers`] runs
+//! one runtime per thread instead, each with its own listener under
+//! `SO_REUSEPORT` so the kernel spreads connections between them.
+//!
+//! Which version a connection speaks is settled before a handler sees it: by
+//! ALPN over TLS, by sniffing the HTTP/2 preface on a plaintext port, and by
+//! the port itself for QUIC. Handlers are written against
+//! [`AnyConnection`], so they do not need to care which it was.
+//!
+//! Admission control lives in [`Gate`], and runs before the handler is
+//! reached: a total connection count, a per-address count, and a set of
+//! sliding-window rate limits. Handshakes negotiate concurrently, bounded by
+//! [`Limits::max_pending_handshakes`], so a peer that opens a connection and
+//! then goes quiet cannot hold up the accept loop.
+
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
@@ -12,16 +30,26 @@ use crate::protocol::h1::H1Connection;
 use crate::protocol::h2::{self, H2Connection};
 use crate::protocol::h3::{H3Connection, H3Session};
 
+/// A QUIC connection that has arrived but not yet been given an application.
 pub type QuicIncoming = tokio_quiche::InitialQuicConnection<tokio::net::UdpSocket, tokio_quiche::metrics::DefaultMetrics>;
 
+/// The versions a server offers when the builder was not told which.
 pub const SUPPORTED: &[Version] = &[Version::V3_0, Version::V2_0, Version::V1_1];
 
+/// The listen backlog for a TCP socket.
 pub const BACKLOG: i32 = 1024;
 
+/// How many threads the machine can run at once, or 1 if that cannot be found.
+///
+/// Useful as the worker count for [`Server::serve_workers`].
 pub fn cores() -> usize {
     std::thread::available_parallelism().map(|count| count.get()).unwrap_or(1)
 }
 
+/// Builds a [`Server`].
+///
+/// Everything has a working default: every supported version offered, no
+/// admission limits, and `SO_REUSEPORT` on.
 pub struct ServerBuilder {
     versions: Vec<Version>,
     limits: Option<Limits>,
@@ -35,6 +63,7 @@ pub struct ServerBuilder {
 }
 
 impl ServerBuilder {
+    /// A builder with the defaults described on [`ServerBuilder`].
     pub fn new() -> Self {
         Self {
             versions: Vec::new(),
@@ -49,51 +78,73 @@ impl ServerBuilder {
         }
     }
 
+    /// Offers one more version. Call it repeatedly to offer several.
+    ///
+    /// Offering none at all leaves [`SUPPORTED`] on offer.
     pub fn version(mut self, version: Version) -> Self {
         self.versions.push(version);
         self
     }
 
+    /// Sets the limits every connection this server accepts will hold itself to.
     pub fn limits(mut self, limits: Limits) -> Self {
         self.limits = Some(limits);
         self
     }
 
+    /// Sets the certificate chain and key to serve.
+    ///
+    /// Required for TLS and for any QUIC port; without one, a TCP port is
+    /// served in plaintext.
     pub fn identity(mut self, certificates: Vec<Vec<u8>>, key: Vec<u8>) -> Self {
         self.identity = Some(Identity::new(certificates, key));
         self
     }
 
+    /// Offers Encrypted Client Hello with these keys.
     pub fn ech(mut self, ech: crate::api::tls::EchKeys) -> Self {
         self.ech = Some(ech);
         self
     }
 
+    /// Bounds how many connections may be open at once. Zero is unbounded.
     pub fn max_connections(mut self, max_connections: u32) -> Self {
         self.max_connections = max_connections;
         self
     }
 
+    /// Bounds how many connections one address may have open. Zero is unbounded.
     pub fn max_connections_per_ip(mut self, max_connections_per_ip: u32) -> Self {
         self.max_connections_per_ip = max_connections_per_ip;
         self
     }
 
+    /// Bounds how fast one address may connect.
+    ///
+    /// Each entry is a period in seconds and how many connections are allowed
+    /// within it; every entry has to be satisfied, so several together shape
+    /// both bursts and sustained rate.
     pub fn max_connection_rate(mut self, max_connection_rate: Vec<(f64, u32)>) -> Self {
         self.max_connection_rate = max_connection_rate;
         self
     }
 
+    /// Attaches an HSTS policy to every secure response.
     pub fn hsts(mut self, hsts: crate::helpers::hsts::HstsPolicy) -> Self {
         self.hsts = Some(hsts);
         self
     }
 
+    /// Whether sockets are opened with `SO_REUSEPORT`.
+    ///
+    /// On by default, and needed for [`Server::serve_workers`] to give each
+    /// worker its own listener. Turning it off makes a QUIC port single-worker.
     pub fn reuseport(mut self, reuseport: bool) -> Self {
         self.reuseport = reuseport;
         self
     }
 
+    /// Builds the server.
     pub fn build(self) -> Server {
         Server {
             versions: if self.versions.is_empty() { SUPPORTED.to_vec() } else { self.versions },
@@ -115,6 +166,10 @@ impl Default for ServerBuilder {
     }
 }
 
+/// An HTTP server.
+///
+/// Holds the configuration a listener is built from. Cheap to clone, since
+/// each worker in [`Server::serve_workers`] needs its own copy.
 #[derive(Clone)]
 pub struct Server {
     versions: Vec<Version>,
@@ -129,27 +184,44 @@ pub struct Server {
 }
 
 impl Server {
+    /// A builder for a server.
     pub fn builder() -> ServerBuilder {
         ServerBuilder::new()
     }
 
+    /// The versions this server offers.
     pub fn versions(&self) -> &[Version] {
         &self.versions
     }
 
+    /// The limits every connection this server accepts holds itself to.
     pub fn limits(&self) -> &Limits {
         &self.limits
     }
 
+    /// Whether sockets are opened with `SO_REUSEPORT`.
     pub fn reuseport(&self) -> bool {
         self.reuseport
     }
 
+    /// Opens a port and makes a listener over it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Server::open`] and [`Server::attach`].
     pub async fn bind(&self, target: Port) -> Result<Listener, Error> {
         let socket = self.open(&target)?;
         self.attach(&target, socket).await
     }
 
+    /// Opens the socket for a port, without building a listener over it.
+    ///
+    /// Splitting this out lets several worker threads open the same port under
+    /// `SO_REUSEPORT` before any of them starts a runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when the socket cannot be created or bound.
     pub fn open(&self, target: &Port) -> Result<RawSocket, Error> {
         Ok(match target {
             Port::UDS(path) => {
@@ -163,6 +235,15 @@ impl Server {
         })
     }
 
+    /// Creates and binds one socket.
+    ///
+    /// Bound to the IPv6 unspecified address, which on the usual dual-stack
+    /// configuration accepts IPv4 as well.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when the socket cannot be created, configured or
+    /// bound.
     pub fn socket(&self, port: u16, kind: socket2::Type) -> Result<socket2::Socket, Error> {
         let socket = socket2::Socket::new(socket2::Domain::IPV6, kind, None)?;
 
@@ -185,6 +266,17 @@ impl Server {
         Ok(socket)
     }
 
+    /// Builds a listener over an already-open socket.
+    ///
+    /// This is where the version list is narrowed to what the port can carry —
+    /// HTTP/3 on a QUIC port, everything else elsewhere — and where the TLS
+    /// acceptor is built, if there is an identity to build one from.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Tls`] when a QUIC port has no identity or a TLS
+    /// context cannot be built, [`Error::Version`] when a QUIC port is offered
+    /// no HTTP/3, and [`Error::Io`] when the socket cannot be adopted.
     pub async fn attach(&self, target: &Port, socket: RawSocket) -> Result<Listener, Error> {
         let socket = match socket {
             RawSocket::UDS(listener) => Socket::UDS(UnixListener::from_std(listener)?),
@@ -244,13 +336,26 @@ impl Server {
     }
 }
 
+/// A bound socket that no runtime has adopted yet.
+///
+/// Sockets are opened before worker threads start, so this is deliberately
+/// runtime-free; [`Server::attach`] turns one into a [`Socket`].
 pub enum RawSocket {
+    /// A bound Unix domain socket.
     UDS(std::os::unix::net::UnixListener),
+    /// A bound and listening TCP socket.
     TCP(std::net::TcpListener),
+    /// A bound UDP socket, for QUIC.
     QUIC(std::net::UdpSocket),
 }
 
 impl RawSocket {
+    /// The address the socket is bound to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] for a Unix socket, which has no address, and when
+    /// the address cannot be read.
     pub fn address(&self) -> Result<SocketAddr, Error> {
         match self {
             Self::TCP(listener) => Ok(listener.local_addr()?),
@@ -259,6 +364,14 @@ impl RawSocket {
         }
     }
 
+    /// Duplicates the descriptor, so several workers accept from one socket.
+    ///
+    /// This is the fallback when `SO_REUSEPORT` is off, or for a Unix socket,
+    /// which cannot be bound twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when the descriptor cannot be duplicated.
     pub fn share(&self) -> Result<Self, Error> {
         Ok(match self {
             Self::UDS(listener) => Self::UDS(listener.try_clone()?),
@@ -268,16 +381,32 @@ impl RawSocket {
     }
 }
 
+/// A listening socket a runtime has adopted.
 pub enum Socket {
+    /// A Unix domain socket.
     UDS(UnixListener),
+    /// A TCP socket.
     TCP(TcpListener),
+    /// A QUIC endpoint.
+    ///
+    /// `tokio-quiche` owns the UDP socket and demultiplexes datagrams into
+    /// connections, so what arrives here is a queue of connections rather than
+    /// a socket to accept on.
     QUIC {
+        /// Connections `tokio-quiche` has completed the handshake for.
         incoming: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<std::io::Result<QuicIncoming>>>,
+        /// The address the UDP socket is bound to.
         address: std::net::SocketAddr,
     },
 }
 
 impl Socket {
+    /// Waits for the next connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`] when a QUIC endpoint has shut down, and
+    /// [`Error::Io`] when accepting fails.
     pub async fn accept(&self) -> Result<Incoming, Error> {
         match self {
             Self::QUIC { incoming, .. } => {
@@ -298,21 +427,46 @@ impl Socket {
     }
 }
 
+/// A connection that has arrived but not yet been negotiated.
 #[allow(clippy::large_enum_variant)]
 pub enum Incoming {
-    Stream { transport: Box<dyn Transport>, id: ConnectionID },
+    /// A stream transport, over TCP or a Unix socket.
+    Stream {
+        /// The transport.
+        transport: Box<dyn Transport>,
+        /// The peer's address, or `unix` for a Unix socket.
+        id: ConnectionID,
+    },
+    /// A QUIC connection.
     QUIC(QuicIncoming),
 }
 
+/// Everything needed to turn an [`Incoming`] into a connection.
+///
+/// Kept apart from the [`Listener`] so it can be shared by reference with the
+/// tasks that negotiate concurrently.
 #[derive(Clone)]
 pub struct Negotiation {
+    /// The versions on offer, already narrowed to what the port can carry.
     pub versions: Vec<Version>,
+    /// The limits each connection will hold itself to.
     pub limits: Limits,
+    /// The TLS acceptor, when the port is secure.
     pub acceptor: Option<Arc<boring::ssl::SslAcceptor>>,
+    /// The HSTS policy to attach to responses, if any.
     pub hsts: Option<crate::helpers::hsts::HstsPolicy>,
 }
 
 impl Negotiation {
+    /// Negotiates a version and builds the connection.
+    ///
+    /// A stream transport is held to [`Limits::read_timeout`], so a peer that
+    /// connects and then says nothing does not hold a slot indefinitely.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Timeout`] when the handshake stalls, [`Error::Tls`]
+    /// when it fails, and [`Error::Version`] when nothing usable is agreed.
     pub async fn accept(&self, incoming: Incoming) -> Result<AnyConnection, Error> {
         match incoming {
             Incoming::Stream { transport, id } => {
@@ -332,6 +486,15 @@ impl Negotiation {
         }
     }
 
+    /// Runs the TLS handshake and builds the negotiated connection.
+    ///
+    /// Falls through to [`Negotiation::assemble_plain`] when the port has no
+    /// acceptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Tls`] when the handshake fails and [`Error::Version`]
+    /// when nothing usable is negotiated.
     pub async fn assemble(&self, transport: Box<dyn Transport>, id: ConnectionID) -> Result<AnyConnection, Error> {
         let Some(acceptor) = &self.acceptor else {
             return self.assemble_plain(transport, id).await;
@@ -347,6 +510,16 @@ impl Negotiation {
         })
     }
 
+    /// Picks a version on a plaintext port by sniffing the first few octets.
+    ///
+    /// There is no ALPN without TLS, so the HTTP/2 preface is looked for
+    /// instead. Whatever was read is handed to the connection rather than
+    /// discarded, so an HTTP/1.1 request that happens to start with the same
+    /// octets is not damaged by the check.
+    ///
+    /// # Errors
+    ///
+    /// As [`Buffer::fill`].
     pub async fn assemble_plain(&self, mut transport: Box<dyn Transport>, id: ConnectionID) -> Result<AnyConnection, Error> {
         let mut buffer = Buffer::new();
 
@@ -366,6 +539,12 @@ impl Negotiation {
     }
 }
 
+/// One bound port, accepting and negotiating connections.
+///
+/// Handshakes run concurrently in their own tasks rather than in the accept
+/// loop, so one slow peer does not hold up the rest. The channel between them
+/// is what bounds that concurrency to
+/// [`Limits::max_pending_handshakes`].
 pub struct Listener {
     socket: Socket,
     negotiation: Arc<Negotiation>,
@@ -374,26 +553,38 @@ pub struct Listener {
 }
 
 impl Listener {
+    /// The versions this port offers.
     pub fn versions(&self) -> &[Version] {
         &self.negotiation.versions
     }
 
+    /// The limits each connection holds itself to.
     pub fn limits(&self) -> &Limits {
         &self.negotiation.limits
     }
 
+    /// The socket underneath.
     pub fn socket(&self) -> &Socket {
         &self.socket
     }
 
+    /// What this port negotiates with.
     pub fn negotiation(&self) -> &Negotiation {
         &self.negotiation
     }
 
+    /// How many handshakes are in flight.
     pub fn pending(&self) -> usize {
         self.negotiating.max_capacity() - self.negotiating.capacity()
     }
 
+    /// The address this port is bound to.
+    ///
+    /// Useful when the port was bound to zero and the kernel chose one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] for a Unix socket, which has no address.
     pub fn address(&self) -> Result<std::net::SocketAddr, Error> {
         match &self.socket {
             Socket::TCP(listener) => Ok(listener.local_addr()?),
@@ -402,6 +593,16 @@ impl Listener {
         }
     }
 
+    /// Waits for the next connection that has finished negotiating.
+    ///
+    /// Accepting and negotiating go on in the background while this waits, so
+    /// a caller that is slow to take connections still lets handshakes
+    /// progress. Handshakes that fail are dropped rather than returned — one
+    /// peer failing to negotiate is not the listener's failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] or [`Error::Closed`] when accepting itself fails.
     pub async fn accept(&mut self) -> Result<AnyConnection, Error> {
         loop {
             tokio::select! {
@@ -428,18 +629,29 @@ impl Listener {
     }
 }
 
+/// The limits a server applies on top of the per-message [`Limits`].
 #[derive(Debug, Clone)]
 pub struct ServerLimits {
+    /// The limits each connection holds itself to.
     pub message: Limits,
 
+    /// The number of connections that may be open at once. Zero is unbounded.
     pub max_connections: u32,
+    /// The number of connections one address may have open. Zero is unbounded.
     pub max_connections_per_ip: u32,
-    pub max_connection_rate: Vec<(f64, u32)>, // [(period in seconds, count), ...]
+    /// Rate limits as `[(period in seconds, count), ...]`; every entry must be
+    /// satisfied.
+    pub max_connection_rate: Vec<(f64, u32)>,
+    /// The number of addresses whose connection history is remembered.
     pub max_connection_history: usize,
 
+    /// The number of connections a listener may negotiate at once.
     pub max_pending_handshakes: u32,
+    /// In seconds, how long one handshake may take.
     pub handshake_timeout: f64,
+    /// In seconds, how long a connection may sit idle before it is closed.
     pub idle_timeout: f64,
+    /// In seconds, how long a shutdown waits for connections to finish.
     pub shutdown_timeout: f64,
 }
 
@@ -459,24 +671,45 @@ impl Default for ServerLimits {
     }
 }
 
+/// The per-address bookkeeping a [`Gate`] keeps behind its lock.
 pub struct GateState {
+    /// How many connections each address currently holds.
     pub per_ip: std::collections::HashMap<std::net::IpAddr, u32>,
+    /// When each address last connected, within the rate window.
     pub history: std::collections::HashMap<std::net::IpAddr, std::collections::VecDeque<std::time::Instant>>,
 }
 
+/// Admission control for incoming connections.
+///
+/// Checked before a handler is reached, so a refused connection costs a
+/// handshake and nothing more. Shared across every listener and worker, so the
+/// totals are for the server as a whole rather than per port.
+///
+/// The total count is an atomic, since every connection touches it; the
+/// per-address tallies sit behind a lock, since they are only consulted for a
+/// connection whose address is known.
 pub struct Gate {
+    /// The connections that may be open at once. Zero is unbounded.
     pub max_connections: u32,
+    /// The connections one address may have open. Zero is unbounded.
     pub max_connections_per_ip: u32,
+    /// Rate limits as `[(period in seconds, count), ...]`.
     pub max_connection_rate: Vec<(f64, u32)>,
+    /// The addresses whose history is remembered.
     pub max_connection_history: usize,
 
+    /// The longest period in [`Gate::max_connection_rate`], which is how far
+    /// back history has to be kept.
     pub window: f64,
 
+    /// How many connections are open right now.
     pub connections: std::sync::atomic::AtomicU32,
+    /// The per-address bookkeeping.
     pub state: std::sync::Mutex<GateState>,
 }
 
 impl Gate {
+    /// A gate with these limits.
     pub fn new(max_connections: u32, max_connections_per_ip: u32, max_connection_rate: Vec<(f64, u32)>, max_connection_history: usize) -> Arc<Self> {
         Arc::new(Self {
             window: max_connection_rate.iter().map(|(period, _)| *period).fold(0.0, f64::max),
@@ -492,6 +725,7 @@ impl Gate {
         })
     }
 
+    /// A gate taking its limits from a [`ServerLimits`].
     pub fn from_limits(limits: &ServerLimits) -> Arc<Self> {
         Self::new(
             limits.max_connections,
@@ -501,14 +735,24 @@ impl Gate {
         )
     }
 
+    /// How many connections are open right now.
     pub fn count(&self) -> u32 {
         self.connections.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// The longest rate limit period, and so how far back history is kept.
     pub fn window(&self) -> f64 {
         self.window
     }
 
+    /// Admits a connection, or refuses it.
+    ///
+    /// `None` means turn the connection away. A [`Permit`] means it may
+    /// proceed, and releases its slot when dropped — so holding the permit for
+    /// as long as the connection lives is what keeps the count honest.
+    ///
+    /// An `ip` of `None` skips the per-address checks; a Unix socket has no
+    /// address to limit by.
     pub fn admit(self: &Arc<Self>, ip: Option<std::net::IpAddr>, now: std::time::Instant) -> Option<Permit> {
         use std::sync::atomic::Ordering;
 
@@ -545,6 +789,10 @@ impl Gate {
         Some(Permit { gate: Arc::clone(self), ip })
     }
 
+    /// Whether an address is within every rate limit, recording the attempt
+    /// when it is.
+    ///
+    /// Entries older than the longest window are dropped as they are found.
     pub fn rate(&self, state: &mut GateState, ip: std::net::IpAddr, now: std::time::Instant) -> bool {
         let window = self.window();
         let record = state.history.entry(ip).or_default();
@@ -564,6 +812,10 @@ impl Gate {
         true
     }
 
+    /// Bounds how many addresses are remembered, never evicting `keep`.
+    ///
+    /// Without this, a flood from many addresses would grow the history
+    /// without bound — the rate limiter itself becoming the way in.
     pub fn bound_history(&self, state: &mut GateState, keep: std::net::IpAddr) {
         let cap = self.max_connection_history.max(self.max_connections as usize);
 
@@ -575,6 +827,10 @@ impl Gate {
         }
     }
 
+    /// Gives a connection's slot back.
+    ///
+    /// Called by [`Permit`] on drop; there is rarely a reason to call it
+    /// directly, and doing so alongside a live permit would double-count.
     pub fn release(&self, ip: Option<std::net::IpAddr>) {
         self.connections.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
 
@@ -589,6 +845,10 @@ impl Gate {
         }
     }
 
+    /// Drops rate history that has aged out.
+    ///
+    /// [`Gate::admit`] prunes as it goes, so this is only needed to reclaim
+    /// memory on a server that has gone quiet.
     pub fn sweep(&self, now: std::time::Instant) {
         let window = self.window();
         let mut state = lock(&self.state);
@@ -602,8 +862,14 @@ impl Gate {
     }
 }
 
+/// A connection's claim on a [`Gate`] slot.
+///
+/// Holding it is what keeps the connection counted; dropping it gives the slot
+/// back. Keep it alive for as long as the connection is.
 pub struct Permit {
+    /// The gate the slot belongs to.
     pub gate: Arc<Gate>,
+    /// The address the slot was counted against, if any.
     pub ip: Option<std::net::IpAddr>,
 }
 
@@ -613,7 +879,27 @@ impl Drop for Permit {
     }
 }
 
+/// What a server does with the connections it accepts.
+///
+/// Both methods have defaults, so `impl Handler for MyHandler {}` compiles and
+/// answers every request with a placeholder — useful to get a server running
+/// before deciding what it should say.
+///
+/// A handler is used from many tasks at once, so it takes `&self` and must be
+/// `Send + Sync`.
 pub trait Handler: Send + Sync + 'static {
+    /// Runs one connection to completion.
+    ///
+    /// The default reads requests in a loop and answers each with a
+    /// placeholder `200`, hands a valid WebSocket upgrade to
+    /// [`Handler::on_websocket`], and answers an invalid one with `426`. It
+    /// stops when the peer is done or the connection is no longer reusable,
+    /// and closes on the way out.
+    ///
+    /// An override must send a response carrying the request's
+    /// [`Message::stream_id`], or HTTP/2 and HTTP/3 will not match the two up.
+    ///
+    /// [`Message::stream_id`]: crate::models::Message::stream_id
     fn on_connection(&self, connection: AnyConnection) -> impl std::future::Future<Output = ()> + Send {
         async move {
             let mut connection = connection;
@@ -654,6 +940,10 @@ pub trait Handler: Send + Sync + 'static {
         }
     }
 
+    /// Runs one WebSocket connection to completion.
+    ///
+    /// The default closes it with `1011`, since a server that has not
+    /// overridden this has nothing to say over a WebSocket.
     fn on_websocket(&self, socket: crate::websocket::WebSocketConnection<Box<dyn Transport>>) -> impl std::future::Future<Output = ()> + Send {
         async move {
             let mut socket = socket;
@@ -662,6 +952,11 @@ pub trait Handler: Send + Sync + 'static {
     }
 }
 
+/// The `426 Upgrade Required` sent when a WebSocket handshake does not check out.
+///
+/// Tells the client which version is expected, so it can retry correctly. The
+/// `Upgrade` and `Connection` fields only belong on HTTP/1.x, where they mean
+/// anything.
 pub fn upgrade_required(request: &crate::models::Message, version: Version) -> crate::models::Message {
     let mut headers = crate::models::Headers::new();
     if version.major() == 1 {
@@ -676,21 +971,38 @@ pub fn upgrade_required(request: &crate::models::Message, version: Version) -> c
     response
 }
 
+/// A [`Handler`] that does nothing beyond the trait's defaults.
+///
+/// Useful for bringing a server up before deciding what it should answer.
 pub struct DefaultHandler;
 impl Handler for DefaultHandler {}
 
+/// A running server, as [`Server::serve`] returns it.
+///
+/// Everything runs on the current runtime. Dropping this leaves the server
+/// running; call [`ServerHandle::close`] to wind it down.
 pub struct ServerHandle {
+    /// Tells the accept loops to stop.
     pub shutdown: tokio::sync::watch::Sender<bool>,
+    /// The tasks running connections.
     pub tasks: Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>,
+    /// One accept loop per bound port.
     pub accept_loops: Vec<tokio::task::JoinHandle<()>>,
+    /// The addresses actually bound, which is how to find a port chosen by the
+    /// kernel.
     pub addresses: Vec<std::net::SocketAddr>,
 }
 
 impl ServerHandle {
+    /// The first bound address, if any port has one.
     pub fn address(&self) -> Option<std::net::SocketAddr> {
         self.addresses.first().copied()
     }
 
+    /// Stops accepting and waits for connections to finish.
+    ///
+    /// `timeout` bounds the wait; connections still running when it passes are
+    /// aborted. `None` waits as long as it takes.
     pub async fn close(self, timeout: Option<f64>) {
         let _ = self.shutdown.send(true);
         for accept_loop in self.accept_loops {
@@ -715,6 +1027,16 @@ impl ServerHandle {
 }
 
 impl Server {
+    /// Binds every port and starts serving on the current runtime.
+    ///
+    /// Returns as soon as the ports are bound; the accept loops keep running
+    /// in the background. Use [`Server::serve_workers`] to spread the work
+    /// across threads instead.
+    ///
+    /// # Errors
+    ///
+    /// As [`Server::bind`]. Ports bound before the failure are closed when the
+    /// error unwinds.
     pub async fn serve<H: Handler>(&self, handler: H, ports: &[Port]) -> Result<ServerHandle, Error> {
         let gate = Gate::new(self.max_connections, self.max_connections_per_ip, self.max_connection_rate.clone(), 1024);
 
@@ -726,6 +1048,11 @@ impl Server {
         Ok(self.launch(Arc::new(handler), listeners, gate))
     }
 
+    /// Starts an accept loop for each listener.
+    ///
+    /// Each accepted connection is put to the gate before a task is spawned
+    /// for it; one that is refused is closed at once. The permit is held for
+    /// as long as the connection runs.
     pub fn launch<H: Handler>(&self, handler: Arc<H>, listeners: Vec<Listener>, gate: Arc<Gate>) -> ServerHandle {
         let (shutdown, receiver) = tokio::sync::watch::channel(false);
         let tasks = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
@@ -781,6 +1108,27 @@ impl Server {
         ServerHandle { shutdown, tasks, accept_loops, addresses }
     }
 
+    /// Runs the server across several threads, each with its own runtime.
+    ///
+    /// Under `SO_REUSEPORT` each worker binds the port independently and the
+    /// kernel spreads connections between them, which avoids the single accept
+    /// loop that one shared listener would make. Where that is not possible —
+    /// a Unix socket, or reuseport turned off — the descriptor is duplicated
+    /// and the workers accept from the one socket.
+    ///
+    /// Every port is opened before any thread starts, and this waits for all
+    /// the workers to report ready, so a bind failure surfaces here rather
+    /// than in a thread nobody is watching.
+    ///
+    /// The admission [`Gate`] is shared, so its limits apply to the cluster as
+    /// a whole.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when a QUIC port is asked for more than one
+    /// worker without reuseport, when a socket cannot be opened, or when a
+    /// thread or runtime cannot be created. On failure every thread already
+    /// started is wound down first.
     pub fn serve_workers<H: Handler>(&self, handler: H, ports: &[Port], workers: usize) -> Result<Cluster, Error> {
         let workers = workers.max(1);
 
@@ -903,6 +1251,11 @@ impl Server {
     }
 }
 
+/// A server running across several threads, as [`Server::serve_workers`]
+/// returns it.
+///
+/// Dropping this leaves the workers running; call [`Cluster::close`] to wind
+/// them down.
 pub struct Cluster {
     shutdown: tokio::sync::watch::Sender<Option<f64>>,
     threads: Vec<std::thread::JoinHandle<()>>,
@@ -910,18 +1263,26 @@ pub struct Cluster {
 }
 
 impl Cluster {
+    /// The first bound address, if any port has one.
     pub fn address(&self) -> Option<std::net::SocketAddr> {
         self.addresses.first().copied()
     }
 
+    /// Every bound address.
     pub fn addresses(&self) -> &[std::net::SocketAddr] {
         &self.addresses
     }
 
+    /// How many worker threads are running.
     pub fn workers(&self) -> usize {
         self.threads.len()
     }
 
+    /// Stops every worker and waits for the threads to finish.
+    ///
+    /// `timeout` is passed to each worker's [`ServerHandle::close`], bounding
+    /// how long it waits for its connections. This blocks, so do not call it
+    /// from inside an async context.
     pub fn close(self, timeout: Option<f64>) {
         let _ = self.shutdown.send(timeout);
         for thread in self.threads {

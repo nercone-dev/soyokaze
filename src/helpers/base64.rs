@@ -1,12 +1,25 @@
+//! Base64 with the standard alphabet.
+//!
+//! Encoding always pads. Decoding is strict — it rejects a length that is not
+//! a multiple of four, padding anywhere but the end, and padding whose
+//! discarded bits are not zero — so that a `Sec-WebSocket-Key` cannot be
+//! written more than one way.
+
 use std::fmt;
 
+/// The standard alphabet, indexed by sextet value.
 pub const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+/// The padding symbol.
 pub const PAD: u8 = b'=';
 
+/// Why [`decode`] refused its input.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DecodeError {
+    /// The input length is not a multiple of four.
     InvalidLength(usize),
+    /// A symbol is outside the alphabet.
     InvalidSymbol(u8),
+    /// Padding is misplaced, over-long, or carries non-zero bits.
     InvalidPadding,
 }
 
@@ -22,8 +35,10 @@ impl fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
+/// The [`VALUES`] entry for an octet that is not in the alphabet.
 pub const INVALID: u8 = 0xff;
 
+/// The sextet value of each octet, or [`INVALID`].
 pub static VALUES: [u8; 256] = {
     let mut values = [INVALID; 256];
     let mut index = 0;
@@ -36,10 +51,12 @@ pub static VALUES: [u8; 256] = {
     values
 };
 
+/// The symbol for a sextet; only the low six bits of `value` are read.
 pub fn symbol(value: u8) -> u8 {
     ALPHABET[value as usize & 0x3f]
 }
 
+/// The sextet a symbol stands for, or `None` when it is outside the alphabet.
 pub fn value(symbol: u8) -> Option<u8> {
     match VALUES[symbol as usize] {
         INVALID => None,
@@ -47,10 +64,12 @@ pub fn value(symbol: u8) -> Option<u8> {
     }
 }
 
+/// How many octets [`encode`] will produce for this input, padding included.
 pub fn encoded_len(input: &[u8]) -> usize {
     input.len().div_ceil(3) * 4
 }
 
+/// Encodes octets, padding the result to a multiple of four.
 pub fn encode(input: &[u8]) -> String {
     let mut out = Vec::with_capacity(encoded_len(input));
 
@@ -81,6 +100,12 @@ pub fn encode(input: &[u8]) -> String {
     String::from_utf8(out).unwrap_or_default()
 }
 
+/// Packs a group of symbols into one integer, six bits per symbol.
+///
+/// # Errors
+///
+/// Returns [`DecodeError::InvalidSymbol`] for anything outside the alphabet,
+/// padding included.
 pub fn sextets(group: &[u8]) -> Result<u32, DecodeError> {
     let mut packed = 0u32;
 
@@ -94,6 +119,15 @@ pub fn sextets(group: &[u8]) -> Result<u32, DecodeError> {
     Ok(packed)
 }
 
+/// Decodes padded base64, strictly.
+///
+/// # Errors
+///
+/// Returns [`DecodeError::InvalidLength`] when the input is not a multiple of
+/// four octets, [`DecodeError::InvalidSymbol`] for a symbol outside the
+/// alphabet, and [`DecodeError::InvalidPadding`] when padding appears anywhere
+/// but at the end, when there is more than two octets of it, or when the bits
+/// it displaces are not zero.
 pub fn decode(input: &str) -> Result<Vec<u8>, DecodeError> {
     let input = input.as_bytes();
     if !input.len().is_multiple_of(4) {

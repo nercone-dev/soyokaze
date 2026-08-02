@@ -1,3 +1,19 @@
+//! HTTP/1.0 and HTTP/1.1.
+//!
+//! One message at a time in each direction, framed as a start line, a field
+//! section, and a body whose length comes from `Content-Length`,
+//! `Transfer-Encoding`, or the connection closing — which is what
+//! [`body_length`] works out.
+//!
+//! [`H1Connection`] tracks pipelined requests so that a response can be
+//! matched to the method that asked for it, which some bodies need in order to
+//! be framed at all: a response to `HEAD` has no body however it is labelled.
+//!
+//! The parsers here are strict on the things that let two intermediaries read
+//! one byte stream as two different messages — bare LF, obsolete line folding,
+//! `Content-Length` alongside `Transfer-Encoding`, `Content-Length` values that
+//! disagree — since that is what request smuggling is built out of.
+
 use std::collections::VecDeque;
 use std::ops::Range;
 
@@ -9,6 +25,10 @@ use crate::helpers::text::Text;
 use crate::models::{Body, ConnectionID, HeaderCase, Headers, Limits, Message, Method, Role, Version};
 use crate::protocol::common::{self, Buffer, Connection, Error};
 
+/// The reason phrase conventionally paired with a status code.
+///
+/// Unknown codes get `"Unknown"`. The phrase carries no meaning on the wire —
+/// recipients act on the code — so this only has to be something sensible.
 pub fn reason_phrase(status_code: u16) -> &'static str {
     match status_code {
         100 => "Continue",
@@ -77,6 +97,7 @@ pub fn reason_phrase(status_code: u16) -> &'static str {
     }
 }
 
+/// Appends a decimal integer.
 pub fn write_number(mut value: u64, out: &mut BytesMut) {
     let mut digits = [0u8; 20];
     let mut index = digits.len();
@@ -94,6 +115,12 @@ pub fn write_number(mut value: u64, out: &mut BytesMut) {
     out.extend_from_slice(&digits[index..]);
 }
 
+/// Appends the start line, without its terminating CRLF.
+///
+/// # Errors
+///
+/// Returns [`Error::Version`] for a message that is not HTTP/1.x, and
+/// [`Error::Protocol`] for one that is neither a request nor a response.
 pub fn write_start_line_into(message: &Message, out: &mut BytesMut) -> Result<(), Error> {
     if message.version.major() != 1 {
         return Err(Error::Version(format!("{} has no start line", message.version)));
@@ -151,22 +178,50 @@ pub fn write_start_line_into(message: &Message, out: &mut BytesMut) -> Result<()
     Err(Error::Protocol("message is neither a request nor a response".into()))
 }
 
+/// [`write_start_line_into`], returning the line as a `String`.
+///
+/// # Errors
+///
+/// As [`write_start_line_into`].
 pub fn write_start_line(message: &Message) -> Result<String, Error> {
     let mut out = BytesMut::new();
     write_start_line_into(message, &mut out)?;
     Ok(String::from_utf8(out.to_vec()).unwrap_or_default())
 }
 
+/// [`parse_start_line`] over raw octets.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] when the line is not valid UTF-8, and otherwise
+/// as [`parse_start_line`].
 #[inline]
 pub fn parse_start_line_bytes(line: &[u8]) -> Result<Message, Error> {
     let line = std::str::from_utf8(line).map_err(|_| Error::Protocol("start line is not valid UTF-8".into()))?;
     parse_start_line(line)
 }
 
+/// Splits a line at `at`, discarding the octet there.
+///
+/// # Panics
+///
+/// Panics when `at` is not a character boundary, or is past the end.
 pub fn split_once(line: &str, at: usize) -> (&str, &str) {
     (&line[..at], &line[at + 1..])
 }
 
+/// Parses a start line into an empty request or response.
+///
+/// A line beginning `HTTP/` is read as a status line and anything else as a
+/// request line.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] for a malformed line — a missing field, a
+/// status code that is not three digits, a control octet in the reason phrase,
+/// an unrecognised method, or a request target that is empty or carries a
+/// space or a control octet — and [`Error::Version`] for a version that is not
+/// HTTP/1.x.
 pub fn parse_start_line(line: &str) -> Result<Message, Error> {
     if line.as_bytes().starts_with(b"HTTP/") {
         let Some(first) = scan::find(line.as_bytes(), b' ') else {
@@ -213,6 +268,7 @@ pub fn parse_start_line(line: &str) -> Result<Message, Error> {
     Ok(Message::request(method, target, parse_version(version)?))
 }
 
+/// [`request_line_error_status`] over raw octets.
 pub fn request_line_error_status_bytes(line: &[u8]) -> u16 {
     match std::str::from_utf8(line) {
         Ok(line) => request_line_error_status(line),
@@ -220,6 +276,11 @@ pub fn request_line_error_status_bytes(line: &[u8]) -> u16 {
     }
 }
 
+/// The status a server should answer a request line it could not parse with.
+///
+/// 501 for a method that is not recognised, 505 for a version that is not
+/// HTTP/1.x, and 400 for everything else — so the client is told which part it
+/// got wrong rather than just that something was.
 pub fn request_line_error_status(line: &str) -> u16 {
     let Some(first) = scan::find(line.as_bytes(), b' ') else {
         return 400;
@@ -246,6 +307,12 @@ pub fn request_line_error_status(line: &str) -> u16 {
     400
 }
 
+/// Reads an HTTP/1.x version from a start line.
+///
+/// # Errors
+///
+/// Returns [`Error::Version`] for anything that is not `HTTP/1.0` or
+/// `HTTP/1.1`.
 pub fn parse_version(text: &str) -> Result<Version, Error> {
     match text {
         "HTTP/1.0" => Ok(Version::V1_0),
@@ -254,13 +321,17 @@ pub fn parse_version(text: &str) -> Result<Version, Error> {
     }
 }
 
+/// Whether an octet is a control character, tab included.
 pub fn is_control(byte: u8) -> bool {
     byte < 0x20 || byte == 0x7f
 }
 
+/// [`OCTETS`]: the octet may appear in a token, and so in a field name.
 pub const TOKEN: u8 = 1 << 0;
+/// [`OCTETS`]: the octet may appear in a field value.
 pub const FIELD: u8 = 1 << 1;
 
+/// What each octet is allowed to be part of: the or of [`TOKEN`] and [`FIELD`].
 pub static OCTETS: [u8; 256] = {
     let mut octets = [0u8; 256];
     let mut value = 0usize;
@@ -283,18 +354,28 @@ pub static OCTETS: [u8; 256] = {
     octets
 };
 
+/// Whether a string is a non-empty token, and so usable as a field name.
 pub fn is_token(text: &str) -> bool {
     is_token_bytes(text.as_bytes())
 }
 
+/// [`is_token`] over raw octets.
 pub fn is_token_bytes(text: &[u8]) -> bool {
     !text.is_empty() && text.iter().all(|byte| OCTETS[*byte as usize] & TOKEN != 0)
 }
 
+/// Whether octets may be sent as a field value; see [`scan::is_field_value`].
 pub fn is_field_value(text: &[u8]) -> bool {
     scan::is_field_value(text)
 }
 
+/// Appends one field line, terminator included, in the given casing.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] when the name is not a token or the value
+/// carries a control octet — either of which would let the field break out of
+/// its line and inject another.
 pub fn write_header_line_into(name: &str, value: &str, case: HeaderCase, out: &mut BytesMut) -> Result<(), Error> {
     if !is_token(name) {
         return Err(Error::Protocol(format!("field name {name:?} is not a token")));
@@ -321,12 +402,23 @@ pub fn write_header_line_into(name: &str, value: &str, case: HeaderCase, out: &m
     Ok(())
 }
 
+/// [`write_header_line_into`], returning the line as a `String`.
+///
+/// # Errors
+///
+/// As [`write_header_line_into`].
 pub fn write_header_line(name: &str, value: &str, case: HeaderCase) -> Result<String, Error> {
     let mut out = BytesMut::new();
     write_header_line_into(name, value, case, &mut out)?;
     Ok(String::from_utf8(out.to_vec()).unwrap_or_default())
 }
 
+/// Appends a whole field section, without the blank line that ends it.
+///
+/// # Errors
+///
+/// As [`write_header_line_into`]. The buffer may hold a partial section when
+/// this fails.
 pub fn write_headers_into(headers: &Headers, case: HeaderCase, out: &mut BytesMut) -> Result<(), Error> {
     out.reserve(headers_size(headers) as usize);
 
@@ -336,12 +428,21 @@ pub fn write_headers_into(headers: &Headers, case: HeaderCase, out: &mut BytesMu
     Ok(())
 }
 
+/// [`write_headers_into`], returning the section as a `String`.
+///
+/// # Errors
+///
+/// As [`write_header_line_into`].
 pub fn write_headers(headers: &Headers, case: HeaderCase) -> Result<String, Error> {
     let mut out = BytesMut::new();
     write_headers_into(headers, case, &mut out)?;
     Ok(String::from_utf8(out.to_vec()).unwrap_or_default())
 }
 
+/// Appends a `Content-Length` field line, terminator included.
+///
+/// Kept apart from [`write_header_line_into`] because it goes out on nearly
+/// every message and neither the name nor the value can fail validation.
 pub fn write_content_length_into(length: u64, case: HeaderCase, out: &mut BytesMut) {
     let mut digits = [0u8; 20];
     let mut index = digits.len();
@@ -375,16 +476,27 @@ pub fn write_content_length_into(length: u64, case: HeaderCase, out: &mut BytesM
     line[name.len() + written + 3] = b'\n';
 }
 
+/// How many octets a field section will take on the wire, terminators included.
 pub fn headers_size(headers: &Headers) -> u64 {
     headers.iter().map(|(name, value)| (name.len() + value.len() + 4) as u64).sum()
 }
 
+/// Where the name and value sit within a field line, found without copying.
 pub struct FieldSpans {
+    /// The field name.
     pub name: Range<usize>,
+    /// The field value, with surrounding whitespace already trimmed off.
     pub value: Range<usize>,
+    /// Whether the value is ASCII, so it need not be validated again.
     pub ascii: bool,
 }
 
+/// The offset of the colon that ends a field name.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] when the name is empty, carries a non-token
+/// octet, or the line has no colon at all.
 #[inline]
 pub fn name_end(line: &[u8]) -> Result<usize, Error> {
     let mut at = 0;
@@ -409,6 +521,12 @@ pub fn name_end(line: &[u8]) -> Result<usize, Error> {
     Err(Error::Protocol(format!("field line {:?} has no colon", String::from_utf8_lossy(line))))
 }
 
+/// Locates the name and value within a field line, and classifies the value.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] as [`name_end`] does, and when the value
+/// carries a control octet.
 #[inline]
 pub fn field_spans(line: &[u8]) -> Result<FieldSpans, Error> {
     let colon = name_end(line)?;
@@ -429,6 +547,11 @@ pub fn field_spans(line: &[u8]) -> Result<FieldSpans, Error> {
     Ok(FieldSpans { name: 0..colon, value: value + start..value + end, ascii: class & scan::VALUE_OBS_TEXT == 0 })
 }
 
+/// Parses one field line into an owned lowercased name and value.
+///
+/// # Errors
+///
+/// As [`field_spans`].
 pub fn parse_header_line(line: &str) -> Result<(String, String), Error> {
     let spans = field_spans(line.as_bytes())?;
 
@@ -438,6 +561,12 @@ pub fn parse_header_line(line: &str) -> Result<(String, String), Error> {
     ))
 }
 
+/// Parses a field section from already-split lines.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] for a folded continuation line, which is
+/// obsolete and a smuggling vector, and otherwise as [`field_spans`].
 pub fn parse_headers(lines: impl IntoIterator<Item = String>) -> Result<Headers, Error> {
     let mut headers = Headers::new();
 
@@ -453,6 +582,11 @@ pub fn parse_headers(lines: impl IntoIterator<Item = String>) -> Result<Headers,
     Ok(headers)
 }
 
+/// Parses one field line straight into [`Text`], lowercasing the name.
+///
+/// # Errors
+///
+/// As [`field_spans`].
 pub fn parse_field(line: &[u8]) -> Result<(Text, Text), Error> {
     let spans = field_spans(line)?;
 
@@ -465,6 +599,11 @@ pub fn parse_field(line: &[u8]) -> Result<(Text, Text), Error> {
     Ok((name, value))
 }
 
+/// Finds the blank line that ends a field section.
+///
+/// Returns where the field lines stop and where the section as a whole ends,
+/// the terminator included. `searched` carries how far the scan already got,
+/// so that repeated calls as more octets arrive do not rescan from the front.
 pub fn block_end(data: &[u8], searched: &mut usize) -> Option<(usize, usize)> {
     if data.len() >= 2 && data[0] == b'\r' && data[1] == b'\n' {
         return Some((0, 2));
@@ -490,6 +629,13 @@ pub fn block_end(data: &[u8], searched: &mut usize) -> Option<(usize, usize)> {
     None
 }
 
+/// Parses a whole field section, without its terminating blank line.
+///
+/// # Errors
+///
+/// Returns [`Error::Limit`] past `max_count` fields, [`Error::Protocol`] for a
+/// line not terminated by CRLF or folded onto a continuation line, and
+/// otherwise as [`field_spans`].
 pub fn parse_header_block(block: &[u8], max_count: usize) -> Result<Headers, Error> {
     let mut headers = Headers::with_capacity((block.len() / 32).min(max_count) + 1);
     let mut rest = block;
@@ -521,6 +667,8 @@ pub fn parse_header_block(block: &[u8], max_count: usize) -> Result<Headers, Err
     Ok(headers)
 }
 
+/// Writes `value` as lowercase hexadecimal into the back of `digits`, and
+/// returns where it starts.
 pub fn hex_digits(mut value: u64, digits: &mut [u8; 16]) -> usize {
     let mut index = digits.len();
 
@@ -535,12 +683,17 @@ pub fn hex_digits(mut value: u64, digits: &mut [u8; 16]) -> usize {
     }
 }
 
+/// Appends `value` as lowercase hexadecimal.
 pub fn write_hex(value: u64, out: &mut Vec<u8>) {
     let mut digits = [0u8; 16];
     let index = hex_digits(value, &mut digits);
     out.extend_from_slice(&digits[index..]);
 }
 
+/// Appends one chunk: its size line, the data, and a CRLF.
+///
+/// A zero-length chunk written this way would end the body, so callers filter
+/// empty data out rather than framing it.
 pub fn write_chunk_into(data: &[u8], out: &mut BytesMut) {
     let mut digits = [0u8; 16];
     let index = hex_digits(data.len() as u64, &mut digits);
@@ -552,6 +705,7 @@ pub fn write_chunk_into(data: &[u8], out: &mut BytesMut) {
     out.extend_from_slice(b"\r\n");
 }
 
+/// [`write_chunk_into`], returning the chunk on its own.
 pub fn encode_chunk(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() + 20);
 
@@ -563,6 +717,15 @@ pub fn encode_chunk(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Reads a chunk size line, returning where the data starts and how long it is.
+///
+/// `None` when the line has not fully arrived yet. Any chunk extensions after
+/// a `;` are read past and discarded.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] when the line is not terminated by CRLF or the
+/// size is not hexadecimal.
 pub fn parse_chunk_size(data: &[u8]) -> Result<Option<(usize, usize)>, Error> {
     let Some(end) = scan::find(data, b'\n') else {
         return Ok(None);
@@ -581,6 +744,16 @@ pub fn parse_chunk_size(data: &[u8]) -> Result<Option<(usize, usize)>, Error> {
     Ok(Some((end + 1, size)))
 }
 
+/// Reads one whole chunk.
+///
+/// Returns how many octets the chunk occupies and where its data sits within
+/// them. A consumed count of zero means the chunk has not fully arrived yet;
+/// an empty range with a non-zero count is the final chunk that ends the body.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] as [`parse_chunk_size`] does, when the data is
+/// not terminated by CRLF, and when the size is too large to address.
 pub fn decode_chunk(data: &[u8]) -> Result<(usize, Range<usize>), Error> {
     let Some((start, size)) = parse_chunk_size(data)? else {
         return Ok((0, 0..0));
@@ -605,6 +778,15 @@ pub fn decode_chunk(data: &[u8]) -> Result<(usize, Range<usize>), Error> {
     Ok((terminator, start..end))
 }
 
+/// Reads a `Content-Length` value.
+///
+/// Only digits are accepted — no sign, no whitespace, no `+` — since anything
+/// looser lets two intermediaries read one field as two different lengths.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] when the value is not a run of digits, or does
+/// not fit in a `u64`.
 pub fn parse_content_length(value: &str) -> Result<u64, Error> {
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(Error::Protocol(format!("Content-Length {value:?} is not a number")));
@@ -613,14 +795,32 @@ pub fn parse_content_length(value: &str) -> Result<u64, Error> {
     value.parse().map_err(|_| Error::Protocol(format!("Content-Length {value:?} does not fit")))
 }
 
+/// How the length of a message body is determined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyLength {
+    /// There is no body.
     None,
+    /// The body is chunked, and ends at a zero-length chunk.
     Chunked,
+    /// The body is exactly this many octets.
     Fixed(u64),
+    /// The body ends when the connection closes.
     Close,
 }
 
+/// Works out how a message's body is framed.
+///
+/// `method` is the method of the request this responds to, which some
+/// responses need in order to be framed at all: a response to `HEAD` has no
+/// body however it is labelled, and a successful response to `CONNECT` is
+/// followed by tunnelled octets rather than a body. Pass `None` for a request.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] when `Transfer-Encoding` and `Content-Length`
+/// are both present, when a request's `Transfer-Encoding` does not end in
+/// `chunked`, and when two `Content-Length` values disagree. Each of these is
+/// a way of making one byte stream read as two different messages.
 pub fn body_length(message: &Message, method: Option<Method>) -> Result<BodyLength, Error> {
     let headers = message.headers.as_ref();
 
@@ -678,8 +878,21 @@ pub fn body_length(message: &Message, method: Option<Method>) -> Result<BodyLeng
     if message.is_request() { Ok(BodyLength::None) } else { Ok(BodyLength::Close) }
 }
 
+/// The body size up to which the head and the body go out as one write.
+///
+/// Below this, coalescing saves a syscall and a round trip; above it, copying
+/// the body into the head buffer costs more than the extra write.
 pub const INLINE_BODY_LIMIT: usize = 64 * 1024;
 
+/// An HTTP/1.0 or HTTP/1.1 connection.
+///
+/// One message at a time in each direction. As a client it may pipeline, up to
+/// [`Limits::max_concurrent_streams`] requests awaiting a response, and it
+/// remembers each request's method so the matching response can be framed.
+///
+/// The connection can be handed over to another protocol with
+/// [`H1Connection::upgrade`], which gives up the transport along with whatever
+/// has already been buffered.
 pub struct H1Connection<T> {
     transport: T,
     role: Role,
@@ -696,10 +909,15 @@ impl<T> H1Connection<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    /// A connection over a transport nothing has been read from yet.
     pub fn new(transport: T, role: Role, id: ConnectionID, limits: Limits) -> Self {
         Self::resume(transport, role, id, limits, Buffer::new())
     }
 
+    /// A connection over a transport that has already been read from.
+    ///
+    /// This is what version sniffing needs: the octets read to decide the
+    /// version are handed over rather than lost.
     pub fn resume(transport: T, role: Role, id: ConnectionID, limits: Limits, buffer: Buffer) -> Self {
         Self {
             transport,
@@ -714,32 +932,52 @@ where
         }
     }
 
+    /// Attaches an HSTS policy to be added to the responses this connection sends.
     pub fn with_hsts(mut self, hsts: Option<crate::helpers::hsts::HstsPolicy>) -> Self {
         self.hsts = hsts;
         self
     }
 
+    /// The limits this connection holds itself to.
     pub fn limits(&self) -> &Limits {
         &self.limits
     }
 
+    /// How much the read buffer has allocated.
     pub fn buffer_capacity(&self) -> usize {
         self.buffer.capacity()
     }
 
+    /// How much the write buffer has allocated.
     pub fn scratch_capacity(&self) -> usize {
         self.scratch.capacity()
     }
 
+    /// Gives up the transport and the read buffer, for another protocol to take over.
+    ///
+    /// This is how a `101 Switching Protocols` is followed through: whatever
+    /// the peer sent after the handshake is already buffered and must not be
+    /// dropped.
     pub fn upgrade(self) -> (T, Buffer) {
         (self.transport, self.buffer)
     }
 
+    /// Writes octets without flushing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Timeout`] past [`Limits::write_timeout`], and
+    /// [`Error::Io`] when the transport fails.
     pub async fn write(&mut self, data: &[u8]) -> Result<(), Error> {
         common::within(self.limits.write_timeout, self.transport.write_all(data)).await??;
         Ok(())
     }
 
+    /// Writes octets and flushes, both under one deadline.
+    ///
+    /// # Errors
+    ///
+    /// As [`H1Connection::write`].
     pub async fn write_flushed(&mut self, data: &[u8]) -> Result<(), Error> {
         let transport = &mut self.transport;
 
@@ -752,20 +990,48 @@ where
         Ok(())
     }
 
+    /// Flushes whatever the transport has buffered.
+    ///
+    /// # Errors
+    ///
+    /// As [`H1Connection::write`].
     pub async fn flush(&mut self) -> Result<(), Error> {
         common::within(self.limits.write_timeout, self.transport.flush()).await??;
         Ok(())
     }
 
+    /// Answers with a bare status and marks the connection for closing.
+    ///
+    /// Used where the request could not be parsed, so there is no telling
+    /// where the next one would begin.
+    ///
+    /// # Errors
+    ///
+    /// As [`H1Connection::send_message`].
     pub async fn reject(&mut self, status_code: u16) -> Result<(), Error> {
         self.closing = true;
         self.send_message(Message::response(status_code, Version::V1_1)).await
     }
 
+    /// How many requests may be in flight at once.
     pub fn pipeline_depth(&self) -> usize {
         (self.limits.max_concurrent_streams as usize).max(1)
     }
 
+    /// Writes one whole message: start line, fields, and body.
+    ///
+    /// A server-side response is finalised first, so `Date`, `Server` and the
+    /// HSTS policy are attached. The body is framed as the fields already say,
+    /// and `Content-Length` is added when neither `Transfer-Encoding` nor an
+    /// existing `Content-Length` says otherwise and the status admits a body.
+    /// Bodies up to [`INLINE_BODY_LIMIT`] go out together with the head.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Limit`] when more than [`H1Connection::pipeline_depth`]
+    /// requests are already awaiting a response, [`Error::Io`] when a
+    /// [`Body::File`] cannot be read, and otherwise as
+    /// [`write_start_line_into`] and [`write_header_line_into`].
     pub async fn send_message(&mut self, message: Message) -> Result<(), Error> {
         if message.method.is_some() && self.pending.len() >= self.pipeline_depth() {
             let reason = format!("more than {} requests are awaiting a response", self.pipeline_depth());
@@ -877,6 +1143,17 @@ where
         Ok(())
     }
 
+    /// Reads one whole message.
+    ///
+    /// A server that cannot parse the request line answers with the status
+    /// [`request_line_error_status`] picks before reporting the failure, since
+    /// a client that sent something malformed is owed an explanation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`] when the peer is done, [`Error::Limit`] when
+    /// the message goes past [`Limits::max_message_size`] or one of the other
+    /// ceilings, and otherwise as the parsers above.
     pub async fn receive_message(&mut self) -> Result<Message, Error> {
         let length = self
             .buffer
@@ -934,10 +1211,22 @@ where
         Ok(message)
     }
 
+    /// Reads a field section on its own, such as a trailer section.
+    ///
+    /// # Errors
+    ///
+    /// As [`H1Connection::read_header_block`].
     pub async fn receive_headers(&mut self) -> Result<Headers, Error> {
         Ok(self.read_header_block().await?.0)
     }
 
+    /// Reads a field section, returning it and how many octets it occupied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Limit`] past [`Limits::max_headers_size`],
+    /// [`Error::Closed`] when the transport ends first, and otherwise as
+    /// [`parse_header_block`].
     pub async fn read_header_block(&mut self) -> Result<(Headers, usize), Error> {
         let max = self.limits.max_headers_size;
         let mut searched = 0usize;
@@ -966,10 +1255,27 @@ where
         Ok((headers, consumed))
     }
 
+    /// [`H1Connection::read_body`], reporting an empty body as no body at all.
+    ///
+    /// # Errors
+    ///
+    /// As [`H1Connection::read_body`].
     pub async fn receive_body(&mut self, length: BodyLength, budget: u64) -> Result<Option<Bytes>, Error> {
         Ok(self.read_body(length, budget).await?.filter(|body| !body.is_empty()))
     }
 
+    /// Reads a message body framed as `length` says.
+    ///
+    /// `budget` is what remains of [`Limits::max_message_size`] once the head
+    /// has been counted; the body is held to the lesser of that and
+    /// [`Limits::max_message_body_size`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Limit`] when the body goes past that ceiling or a
+    /// chunk size line past [`Limits::max_chunk_header_size`],
+    /// [`Error::Closed`] when the transport ends mid-body, and otherwise as
+    /// [`decode_chunk`].
     pub async fn read_body(&mut self, length: BodyLength, budget: u64) -> Result<Option<Bytes>, Error> {
         let limit = self.limits.max_message_body_size.min(budget);
 

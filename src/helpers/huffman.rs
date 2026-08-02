@@ -1,22 +1,42 @@
+//! The Huffman code HPACK and QPACK share.
+//!
+//! The code is a fixed canonical one, tuned on a corpus of real field values,
+//! so no table travels with the data. HTTP/2 and HTTP/3 both use it, which is
+//! why it lives here rather than in either codec.
+//!
+//! Encoding is a table lookup per octet, packing codes into a bit accumulator.
+//! Decoding walks a table-driven automaton four bits at a time, built once by
+//! [`DecodeTable::new`] and shared from [`decode_table`].
+//!
+//! Padding must be the high bits of the end-of-string code — a decoder must
+//! reject anything else, and reject the code itself appearing in full, since
+//! both would let one string be written more than one way.
+
 use std::fmt;
 use std::sync::OnceLock;
 
 use bytes::Bytes;
 
+/// One code word: `length` bits, right-aligned in `code`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Symbol {
+    /// The code word, right-aligned.
     pub code: u32,
+    /// How many bits of `code` are meaningful; never more than 30.
     pub length: u8,
 }
 
 impl Symbol {
+    /// A code word of `length` bits.
     pub const fn new(code: u32, length: u8) -> Self {
         Self { code, length }
     }
 }
 
+/// The end-of-string symbol, which never appears in a well-formed encoding.
 pub const EOS: u16 = 256;
 
+/// The code word for each octet, and for [`EOS`] at the end.
 pub static TABLE: [Symbol; 257] = [
     Symbol::new(0x1ff8, 13),     // 0
     Symbol::new(0x7fffd8, 23),   // 1
@@ -277,10 +297,13 @@ pub static TABLE: [Symbol; 257] = [
     Symbol::new(0x3fffffff, 30), // 256 EOS
 ];
 
+/// The code table.
 pub fn table() -> &'static [Symbol; 257] {
     &TABLE
 }
 
+/// The code length for each symbol, split out so [`encoded_len`] can size a
+/// buffer without touching the code words.
 pub static LENGTHS: [u8; 257] = {
     let mut lengths = [0u8; 257];
     let mut value = 0;
@@ -293,36 +316,63 @@ pub static LENGTHS: [u8; 257] = {
     lengths
 };
 
+/// What following one bit out of a node reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Branch {
+    /// Another node, by index into [`DecodeTable::branches`].
     Node(usize),
+    /// A complete symbol.
     Symbol(u16),
 }
 
+/// How many transitions one automaton row holds: one per four-bit input.
 pub const NIBBLE: usize = 16;
 
+/// [`Transition`]: a symbol was completed and should be emitted.
 pub const EMIT: u8 = 1 << 0;
+/// [`Transition`]: the bits do not spell a code word, so decoding fails.
 pub const FAIL: u8 = 1 << 1;
+/// [`Transition`]: the end-of-string code was met, which is not allowed on the wire.
 pub const ENDED: u8 = 1 << 2;
 
+/// One step of the decoding automaton, for one state and one four-bit input.
+///
+/// At most one symbol can be completed per nibble, because no code word is
+/// shorter than five bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Transition {
+    /// The state to move to.
     pub next: u16,
+    /// The symbol completed, meaningful only when [`EMIT`] is set.
     pub symbol: u8,
+    /// The or of [`EMIT`], [`FAIL`] and [`ENDED`].
     pub flags: u8,
 }
 
 impl Transition {
+    /// The transition for an input that cannot continue any code word.
     pub const STUCK: Self = Self { next: 0, symbol: 0, flags: FAIL };
 }
 
+/// The decoding automaton, built once and shared.
+///
+/// The bit-level tree in `branches` is what the code table spells out
+/// directly; `rows` is that tree flattened into a table indexed by state and
+/// nibble, which is what the decoder actually walks.
 pub struct DecodeTable {
+    /// The binary tree of the code, indexed by node, then by bit.
     pub branches: Vec<[Option<Branch>; 2]>,
+    /// One row of [`NIBBLE`] transitions per state.
     pub rows: Vec<[Transition; NIBBLE]>,
+    /// Whether each state may end an encoding.
+    ///
+    /// A state is accepting when it sits on the all-ones path from the root,
+    /// which is what valid padding leaves behind.
     pub accepting: Vec<bool>,
 }
 
 impl DecodeTable {
+    /// Builds the automaton from a code table.
     pub fn new(table: &[Symbol; 257]) -> Self {
         let mut branches = vec![[None, None]];
 
@@ -350,6 +400,11 @@ impl DecodeTable {
         Self { branches, rows, accepting }
     }
 
+    /// Flattens the bit tree into nibble-wide rows, and works out which states
+    /// may end an encoding.
+    ///
+    /// Only states reachable from the root are given rows, so the table stays
+    /// far smaller than the tree it came from.
     pub fn compile(branches: &[[Option<Branch>; 2]]) -> (Vec<[Transition; NIBBLE]>, Vec<bool>) {
         let mut state_of = vec![u16::MAX; branches.len()];
         let mut nodes = vec![0usize];
@@ -420,19 +475,28 @@ impl DecodeTable {
         (rows, accepting)
     }
 
+    /// Follows one bit out of `node` in the bit tree.
+    ///
+    /// The decoder itself walks `rows` a nibble at a time; this is for
+    /// inspecting the code directly.
     pub fn step(&self, node: usize, bit: bool) -> Option<Branch> {
         self.branches.get(node).and_then(|pair| pair[bit as usize])
     }
 }
 
+/// The shared decoding automaton, built on first use.
 pub fn decode_table() -> &'static DecodeTable {
     static DECODE_TABLE: OnceLock<DecodeTable> = OnceLock::new();
     DECODE_TABLE.get_or_init(|| DecodeTable::new(table()))
 }
 
+/// Why a Huffman string would not decode.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DecodeError {
+    /// The encoding does not end on the all-ones padding, or it spells out the
+    /// end-of-string code in full.
     InvalidPadding,
+    /// The bits do not spell a code word.
     UnknownSymbol,
 }
 
@@ -447,6 +511,7 @@ impl fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
+/// Encodes octets, padding to a whole octet with one-bits.
 pub fn encode(input: &[u8]) -> Bytes {
     let encoded = encoded_len(input);
 
@@ -456,10 +521,15 @@ pub fn encode(input: &[u8]) -> Bytes {
     Bytes::from(out)
 }
 
+/// [`encode`], appending to a buffer the caller owns.
 pub fn encode_into(input: &[u8], out: &mut Vec<u8>) {
     encode_sized(input, encoded_len(input), out)
 }
 
+/// [`encode_into`] for a caller that has already computed [`encoded_len`].
+///
+/// The length is only used to reserve; a wrong one costs a reallocation but
+/// does not change the output.
 pub fn encode_sized(input: &[u8], encoded: usize, out: &mut Vec<u8>) {
     let table = table();
     out.reserve(encoded);
@@ -489,16 +559,39 @@ pub fn encode_sized(input: &[u8], encoded: usize, out: &mut Vec<u8>) {
     }
 }
 
+/// Decodes a Huffman string.
+///
+/// # Errors
+///
+/// Returns [`DecodeError::UnknownSymbol`] when the bits do not spell a code
+/// word, and [`DecodeError::InvalidPadding`] when the encoding does not end on
+/// the all-ones padding or spells out the end-of-string code.
 pub fn decode(input: &[u8]) -> Result<Bytes, DecodeError> {
     let mut out = Vec::new();
     decode_into(input, &mut out)?;
     Ok(Bytes::from(out))
 }
 
+/// [`decode`], appending to a buffer the caller owns.
+///
+/// # Errors
+///
+/// As [`decode`]. The buffer may hold a partial result when this fails.
 pub fn decode_into(input: &[u8], out: &mut Vec<u8>) -> Result<(), DecodeError> {
     decode_into_ascii(input, out).map(|_| ())
 }
 
+/// [`decode_into`], also reporting whether the result is ASCII.
+///
+/// Returns `true` when no decoded octet has its high bit set. Field values are
+/// almost always ASCII, and knowing so lets the caller build a [`Text`]
+/// without a second pass over the octets.
+///
+/// # Errors
+///
+/// As [`decode`]. The buffer may hold a partial result when this fails.
+///
+/// [`Text`]: crate::helpers::text::Text
 pub fn decode_into_ascii(input: &[u8], out: &mut Vec<u8>) -> Result<bool, DecodeError> {
     let table = decode_table();
     let rows = table.rows.as_slice();
@@ -535,6 +628,11 @@ pub fn decode_into_ascii(input: &[u8], out: &mut Vec<u8>) -> Result<bool, Decode
     Ok(seen & 0x80 == 0)
 }
 
+/// How many octets [`encode`] will produce for this input, padding included.
+///
+/// The codecs call this before encoding to decide whether Huffman coding is
+/// worth it at all: when it is no shorter than the input, the string is sent
+/// as it stands.
 pub fn encoded_len(input: &[u8]) -> usize {
     let bits: usize = input.iter().map(|byte| LENGTHS[*byte as usize] as usize).sum();
     bits.div_ceil(8)

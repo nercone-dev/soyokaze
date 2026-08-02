@@ -1,3 +1,12 @@
+//! HTTP Strict Transport Security.
+//!
+//! [`HstsPolicy`] is the `Strict-Transport-Security` field itself: a server
+//! builds one to send, a client parses one it received. [`HstsStore`] is the
+//! client-side memory of which hosts have asked to be reached over TLS only,
+//! which a [`Client`] consults before it dials.
+//!
+//! [`Client`]: crate::api::client::Client
+
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Mutex;
@@ -7,28 +16,42 @@ use crate::helpers::sync::lock;
 use crate::helpers::text::Text;
 use crate::models::Limits;
 
+/// Appends as much of `part` to `out` as fits, advancing `written`.
+///
+/// Truncates rather than growing or failing, which is what lets
+/// [`HstsPolicy::value`] build its field value on the stack.
 pub fn append(out: &mut [u8], written: &mut usize, part: &[u8]) {
     let end = (*written + part.len()).min(out.len());
     out[*written..end].copy_from_slice(&part[..end - *written]);
     *written = end;
 }
 
+/// One `Strict-Transport-Security` policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HstsPolicy {
+    /// How many seconds the policy holds for. Zero withdraws it.
     pub max_age: i64,
+    /// Whether the policy covers subdomains as well as the host itself.
     pub include_subdomains: bool,
+    /// Whether the host asks to be added to browser preload lists.
     pub preload: bool,
 }
 
 impl HstsPolicy {
+    /// A policy lasting `max_age` seconds, covering this host alone.
     pub fn new(max_age: i64) -> Self {
         Self { max_age, include_subdomains: false, preload: false }
     }
 
+    /// The field value as a `String`.
     pub fn build(&self) -> String {
         self.value().into_string()
     }
 
+    /// The field value.
+    ///
+    /// A negative `max_age` is written as zero. The value is built without
+    /// allocating, since a server writes one on every secure response.
     pub fn value(&self) -> Text {
         let mut out = [0u8; 64];
         let mut written = 0;
@@ -62,6 +85,12 @@ impl HstsPolicy {
         Text::from_ascii(&out[..written])
     }
 
+    /// Reads a `Strict-Transport-Security` field value.
+    ///
+    /// Directive names are matched case-insensitively, and unrecognised ones
+    /// are ignored. Returns `None` when a directive repeats, when `max-age` is
+    /// missing, or when `max-age` is not a run of digits — a field that cannot
+    /// be trusted must not be acted on at all.
     pub fn parse(value: &str) -> Option<Self> {
         let mut policy = Self { max_age: -1, include_subdomains: false, preload: false };
         let mut seen = HashSet::new();
@@ -100,21 +129,38 @@ impl HstsPolicy {
     }
 }
 
+/// A client-side record of which hosts insist on TLS.
+///
+/// The store is shared and internally locked, so a [`Client`] can consult the
+/// same store from every request. It holds at most
+/// [`Limits::max_hsts_entries`] hosts, evicting whichever expires soonest to
+/// make room.
+///
+/// [`Client`]: crate::api::client::Client
 pub struct HstsStore {
+    /// Host to expiry and whether the policy covers subdomains.
     pub entries: Mutex<HashMap<String, (Instant, bool)>>,
+    /// The ceilings the store keeps itself under.
     pub limits: Limits,
 }
 
 impl HstsStore {
+    /// An empty store with the default [`Limits`].
     pub fn new() -> Self {
         Self { entries: Mutex::new(HashMap::new()), limits: Limits::default() }
     }
 
+    /// The same store, bounded by `limits`.
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
         self
     }
 
+    /// The form of a host name the store keys on.
+    ///
+    /// Strips surrounding brackets and any trailing root dot, and lowercases
+    /// the rest. Returns `None` for an empty name and for an IP address, since
+    /// HSTS applies to host names only.
     pub fn normalize(host: &str) -> Option<String> {
         let host = host.trim().trim_matches(['[', ']']).trim_end_matches('.');
 
@@ -125,6 +171,12 @@ impl HstsStore {
         Some(host.to_ascii_lowercase())
     }
 
+    /// Takes in the `Strict-Transport-Security` field a response carried.
+    ///
+    /// Ignored outright unless the response arrived over a secure transport,
+    /// since otherwise the field could have been injected. A `max-age` of zero
+    /// or less withdraws the host instead of storing it. A field that does not
+    /// parse, and a host that is an IP address, are ignored.
     pub fn learn(&self, host: &str, header: &str, secure: bool, now: Instant) {
         if !secure {
             return;
@@ -161,6 +213,10 @@ impl HstsStore {
         entries.insert(name, (expiry, policy.include_subdomains));
     }
 
+    /// Whether `host` must be reached over TLS.
+    ///
+    /// True when the host itself is stored, or when a parent domain is stored
+    /// with `includeSubDomains`. Expired entries are dropped as they are found.
     pub fn secure(&self, host: &str, now: Instant) -> bool {
         let Some(name) = Self::normalize(host) else {
             return false;

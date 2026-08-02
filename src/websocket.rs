@@ -1,3 +1,20 @@
+//! The WebSocket protocol, over all three versions of HTTP.
+//!
+//! The handshake differs by version and the framing does not. Over HTTP/1.1 it
+//! is an `Upgrade`; over HTTP/2 and HTTP/3 it is an extended `CONNECT` naming
+//! `websocket` in `:protocol`. [`AnyConnection::accept_websocket`] and
+//! [`AnyConnection::open_websocket`] do whichever applies, and both hand back
+//! the same [`WebSocketConnection`].
+//!
+//! What the connection runs over differs too: HTTP/1.1 gives up its transport
+//! outright, HTTP/2 turns the whole connection into a tunnel over one stream,
+//! and HTTP/3 tunnels one stream and leaves the rest of the connection
+//! running.
+//!
+//! Framing is enforced in both directions: clients must mask and servers must
+//! not, control frames must be short and unfragmented, text must be valid
+//! UTF-8, and close codes must be ones that may appear on the wire.
+
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -5,24 +22,40 @@ use crate::helpers::{base64, sha1};
 use crate::models::{ConnectionID, Headers, Limits, Message, Method, Role, Version};
 use crate::protocol::common::{self, AnyConnection, Buffer, Connection, Error, Transport};
 
+/// The fixed string a server hashes with the client's nonce to prove it read
+/// the handshake.
 pub const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+/// The protocol version this implements, as `Sec-WebSocket-Version` carries it.
 pub const VERSION: &str = "13";
 
+/// The protocol name, in `Upgrade` and in `:protocol`.
 pub const PROTOCOL: &str = "websocket";
 
+/// The largest payload a control frame may carry.
 pub const MAXIMUM_CONTROL_PAYLOAD: usize = 125;
 
+/// What a frame is.
+///
+/// Control opcodes have the high bit of their code set, which is what
+/// [`Opcode::control`] tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Opcode {
+    /// More of the message the previous frame began.
     Continuation,
+    /// A message that must be valid UTF-8.
     Text,
+    /// A message of arbitrary octets.
     Binary,
+    /// Begin the closing handshake.
     Close,
+    /// A liveness probe, to be answered with [`Opcode::Pong`].
     Ping,
+    /// An answer to a [`Opcode::Ping`], or an unsolicited keepalive.
     Pong,
 }
 
 impl Opcode {
+    /// The opcode as it appears in a frame header.
     pub fn code(&self) -> u8 {
         match self {
             Self::Continuation => 0x0,
@@ -34,6 +67,7 @@ impl Opcode {
         }
     }
 
+    /// The opcode a code names, or `None` when it is reserved.
     pub fn from_code(code: u8) -> Option<Self> {
         match code {
             0x0 => Some(Self::Continuation),
@@ -46,25 +80,38 @@ impl Opcode {
         }
     }
 
+    /// Whether this is a control frame, which may interleave with a message
+    /// but must be short and unfragmented.
     pub fn control(&self) -> bool {
         self.code() & 0x8 != 0
     }
 }
 
+/// Why a connection is being closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseCode {
+    /// 1000: the exchange finished.
     Normal,
+    /// 1001: this end is going away.
     GoingAway,
+    /// 1002: the peer broke the protocol.
     ProtocolError,
+    /// 1003: the peer sent data of a kind this end cannot accept.
     UnsupportedData,
+    /// 1007: a message did not match its type, such as text that is not UTF-8.
     InvalidPayload,
+    /// 1008: a message broke a policy this end enforces.
     PolicyViolation,
+    /// 1009: a message was too large to process.
     MessageTooBig,
+    /// 1010: the server did not agree to a required extension.
     MandatoryExtension,
+    /// 1011: something failed on this end.
     InternalError,
 }
 
 impl CloseCode {
+    /// The numeric code as it appears in a close payload.
     pub fn code(&self) -> u16 {
         match self {
             Self::Normal => 1000,
@@ -79,6 +126,7 @@ impl CloseCode {
         }
     }
 
+    /// The close code a number names, or `None` when it is not one of these.
     pub fn from_code(code: u16) -> Option<Self> {
         match code {
             1000 => Some(Self::Normal),
@@ -94,24 +142,44 @@ impl CloseCode {
         }
     }
 
+    /// Whether a close code may appear on the wire.
+    ///
+    /// The defined codes, plus 3000–4999, which are left to applications and
+    /// registered use. Codes such as 1005 and 1006 stand for "no code was
+    /// sent" and must never be sent as one.
     pub fn permitted(code: u16) -> bool {
         Self::from_code(code).is_some() || (3000..5000).contains(&code)
     }
 }
 
+/// One WebSocket frame.
+///
+/// The payload is always unmasked here; masking is applied on the way out and
+/// undone on the way in, so nothing above the framing layer sees it.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Frame {
+    /// Whether this frame ends its message.
     pub fin: bool,
+    /// What the frame is.
     pub opcode: Opcode,
+    /// The masking key, which a client must set and a server must not.
     pub mask: Option<[u8; 4]>,
+    /// The payload, unmasked.
     pub payload: Vec<u8>,
 }
 
 impl Frame {
+    /// A complete, unmasked frame.
+    ///
+    /// The mask is filled in by [`WebSocketConnection::send`] according to the
+    /// role, so it need not be set here.
     pub fn new(opcode: Opcode, payload: impl Into<Vec<u8>>) -> Self {
         Self { fin: true, opcode, mask: None, payload: payload.into() }
     }
 
+    /// Applies a masking key in place, which also removes one.
+    ///
+    /// The key is applied a word at a time, with a byte loop for the tail.
     pub fn apply_mask(mask: [u8; 4], payload: &mut [u8]) {
         let [a, b, c, d] = mask;
         let key = u64::from_ne_bytes([a, b, c, d, a, b, c, d]);
@@ -127,12 +195,14 @@ impl Frame {
         }
     }
 
+    /// The whole frame as its own buffer.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.payload.len() + 14);
         self.encode_into(&mut out);
         out
     }
 
+    /// Appends the whole frame, masking the payload if a key is set.
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         let length = self.payload.len();
 
@@ -163,6 +233,17 @@ impl Frame {
         }
     }
 
+    /// Reads one frame, returning how many octets it took.
+    ///
+    /// `None` when the frame has not fully arrived; the caller should read
+    /// more and try again. The payload comes back unmasked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when a reserved bit is set with no
+    /// extension negotiated, when the opcode is reserved, when the length has
+    /// its high bit set, or when a control frame is fragmented or longer than
+    /// [`MAXIMUM_CONTROL_PAYLOAD`].
     pub fn decode(data: &[u8]) -> Result<Option<(usize, Self)>, Error> {
         if data.len() < 2 {
             return Ok(None);
@@ -236,27 +317,48 @@ impl Frame {
     }
 }
 
+/// Reads `N` octets at `offset`, or `None` when they are not all there.
 pub fn octets<const N: usize>(data: &[u8], offset: usize) -> Option<[u8; N]> {
     let end = offset.checked_add(N)?;
     data.get(offset..end).and_then(|slice| <[u8; N]>::try_from(slice).ok())
 }
 
+/// The `Sec-WebSocket-Accept` value for a client's `Sec-WebSocket-Key`.
+///
+/// The base64 of the SHA-1 of the key concatenated with [`GUID`]. This is not
+/// a security mechanism — it only shows the peer read the request and is
+/// speaking WebSocket rather than something that stumbled onto the port.
 pub fn accept_key(key: &str) -> String {
     base64::encode(&sha1::sha1(format!("{key}{GUID}").as_bytes()))
 }
 
+/// A fresh `Sec-WebSocket-Key`: sixteen random octets, base64 encoded.
+///
+/// # Errors
+///
+/// Returns [`Error::Tls`] when no randomness is available.
 pub fn nonce() -> Result<String, Error> {
     let mut key = [0u8; 16];
     common::random(&mut key)?;
     Ok(base64::encode(&key))
 }
 
+/// A fresh masking key.
+///
+/// It has to be unpredictable: masking exists so that a client cannot be
+/// tricked into putting attacker-chosen octets on the wire verbatim, which a
+/// guessable key would undo.
+///
+/// # Errors
+///
+/// Returns [`Error::Tls`] when no randomness is available.
 pub fn masking_key() -> Result<[u8; 4], Error> {
     let mut key = [0u8; 4];
     common::random(&mut key)?;
     Ok(key)
 }
 
+/// The HTTP/1.1 upgrade request that opens a WebSocket.
 pub fn handshake_request(host: &str, target: &str, key: &str) -> Message {
     let mut headers = Headers::new();
     headers.append("host", host);
@@ -270,6 +372,7 @@ pub fn handshake_request(host: &str, target: &str, key: &str) -> Message {
     request
 }
 
+/// The `101 Switching Protocols` that accepts an HTTP/1.1 upgrade.
 pub fn handshake_response(key: &str) -> Message {
     let mut headers = Headers::new();
     headers.append("upgrade", PROTOCOL);
@@ -281,6 +384,13 @@ pub fn handshake_response(key: &str) -> Message {
     response
 }
 
+/// Checks an HTTP/1.1 upgrade request and returns its `Sec-WebSocket-Key`.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] when the request has no fields, is not a `GET`,
+/// does not ask for a WebSocket upgrade, offers a version other than
+/// [`VERSION`], or carries a key that is not sixteen base64 encoded octets.
 pub fn verify_request(request: &Message) -> Result<String, Error> {
     let headers = request.headers.as_ref().ok_or_else(|| Error::Protocol("the request has no fields".into()))?;
 
@@ -307,6 +417,13 @@ pub fn verify_request(request: &Message) -> Result<String, Error> {
     Ok(key.to_owned())
 }
 
+/// Checks the server's answer to an HTTP/1.1 upgrade.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] when the response has no fields, is not `101`,
+/// does not confirm the upgrade, or carries a `Sec-WebSocket-Accept` that does
+/// not match the nonce that was sent.
 pub fn verify_response(response: &Message, key: &str) -> Result<(), Error> {
     let headers = response.headers.as_ref().ok_or_else(|| Error::Protocol("the response has no fields".into()))?;
 
@@ -325,6 +442,9 @@ pub fn verify_response(response: &Message, key: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Whether a field carries a token, across repeats and comma-separated lists.
+///
+/// Matching ignores case, as these tokens are case-insensitive.
 pub fn token_present(headers: &Headers, name: &str, token: &str) -> bool {
     headers
         .get_all(name)
@@ -332,6 +452,11 @@ pub fn token_present(headers: &Headers, name: &str, token: &str) -> bool {
         .any(|value| value.trim().eq_ignore_ascii_case(token))
 }
 
+/// The extended `CONNECT` that opens a WebSocket over HTTP/2 or HTTP/3.
+///
+/// There is no nonce and no accept key: the stream is already authenticated by
+/// the connection it runs on, so the HTTP/1.1 proof of understanding is not
+/// needed.
 pub fn connect_request(authority: &str, target: &str, version: Version) -> Message {
     let mut headers = Headers::new();
     headers.append("host", authority);
@@ -344,12 +469,23 @@ pub fn connect_request(authority: &str, target: &str, version: Version) -> Messa
     request
 }
 
+/// The `200 OK` that accepts an extended `CONNECT`.
+///
+/// The caller must set [`Message::stream_id`] to the request's before sending.
+///
+/// [`Message::stream_id`]: crate::models::Message::stream_id
 pub fn connect_response(version: Version) -> Message {
     let mut response = Message::response(200, version);
     response.headers = Some(Headers::new());
     response
 }
 
+/// Checks an extended `CONNECT` request.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] when the request has no fields, is not a
+/// `CONNECT`, or does not name [`PROTOCOL`] in `:protocol`.
 pub fn verify_connect_request(request: &Message) -> Result<(), Error> {
     let headers = request.headers.as_ref().ok_or_else(|| Error::Protocol("the request has no fields".into()))?;
 
@@ -364,6 +500,11 @@ pub fn verify_connect_request(request: &Message) -> Result<(), Error> {
     Ok(())
 }
 
+/// Checks the server's answer to an extended `CONNECT`.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] for any status outside 2xx.
 pub fn verify_connect_response(response: &Message) -> Result<(), Error> {
     match response.status_code {
         Some(200..=299) => Ok(()),
@@ -371,6 +512,10 @@ pub fn verify_connect_response(response: &Message) -> Result<(), Error> {
     }
 }
 
+/// Whether a request is asking for a WebSocket, whichever version it arrived on.
+///
+/// A cheap test meant for routing; it does not check that the handshake is
+/// well formed. Use [`verify_upgrade`] before accepting one.
 pub fn upgrade_requested(request: &Message) -> bool {
     let Some(headers) = request.headers.as_ref() else {
         return false;
@@ -386,6 +531,11 @@ pub fn upgrade_requested(request: &Message) -> bool {
     }
 }
 
+/// Checks a WebSocket handshake, whichever version it arrived on.
+///
+/// # Errors
+///
+/// As [`verify_request`] for HTTP/1.x, and [`verify_connect_request`] above it.
 pub fn verify_upgrade(request: &Message) -> Result<(), Error> {
     match request.version.major() {
         1 => verify_request(request).map(|_| ()),
@@ -395,6 +545,22 @@ pub fn verify_upgrade(request: &Message) -> Result<(), Error> {
 
 
 impl AnyConnection {
+    /// Accepts a WebSocket handshake and takes the connection over.
+    ///
+    /// What the socket ends up running over depends on the version: HTTP/1.1
+    /// gives up its transport along with anything already buffered, HTTP/2
+    /// turns the whole connection into a tunnel over the request's stream, and
+    /// HTTP/3 tunnels that one stream while the connection keeps running.
+    ///
+    /// The connection is consumed either way, so a caller that wants to keep
+    /// serving other HTTP/3 streams should tunnel the stream itself rather
+    /// than going through here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when the handshake does not check out or
+    /// the request names no stream, and otherwise as
+    /// [`Connection::send`].
     pub async fn accept_websocket(self, request: &Message) -> Result<WebSocketConnection<Box<dyn Transport>>, Error> {
         let id = self.id();
 
@@ -435,6 +601,17 @@ impl AnyConnection {
         }
     }
 
+    /// Opens a WebSocket and takes the connection over.
+    ///
+    /// The client-side counterpart of [`AnyConnection::accept_websocket`], and
+    /// it takes the connection over in the same way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when the server's answer does not check out
+    /// or names no stream, [`Error::Tls`] when no randomness is available for
+    /// the nonce, and otherwise as [`Connection::send`] and
+    /// [`Connection::receive`].
     pub async fn open_websocket(self, authority: &str, target: &str) -> Result<WebSocketConnection<Box<dyn Transport>>, Error> {
         let id = self.id();
 
@@ -477,6 +654,15 @@ impl AnyConnection {
     }
 }
 
+/// A WebSocket connection.
+///
+/// Generic over its transport, because the three HTTP versions leave it
+/// running over three different things — a bare transport, an HTTP/2 tunnel,
+/// or an HTTP/3 stream — and the protocol above them is the same.
+///
+/// Work in messages with [`WebSocketConnection::receive_message`], which
+/// reassembles fragments and answers pings on its own, or in frames with
+/// [`WebSocketConnection::receive`] where that control is wanted.
 pub struct WebSocketConnection<T> {
     transport: T,
     role: Role,
@@ -493,10 +679,15 @@ impl<T> WebSocketConnection<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    /// A connection over a transport nothing has been read from yet.
     pub fn new(transport: T, role: Role, id: ConnectionID, limits: Limits) -> Self {
         Self::resume(transport, role, id, limits, Buffer::new())
     }
 
+    /// A connection over a transport that has already been read from.
+    ///
+    /// This is what an HTTP/1.1 upgrade needs: whatever the peer sent
+    /// immediately after the handshake is already buffered.
     pub fn resume(transport: T, role: Role, id: ConnectionID, limits: Limits, buffer: Buffer) -> Self {
         Self {
             transport,
@@ -511,22 +702,35 @@ where
         }
     }
 
+    /// Which end of the connection this is, which decides masking.
     pub fn role(&self) -> Role {
         self.role
     }
 
+    /// The identifier of the connection this came from.
     pub fn id(&self) -> ConnectionID {
         self.id.clone()
     }
 
+    /// The limits this connection holds itself to.
     pub fn limits(&self) -> &Limits {
         &self.limits
     }
 
+    /// Whether the closing handshake has begun.
     pub fn closing(&self) -> bool {
         self.closing
     }
 
+    /// Sends one frame.
+    ///
+    /// The mask is set from the role, whatever the frame carried: a client
+    /// always masks and a server never does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Tls`] when no randomness is available for the mask,
+    /// and [`Error::Io`] when the transport fails.
     pub async fn send(&mut self, mut frame: Frame) -> Result<(), Error> {
         frame.mask = if self.role.is_client() { Some(masking_key()?) } else { None };
 
@@ -542,6 +746,14 @@ where
         Ok(())
     }
 
+    /// Receives one frame, without reassembling or answering anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when the frame is malformed or masked the
+    /// wrong way round for the peer's role, [`Error::Limit`] when it grows
+    /// past [`Limits::max_message_size`], and [`Error::Closed`] when the
+    /// transport ends mid-frame.
     pub async fn receive(&mut self) -> Result<Frame, Error> {
         loop {
             if let Some((consumed, frame)) = Frame::decode(self.buffer.as_slice())? {
@@ -567,10 +779,31 @@ where
         }
     }
 
+    /// Sends a whole message as one unfragmented frame.
+    ///
+    /// # Errors
+    ///
+    /// As [`WebSocketConnection::send`].
     pub async fn send_message(&mut self, opcode: Opcode, payload: impl Into<Vec<u8>>) -> Result<(), Error> {
         self.send(Frame::new(opcode, payload)).await
     }
 
+    /// Receives one whole message, reassembling fragments.
+    ///
+    /// Control frames are dealt with along the way: a ping is answered with a
+    /// pong, and a close is echoed back and then returned as
+    /// `(Opcode::Close, payload)` so the caller knows the connection is
+    /// finishing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when fragmentation is misused — a new
+    /// message beginning inside one, or a continuation beginning one — or when
+    /// a text message is not valid UTF-8, in which case the connection is
+    /// closed with [`CloseCode::InvalidPayload`] first. Returns
+    /// [`Error::Limit`] when the message goes past
+    /// [`Limits::max_message_size`] or spans more than
+    /// [`Limits::ws_max_fragments`] frames.
     pub async fn receive_message(&mut self) -> Result<(Opcode, Bytes), Error> {
         loop {
             let frame = self.receive().await?;
@@ -649,6 +882,15 @@ where
         }
     }
 
+    /// Checks a close frame's payload.
+    ///
+    /// An empty payload is allowed and means no code was given.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when the payload is a single octet, carries
+    /// a code that may not appear on the wire, or has a reason that is not
+    /// valid UTF-8.
     pub fn verify_close(&self, payload: &[u8]) -> Result<(), Error> {
         if payload.is_empty() {
             return Ok(());
@@ -670,6 +912,16 @@ where
         Ok(())
     }
 
+    /// Closes the connection, running the closing handshake.
+    ///
+    /// Sends a close frame and then waits, for up to
+    /// [`Limits::ws_linger_timeout`], for the peer to echo one back, so both
+    /// ends agree the exchange ended rather than the transport simply
+    /// vanishing. The reason is truncated to fit
+    /// [`MAXIMUM_CONTROL_PAYLOAD`].
+    ///
+    /// The transport is shut down either way, and failures are swallowed:
+    /// there is nothing left to report them to.
     pub async fn close(&mut self, code: CloseCode, reason: &str) {
         if !self.closing {
             self.closing = true;

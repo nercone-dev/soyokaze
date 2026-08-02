@@ -1,3 +1,16 @@
+//! The vocabulary every HTTP version shares.
+//!
+//! [`Connection`] is the trait the whole crate is written against: send a
+//! [`Message`], receive one, close. [`H1Connection`], [`H2Connection`] and
+//! [`H3Connection`] all implement it, and [`AnyConnection`] is the one of them
+//! that was actually negotiated, so a caller that never names a version works
+//! unchanged over all three.
+//!
+//! The conversion between a [`Message`] and a field list lives here too, in
+//! [`fields`] and [`message_from`]. HTTP/2 and HTTP/3 both carry the start
+//! line as pseudo-headers, and both must enforce the same rules about them, so
+//! doing it once keeps the two from drifting apart.
+
 use std::future::Future;
 use std::task::Poll;
 use std::time::Duration;
@@ -12,14 +25,34 @@ use crate::protocol::{h1::H1Connection, h2::H2Connection, h3::H3Connection};
 
 pub use crate::errors::Error;
 
+/// Fills `out` with cryptographically secure random octets.
+///
+/// # Errors
+///
+/// Returns [`Error::Tls`] when BoringSSL cannot reach a source of randomness.
 pub fn random(out: &mut [u8]) -> Result<(), Error> {
     boring::rand::rand_bytes(out).map_err(|_| Error::Tls("BoringSSL has no source of randomness".into()))
 }
 
+/// A timeout in seconds as a [`Duration`], or `None` when it means "wait forever".
+///
+/// Zero, negative and non-finite values all disable the timeout, which is what
+/// the [`Limits`] fields are documented to do.
+///
+/// [`Limits`]: crate::models::Limits
 pub fn duration(seconds: f64) -> Option<Duration> {
     (seconds.is_finite() && seconds > 0.0).then(|| Duration::from_secs_f64(seconds))
 }
 
+/// Runs an operation under a deadline.
+///
+/// A `seconds` that [`duration`] rejects means no deadline at all, and the
+/// operation is simply awaited. The operation is polled once before the timer
+/// is armed, so work that is already finished never pays for one.
+///
+/// # Errors
+///
+/// Returns [`Error::Timeout`] when the deadline passes first.
 pub async fn within<T>(seconds: f64, operation: impl Future<Output = T>) -> Result<T, Error> {
     let Some(wait) = duration(seconds) else {
         return Ok(operation.await);
@@ -36,6 +69,10 @@ pub async fn within<T>(seconds: f64, operation: impl Future<Output = T>) -> Resu
         .map_err(|_| Error::Timeout(format!("nothing arrived within {seconds}s")))
 }
 
+/// A multiplicative hasher for stream identifiers.
+///
+/// Stream keys are small integers handed out in sequence, where a general
+/// purpose hash costs more than the lookup it protects.
 #[derive(Default)]
 pub struct StreamHasher(u64);
 
@@ -60,14 +97,24 @@ impl std::hash::Hasher for StreamHasher {
     }
 }
 
+/// A map keyed by stream, hashed with [`StreamHasher`].
 pub type StreamMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<StreamHasher>>;
 
+/// The buffer size above which an idle connection gives memory back.
 pub const IDLE_CAPACITY: usize = 64 * 1024;
 
+/// Whether a buffer has grown past [`IDLE_CAPACITY`] and since emptied out
+/// enough to be worth rebuilding.
+///
+/// One large message would otherwise leave every idle connection holding a
+/// buffer sized for it, which across many connections is the difference
+/// between idling at a few kilobytes and idling at megabytes.
 pub fn oversized(capacity: usize, len: usize) -> bool {
     capacity > IDLE_CAPACITY && len <= IDLE_CAPACITY / 2
 }
 
+/// Gives back the memory an outsized buffer is holding, if there is enough to
+/// be worth it.
 pub fn reclaim(buffer: &mut BytesMut) {
     if oversized(buffer.capacity(), buffer.len()) {
         let mut fresh = BytesMut::new();
@@ -76,12 +123,24 @@ pub fn reclaim(buffer: &mut BytesMut) {
     }
 }
 
+/// [`reclaim`] for a plain octet buffer.
 pub fn reclaim_octets(buffer: &mut Vec<u8>) {
     if oversized(buffer.capacity(), buffer.len()) {
         buffer.shrink_to(IDLE_CAPACITY / 2);
     }
 }
 
+/// The read buffer sitting between a transport and a parser.
+///
+/// Holds whatever has arrived but not yet been consumed, which is what lets a
+/// parser ask for a line or a frame without caring how the octets were
+/// delivered. The read size starts at [`Buffer::FIRST_CHUNK`] and doubles up
+/// to [`Buffer::CHUNK_SIZE`] as long as reads keep coming back full, so a
+/// small request costs a small read while a large body ramps up.
+///
+/// It survives a protocol switch: an HTTP/1.1 connection that upgrades to
+/// WebSocket, or a plaintext connection sniffed for the HTTP/2 preface, hands
+/// its buffer to whatever takes over so the octets already read are not lost.
 pub struct Buffer {
     data: BytesMut,
     chunk: usize,
@@ -89,45 +148,67 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    /// The largest single read.
     pub const CHUNK_SIZE: usize = 16 * 1024;
+    /// The first read, before the size has ramped up.
     pub const FIRST_CHUNK: usize = 2 * 1024;
 
+    /// An empty buffer over a transport nothing has been read from yet.
     pub fn new() -> Self {
         Self { data: BytesMut::new(), chunk: Self::FIRST_CHUNK, eof: false }
     }
 
+    /// How many octets are buffered but not yet consumed.
     pub fn len(&self) -> usize {
         self.data.len()
     }
 
+    /// Whether nothing is buffered right now.
+    ///
+    /// This says nothing about whether more will arrive; see [`Buffer::eof`].
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
 
+    /// Whether the transport has reported end of file.
     pub fn eof(&self) -> bool {
         self.eof
     }
 
+    /// The buffered octets.
     pub fn as_slice(&self) -> &[u8] {
         &self.data
     }
 
+    /// Drops the first `count` octets, or all of them if fewer are buffered.
     pub fn consume(&mut self, count: usize) {
         self.data.advance(count.min(self.data.len()));
     }
 
+    /// How much the buffer has allocated.
     pub fn capacity(&self) -> usize {
         self.data.capacity()
     }
 
+    /// Gives back memory the buffer no longer needs; see [`reclaim`].
     pub fn reclaim(&mut self) {
         reclaim(&mut self.data);
     }
 
+    /// Splits the first `count` octets off, or all of them if fewer are buffered.
     pub fn take(&mut self, count: usize) -> BytesMut {
         self.data.split_to(count.min(self.data.len()))
     }
 
+    /// Reads once from the transport.
+    ///
+    /// Returns `false` at end of file, after which further calls return
+    /// `false` without touching the transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Timeout`] when nothing arrives in time, and
+    /// [`Error::Io`] when the transport fails.
     pub async fn fill<T>(&mut self, transport: &mut T, timeout: f64) -> Result<bool, Error>
     where
         T: AsyncRead + Unpin,
@@ -151,6 +232,15 @@ impl Buffer {
         Ok(true)
     }
 
+    /// Reads until at least `count` octets are buffered, and returns them.
+    ///
+    /// The octets stay buffered; consume them with [`Buffer::consume`] or
+    /// [`Buffer::take`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`] when the transport ends before `count` octets
+    /// arrive, and otherwise as [`Buffer::fill`].
     pub async fn require<T>(&mut self, transport: &mut T, count: usize, timeout: f64) -> Result<&[u8], Error>
     where
         T: AsyncRead + Unpin,
@@ -164,6 +254,18 @@ impl Buffer {
         Ok(&self.data[..count])
     }
 
+    /// Reads until a CRLF-terminated line is buffered, and returns its length
+    /// without the terminator.
+    ///
+    /// The line is left in the buffer, so the caller can parse it in place and
+    /// then consume its length plus two. Use [`Buffer::line`] to have it
+    /// consumed and copied out instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] for a bare LF, [`Error::Limit`] when the
+    /// line runs past `max`, [`Error::Closed`] when the transport ends first,
+    /// and otherwise as [`Buffer::fill`].
     pub async fn line_end<T>(&mut self, transport: &mut T, max: usize, timeout: f64) -> Result<usize, Error>
     where
         T: AsyncRead + Unpin,
@@ -195,6 +297,13 @@ impl Buffer {
         }
     }
 
+    /// [`Buffer::line_end`], consuming the line and returning it as a `String`.
+    ///
+    /// Octets that are not valid UTF-8 are replaced rather than rejected.
+    ///
+    /// # Errors
+    ///
+    /// As [`Buffer::line_end`].
     pub async fn line<T>(&mut self, transport: &mut T, max: usize, timeout: f64) -> Result<String, Error>
     where
         T: AsyncRead + Unpin,
@@ -235,22 +344,40 @@ impl Default for Buffer {
     }
 }
 
+/// The pseudo-headers a request may carry.
 pub const PSEUDO_REQUEST: &[&str] = &[":method", ":scheme", ":authority", ":path", ":protocol"];
+/// The pseudo-headers a response may carry.
 pub const PSEUDO_RESPONSE: &[&str] = &[":status"];
 
+/// Fields that describe the HTTP/1.x connection rather than the message.
+///
+/// These have no meaning above HTTP/1.1 and must not be framed there, since a
+/// peer that honoured them could be talked into changing how the connection
+/// itself is read.
 pub const CONNECTION_SPECIFIC: &[&str] = &["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"];
 
+/// Whether a field name is one of [`CONNECTION_SPECIFIC`].
 pub fn is_connection_specific(name: &str) -> bool {
     matches!(name.len(), 7 | 10 | 16 | 17) && CONNECTION_SPECIFIC.contains(&name)
 }
 
+/// Seen-bit for `:method`, so a repeat can be caught.
 pub const PSEUDO_METHOD: u8 = 1 << 0;
+/// Seen-bit for `:status`.
 pub const PSEUDO_STATUS: u8 = 1 << 1;
+/// Seen-bit for `:scheme`.
 pub const PSEUDO_SCHEME: u8 = 1 << 2;
+/// Seen-bit for `:path`.
 pub const PSEUDO_PATH: u8 = 1 << 3;
+/// Seen-bit for `:authority`.
 pub const PSEUDO_AUTHORITY: u8 = 1 << 4;
+/// Seen-bit for `:protocol`, which extended CONNECT carries.
 pub const PSEUDO_PROTOCOL: u8 = 1 << 5;
 
+/// A status code as the three digits `:status` carries.
+///
+/// Codes outside three digits fall back to a plain decimal rendering; the
+/// message will be rejected elsewhere, but formatting it must not panic.
 pub fn status_text(status_code: u16) -> Text {
     if !(100..1000).contains(&status_code) {
         return Text::from_string(status_code.to_string());
@@ -265,6 +392,19 @@ pub fn status_text(status_code: u16) -> Text {
     Text::from_verified_ascii(&digits)
 }
 
+/// Turns a [`Message`] into the field list HTTP/2 and HTTP/3 frame.
+///
+/// The start line becomes pseudo-headers, which lead the list as the format
+/// requires. `Host` is dropped in favour of `:authority`, since the two say
+/// the same thing and sending both invites disagreement. A `CONNECT` without
+/// `:protocol` carries its authority as `:authority` and nothing else, because
+/// it names a tunnel rather than a resource.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] when the message is neither a request nor a
+/// response, or when it carries a [`CONNECTION_SPECIFIC`] field, which has no
+/// meaning above HTTP/1.1.
 pub fn fields(message: &Message) -> Result<Vec<HeaderField>, Error> {
     let mut fields = Vec::with_capacity(PSEUDO_REQUEST.len() + message.headers.as_ref().map_or(0, Headers::len));
 
@@ -313,10 +453,29 @@ pub fn fields(message: &Message) -> Result<Vec<HeaderField>, Error> {
     Ok(fields)
 }
 
+/// [`message_from`] over a borrowed field list.
+///
+/// # Errors
+///
+/// As [`message_from`].
 pub fn message(fields: &[HeaderField], version: Version) -> Result<Message, Error> {
     message_from(fields.to_vec(), version)
 }
 
+/// Turns a decoded field list back into a [`Message`], enforcing the rules
+/// HTTP/2 and HTTP/3 share.
+///
+/// `:authority` is written back out as `Host`, so a handler sees one
+/// authority field whatever version delivered it.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] when the field list breaks any of the rules
+/// both versions impose: an uppercase field name; a [`CONNECTION_SPECIFIC`]
+/// field; a `TE` asking for anything but trailers; a pseudo-header after a
+/// regular field, repeated, undefined, or belonging to the other kind of
+/// message; neither `:method` nor `:status`; a request without both a scheme
+/// and a non-empty path; or a `CONNECT` carrying more than an authority.
 pub fn message_from(fields: Vec<HeaderField>, version: Version) -> Result<Message, Error> {
     let mut message = Message::new(version);
     let mut headers = Headers::with_capacity(fields.len() + 1);
@@ -438,37 +597,91 @@ pub fn message_from(fields: Vec<HeaderField>, version: Version) -> Result<Messag
     Ok(message)
 }
 
+/// What every HTTP connection can do, whichever version it speaks.
+///
+/// Write against this rather than a version-specific connection wherever
+/// there is a choice: the three implementations are meant to be drop-in
+/// replacements for one another, and code that names one of them directly
+/// gives that up.
+///
+/// On a server, a response must carry the [`Message::stream_id`] of the
+/// request it answers, or HTTP/2 and HTTP/3 will not be able to match the two.
 #[allow(async_fn_in_trait)]
 pub trait Connection {
+    /// The version being spoken.
     fn version(&self) -> Version;
+    /// Which end of the connection this is.
     fn role(&self) -> Role;
+    /// The connection's identifier.
     fn id(&self) -> ConnectionID;
 
+    /// Whether another message may be exchanged over this connection.
+    ///
+    /// Only HTTP/1.x can answer no, when the peer asked to close or the
+    /// connection is being wound down.
     fn reusable(&self) -> bool {
         true
     }
 
+    /// Sends a message.
+    ///
+    /// # Errors
+    ///
+    /// Any [`Error`]; [`Error::Timeout`] once [`Limits::send_timeout`] passes.
+    ///
+    /// [`Limits::send_timeout`]: crate::models::Limits::send_timeout
     async fn send(&mut self, message: Message) -> Result<(), Error>;
+    /// Receives the next message.
+    ///
+    /// # Errors
+    ///
+    /// Any [`Error`]; [`Error::Closed`] when the peer is done, and
+    /// [`Error::Timeout`] once [`Limits::receive_timeout`] passes.
+    ///
+    /// [`Limits::receive_timeout`]: crate::models::Limits::receive_timeout
     async fn receive(&mut self) -> Result<Message, Error>;
 
+    /// Shuts the connection down, telling the peer where that is possible.
+    ///
+    /// Failures are swallowed: there is nothing left to report them to.
     async fn close(&mut self);
 }
 
+/// What every stream within a multiplexed connection can do.
 #[allow(async_fn_in_trait)]
 pub trait Stream {
+    /// The stream's identifier.
     fn id(&self) -> StreamID;
 
+    /// Abandons the stream with a protocol error code.
     async fn reset(&mut self, code: u64);
 }
 
+/// Anything a connection can be carried over.
+///
+/// Blanket-implemented, so a TCP stream, a Unix socket, a TLS stream and an
+/// in-memory duplex all qualify without saying so.
 pub trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
 
+/// A connection of whichever version was negotiated.
+///
+/// This is what [`Client::connect`] and a server's accept loop hand back, and
+/// it implements [`Connection`] by forwarding, so a caller need never open it
+/// up. Match on it only where the version genuinely changes what to do — as
+/// [`AnyConnection::accept_websocket`] does, since the WebSocket handshake
+/// really is three different exchanges.
+///
+/// [`Client::connect`]: crate::api::client::Client::connect
+/// [`AnyConnection::accept_websocket`]: crate::websocket
 #[allow(clippy::large_enum_variant)]
 pub enum AnyConnection {
+    /// An HTTP/1.0 or HTTP/1.1 connection.
     H1(H1Connection<Box<dyn Transport>>),
+    /// An HTTP/2 connection.
     H2(H2Connection<Box<dyn Transport>>),
+    /// An HTTP/3 connection.
     H3(H3Connection),
 }
 

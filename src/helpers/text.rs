@@ -1,24 +1,61 @@
+//! [`Text`], the string type field names and values are held in.
+//!
+//! A field section is mostly short strings — `host`, `accept`, `gzip`, a
+//! status code — and allocating each one costs more than the message itself.
+//! [`Text`] keeps anything up to [`INLINE`] octets in the value and only
+//! reaches for the heap beyond that.
+//!
+//! [`Text`] is immutable apart from [`Text::make_ascii_lowercase`], which is
+//! what field names need, and compares and hashes as the string it holds, so
+//! it can stand in for `&str` in a map.
+
 use std::borrow::Borrow;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 
+/// The longest string held without allocating.
+///
+/// Chosen so that [`Text`] fits in the same space as a `Box<str>` plus its
+/// discriminant and length, which covers all but the longest field values.
 pub const INLINE: usize = 30;
 
+/// Where a [`Text`] keeps its octets.
 #[derive(Clone)]
 pub enum Repr {
-    Inline { len: u8, octets: [u8; INLINE] },
+    /// Held in the value itself, `len` octets of `octets` being live.
+    Inline {
+        /// How many leading octets are live; never above [`INLINE`].
+        len: u8,
+        /// The octets, of which only the first `len` are meaningful.
+        octets: [u8; INLINE],
+    },
+    /// Held on the heap, for anything longer than [`INLINE`].
     Heap(Box<str>),
 }
 
+/// A short immutable string that stays off the heap.
+///
+/// Everything a [`Text`] can be built from is valid UTF-8 by construction —
+/// except the `verified` constructors, which trust the caller. It derefs to
+/// `str`, so the usual string methods are available on it directly.
 #[derive(Clone)]
 pub struct Text(Repr);
 
 impl Text {
+    /// The empty string.
     pub const fn new() -> Self {
         Self(Repr::Inline { len: 0, octets: [0; INLINE] })
     }
 
+    /// Copies up to [`INLINE`] octets of `source` into a fresh inline buffer.
+    ///
+    /// The copy is done as a pair of overlapping fixed-width copies rather
+    /// than a length-driven loop. Octets past `source.len()` are left zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `source` is longer than [`INLINE`].
     #[inline]
     pub fn copy_inline(source: &[u8]) -> [u8; INLINE] {
         let mut octets = [0u8; INLINE];
@@ -43,6 +80,7 @@ impl Text {
         octets
     }
 
+    /// Copies a string slice, staying inline when it is short enough.
     #[allow(clippy::should_implement_trait)]
     #[inline]
     pub fn from_str(text: &str) -> Self {
@@ -54,6 +92,8 @@ impl Text {
         }
     }
 
+    /// Takes ownership of a `String`, reusing its allocation when it is long
+    /// enough to need one.
     #[inline]
     pub fn from_string(text: String) -> Self {
         match text.len() <= INLINE {
@@ -62,6 +102,10 @@ impl Text {
         }
     }
 
+    /// Lowercases ASCII octets while copying them in.
+    ///
+    /// Input that is not ASCII goes through lossy UTF-8 decoding first, so
+    /// this never fails.
     #[inline]
     pub fn from_ascii_lowercase(octets: &[u8]) -> Self {
         if !octets.is_ascii() {
@@ -79,6 +123,11 @@ impl Text {
         Self(Repr::Heap(String::from_utf8_lossy(&text).into_owned().into_boxed_str()))
     }
 
+    /// Copies octets that are expected to be ASCII, checking that they are.
+    ///
+    /// Input that is not ASCII goes through lossy UTF-8 decoding, so this
+    /// never fails. Use [`Text::from_verified_ascii`] only where the check has
+    /// already been done.
     #[inline]
     pub fn from_ascii(octets: &[u8]) -> Self {
         match octets.is_ascii() {
@@ -93,6 +142,20 @@ impl Text {
         }
     }
 
+    /// Copies octets already known to be ASCII, skipping the check.
+    ///
+    /// This is the constructor the parsers use after
+    /// [`scan::classify_field_value`] has already established that a field
+    /// value carries no octet at or above `0x80`, so paying for a second pass
+    /// would be waste.
+    ///
+    /// The caller must have established that `octets` is ASCII. Passing
+    /// anything else produces a [`Text`] that is not valid UTF-8, and reading
+    /// it back through [`Text::as_str`] is undefined behaviour. Debug builds
+    /// assert; release builds do not check. Use [`Text::from_ascii`] wherever
+    /// the input has not already been classified.
+    ///
+    /// [`scan::classify_field_value`]: crate::helpers::scan::classify_field_value
     #[inline]
     pub fn from_verified_ascii(octets: &[u8]) -> Self {
         debug_assert!(octets.is_ascii(), "{:?} is not ASCII", String::from_utf8_lossy(octets));
@@ -104,6 +167,13 @@ impl Text {
         Self(Repr::Heap(unsafe { std::str::from_utf8_unchecked(octets) }.into()))
     }
 
+    /// [`Text::from_verified_ascii`], lowercasing as it copies.
+    ///
+    /// This is what field names go through, since a name is a token and so is
+    /// ASCII by the time it has been parsed.
+    ///
+    /// The same precondition applies: the caller must have established that
+    /// `octets` is ASCII, and passing anything else is undefined behaviour.
     #[inline]
     pub fn from_verified_ascii_lowercase(octets: &[u8]) -> Self {
         debug_assert!(octets.is_ascii(), "{:?} is not ASCII", String::from_utf8_lossy(octets));
@@ -119,6 +189,10 @@ impl Text {
         Self(Repr::Heap(unsafe { String::from_utf8_unchecked(text) }.into_boxed_str()))
     }
 
+    /// Copies octets, replacing anything that is not valid UTF-8.
+    ///
+    /// This is the constructor to reach for when nothing is known about the
+    /// input; it never fails.
     #[inline]
     pub fn from_utf8_lossy(octets: &[u8]) -> Self {
         match std::str::from_utf8(octets) {
@@ -127,6 +201,7 @@ impl Text {
         }
     }
 
+    /// The string held, wherever it lives.
     #[inline]
     pub fn as_str(&self) -> &str {
         match &self.0 {
@@ -135,6 +210,7 @@ impl Text {
         }
     }
 
+    /// The octets of the string held.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         match &self.0 {
@@ -143,6 +219,7 @@ impl Text {
         }
     }
 
+    /// The length in octets, not characters.
     #[inline]
     pub fn len(&self) -> usize {
         match &self.0 {
@@ -151,15 +228,18 @@ impl Text {
         }
     }
 
+    /// Whether the string is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Whether the octets are held in the value rather than on the heap.
     pub fn is_inline(&self) -> bool {
         matches!(self.0, Repr::Inline { .. })
     }
 
+    /// Lowercases the ASCII letters in place, leaving everything else alone.
     pub fn make_ascii_lowercase(&mut self) {
         match &mut self.0 {
             Repr::Inline { len, octets } => octets[..*len as usize].make_ascii_lowercase(),
@@ -167,6 +247,8 @@ impl Text {
         }
     }
 
+    /// Consumes the text and returns a `String`, reusing the heap allocation
+    /// when there is one.
     pub fn into_string(self) -> String {
         match self.0 {
             Repr::Inline { .. } => self.as_str().to_owned(),
@@ -174,6 +256,7 @@ impl Text {
         }
     }
 
+    /// Consumes the text and returns its octets.
     pub fn into_bytes(self) -> Vec<u8> {
         self.into_string().into_bytes()
     }

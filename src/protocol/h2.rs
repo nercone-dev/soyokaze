@@ -1,3 +1,22 @@
+//! HTTP/2.
+//!
+//! Many concurrent streams over one connection, framed as fixed nine-octet
+//! headers followed by payloads. Field sections are compressed with
+//! [`hpack`], which is what makes a field block that will not decode fatal to
+//! the whole connection rather than to one stream.
+//!
+//! Flow control is credit-based and applies at two levels at once, the
+//! connection and each stream, so a send is bounded by whichever of the two
+//! windows is smaller. Both are tracked as `i64` rather than `u32` because a
+//! `SETTINGS_INITIAL_WINDOW_SIZE` that shrinks mid-connection can leave a
+//! window legitimately negative.
+//!
+//! Several counters here exist only to blunt floods that cost the server far
+//! more than the peer: [`Limits::max_premature_resets`] against rapid reset,
+//! and [`Limits::max_idle_frames`] against frames that never advance a stream.
+//!
+//! [`hpack`]: crate::helpers::hpack
+
 use std::collections::VecDeque;
 
 use bytes::{Bytes, BytesMut};
@@ -7,62 +26,112 @@ use crate::helpers::hpack::{Decoder as HPACKDecoder, Encoder as HPACKEncoder, He
 use crate::models::{Body, ConnectionID, Headers, Limits, Message, Method, Role, StreamID, Version};
 use crate::protocol::common::{self, Buffer, Connection, Error};
 
+/// The octets a client sends before anything else, to prove it means HTTP/2.
 pub const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+/// The fixed size of a frame header.
 pub const FRAME_HEADER_SIZE: usize = 9;
 
+/// The buffered output size at which a body write flushes rather than growing.
 pub const OUTPUT_HIGH_WATER: usize = 64 * 1024;
 
+/// `SETTINGS_HEADER_TABLE_SIZE`: the peer's HPACK dynamic table ceiling.
 pub const SETTINGS_HEADER_TABLE_SIZE: u16 = 0x1;
+/// `SETTINGS_ENABLE_PUSH`: whether server push is allowed.
 pub const SETTINGS_ENABLE_PUSH: u16 = 0x2;
+/// `SETTINGS_MAX_CONCURRENT_STREAMS`: how many streams may be open at once.
 pub const SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 0x3;
+/// `SETTINGS_INITIAL_WINDOW_SIZE`: the flow control window a new stream starts at.
 pub const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 0x4;
+/// `SETTINGS_MAX_FRAME_SIZE`: the largest frame payload the peer will accept.
 pub const SETTINGS_MAX_FRAME_SIZE: u16 = 0x5;
+/// `SETTINGS_MAX_HEADER_LIST_SIZE`: the largest decoded field section.
 pub const SETTINGS_MAX_HEADER_LIST_SIZE: u16 = 0x6;
+/// `SETTINGS_ENABLE_CONNECT_PROTOCOL`: whether extended CONNECT is allowed.
+///
+/// This is what WebSocket over HTTP/2 is carried by.
 pub const SETTINGS_ENABLE_CONNECT_PROTOCOL: u16 = 0x8;
 
+/// The flow control window both ends assume before any setting says otherwise.
 pub const DEFAULT_INITIAL_WINDOW_SIZE: u32 = 65_535;
+/// The frame size both ends assume, and the smallest that may be negotiated.
 pub const DEFAULT_MAX_FRAME_SIZE: u32 = 16_384;
+/// The largest frame size that may be negotiated.
 pub const MAXIMUM_FRAME_SIZE: u32 = 16_777_215;
+/// The largest a flow control window may reach, and the stream identifier mask.
 pub const MAXIMUM_WINDOW_SIZE: u32 = 0x7fff_ffff;
+/// The largest HPACK encoder table this end will keep, whatever the peer allows.
 pub const MAXIMUM_ENCODER_TABLE_SIZE: usize = 64 * 1024;
 
+/// `NO_ERROR`: the connection or stream ended cleanly.
 pub const NO_ERROR: u32 = 0x0;
+/// `PROTOCOL_ERROR`: the peer broke the protocol.
 pub const PROTOCOL_ERROR: u32 = 0x1;
+/// `INTERNAL_ERROR`: something failed on this end.
 pub const INTERNAL_ERROR: u32 = 0x2;
+/// `FLOW_CONTROL_ERROR`: the peer sent past its window, or overflowed one.
 pub const FLOW_CONTROL_ERROR: u32 = 0x3;
+/// `SETTINGS_TIMEOUT`: settings went unacknowledged too long.
 pub const SETTINGS_TIMEOUT: u32 = 0x4;
+/// `STREAM_CLOSED`: a frame arrived for a stream that had finished.
 pub const STREAM_CLOSED: u32 = 0x5;
+/// `FRAME_SIZE_ERROR`: a frame's length is wrong for its type.
 pub const FRAME_SIZE_ERROR: u32 = 0x6;
+/// `REFUSED_STREAM`: the stream was declined before any processing.
 pub const REFUSED_STREAM: u32 = 0x7;
+/// `CANCEL`: the stream is no longer wanted.
 pub const CANCEL: u32 = 0x8;
+/// `COMPRESSION_ERROR`: the HPACK state cannot be maintained.
 pub const COMPRESSION_ERROR: u32 = 0x9;
+/// `CONNECT_ERROR`: a tunnel failed.
 pub const CONNECT_ERROR: u32 = 0xa;
+/// `ENHANCE_YOUR_CALM`: the peer is generating excessive load.
 pub const ENHANCE_YOUR_CALM: u32 = 0xb;
+/// `INADEQUATE_SECURITY`: the transport does not meet the requirements.
 pub const INADEQUATE_SECURITY: u32 = 0xc;
+/// `HTTP_1_1_REQUIRED`: the peer should retry over HTTP/1.1.
 pub const HTTP_1_1_REQUIRED: u32 = 0xd;
 
+/// Frame flag: this is the last frame this end will send on the stream.
 pub const END_STREAM: u8 = 0x1;
+/// Frame flag: this SETTINGS or PING acknowledges the peer's.
+///
+/// The same bit as [`END_STREAM`], on frame types where that has no meaning.
 pub const ACK: u8 = 0x1;
+/// Frame flag: the field section ends here, with no CONTINUATION to follow.
 pub const END_HEADERS: u8 = 0x4;
+/// Frame flag: the payload begins with a padding length and ends with padding.
 pub const PADDED: u8 = 0x8;
+/// Frame flag: a HEADERS frame carries priority information before its block.
 pub const PRIORITY: u8 = 0x20;
 
+/// The kind of an HTTP/2 frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameType {
+    /// `DATA`: message body octets.
     Data,
+    /// `HEADERS`: a compressed field section.
     Headers,
+    /// `PRIORITY`: a priority hint, which this implementation reads and ignores.
     Priority,
+    /// `RST_STREAM`: abandon one stream.
     RstStream,
+    /// `SETTINGS`: connection parameters, or their acknowledgement.
     Settings,
+    /// `PUSH_PROMISE`: a promised stream; refused here, since push is disabled.
     PushPromise,
+    /// `PING`: a liveness probe, or its acknowledgement.
     Ping,
+    /// `GOAWAY`: no further streams will be accepted.
     GoAway,
+    /// `WINDOW_UPDATE`: more flow control credit.
     WindowUpdate,
+    /// `CONTINUATION`: more of the field section a HEADERS frame began.
     Continuation,
 }
 
 impl FrameType {
+    /// The type code that goes on the wire.
     pub fn code(&self) -> u8 {
         match self {
             Self::Data => 0x0,
@@ -78,6 +147,10 @@ impl FrameType {
         }
     }
 
+    /// The frame type a code names, or `None` for an unknown type.
+    ///
+    /// Unknown types are skipped rather than rejected, so that extensions do
+    /// not break the connection.
     pub fn from_code(code: u8) -> Option<Self> {
         match code {
             0x0 => Some(Self::Data),
@@ -94,6 +167,10 @@ impl FrameType {
         }
     }
 
+    /// Whether this type belongs on a stream or on the connection.
+    ///
+    /// `Some(true)` must be on a stream, `Some(false)` must be on stream zero,
+    /// and `None` is `WINDOW_UPDATE`, which is valid either way.
     pub fn streamed(&self) -> Option<bool> {
         match self {
             Self::Data | Self::Headers | Self::Priority | Self::RstStream | Self::PushPromise
@@ -104,15 +181,21 @@ impl FrameType {
     }
 }
 
+/// The fixed nine-octet header every frame begins with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
+    /// The payload length; only its low 24 bits go on the wire.
     pub length: u32,
+    /// The frame type.
     pub kind: FrameType,
+    /// The type-specific flags.
     pub flags: u8,
+    /// The stream, or zero for the connection.
     pub stream_id: StreamID,
 }
 
 impl FrameHeader {
+    /// Encodes the header.
     pub fn encode(&self) -> [u8; FRAME_HEADER_SIZE] {
         let length = self.length.to_be_bytes();
         let stream_id = (self.stream_id.0 as u32 & MAXIMUM_WINDOW_SIZE).to_be_bytes();
@@ -130,6 +213,11 @@ impl FrameHeader {
         ]
     }
 
+    /// Decodes a header.
+    ///
+    /// Returns the payload length, and the header itself unless the type is
+    /// unknown. The length comes back either way, since an unknown frame still
+    /// has to be read past rather than fail the connection.
     pub fn decode(octets: &[u8; FRAME_HEADER_SIZE]) -> (u32, Option<Self>) {
         let length = u32::from_be_bytes([0, octets[0], octets[1], octets[2]]);
         let stream_id = u32::from_be_bytes([octets[5], octets[6], octets[7], octets[8]]) & MAXIMUM_WINDOW_SIZE;
@@ -145,21 +233,102 @@ impl FrameHeader {
     }
 }
 
+/// One decoded HTTP/2 frame.
+///
+/// Padding has already been stripped by the time a frame reaches this form,
+/// since it carries no meaning above the framing layer.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Frame {
-    Data { stream_id: StreamID, end_stream: bool, data: Bytes },
-    Headers { stream_id: StreamID, end_stream: bool, end_headers: bool, block: Vec<u8> },
-    Priority { stream_id: StreamID, dependency: StreamID, exclusive: bool, weight: u8 },
-    RstStream { stream_id: StreamID, error_code: u32 },
-    Settings { ack: bool, params: Vec<(u16, u32)> },
-    PushPromise { stream_id: StreamID, promised_stream_id: StreamID, block: Vec<u8> },
-    Ping { ack: bool, payload: [u8; 8] },
-    GoAway { last_stream_id: StreamID, error_code: u32, debug_data: Vec<u8> },
-    WindowUpdate { stream_id: StreamID, increment: u32 },
-    Continuation { stream_id: StreamID, end_headers: bool, block: Vec<u8> },
+    /// Message body octets.
+    Data {
+        /// The stream carrying the body.
+        stream_id: StreamID,
+        /// Whether the body ends here.
+        end_stream: bool,
+        /// The octets.
+        data: Bytes,
+    },
+    /// A compressed field section, possibly continued by [`Frame::Continuation`].
+    Headers {
+        /// The stream.
+        stream_id: StreamID,
+        /// Whether the message ends here.
+        end_stream: bool,
+        /// Whether the field section is complete.
+        end_headers: bool,
+        /// The compressed field block, priority information already stripped.
+        block: Vec<u8>,
+    },
+    /// A priority hint, which this implementation reads and ignores.
+    Priority {
+        /// The stream being prioritised.
+        stream_id: StreamID,
+        /// The stream it is said to depend on.
+        dependency: StreamID,
+        /// Whether the dependency is exclusive.
+        exclusive: bool,
+        /// The relative weight.
+        weight: u8,
+    },
+    /// Abandon one stream.
+    RstStream {
+        /// The stream to abandon.
+        stream_id: StreamID,
+        /// Why.
+        error_code: u32,
+    },
+    /// Connection parameters, or their acknowledgement.
+    Settings {
+        /// Whether this acknowledges the peer's settings rather than setting any.
+        ack: bool,
+        /// The identifier and value of each parameter.
+        params: Vec<(u16, u32)>,
+    },
+    /// A promised stream. Refused here, since push is disabled.
+    PushPromise {
+        /// The stream the promise arrived on.
+        stream_id: StreamID,
+        /// The stream being promised.
+        promised_stream_id: StreamID,
+        /// The compressed field block of the promised request.
+        block: Vec<u8>,
+    },
+    /// A liveness probe, or its acknowledgement.
+    Ping {
+        /// Whether this answers the peer's probe rather than being one.
+        ack: bool,
+        /// The eight octets to be echoed back unchanged.
+        payload: [u8; 8],
+    },
+    /// No further streams will be accepted.
+    GoAway {
+        /// The last stream that may still be processed.
+        last_stream_id: StreamID,
+        /// Why the connection is ending.
+        error_code: u32,
+        /// Free-form diagnostic octets.
+        debug_data: Vec<u8>,
+    },
+    /// More flow control credit.
+    WindowUpdate {
+        /// The stream, or zero for the connection as a whole.
+        stream_id: StreamID,
+        /// How much credit is being added; never zero.
+        increment: u32,
+    },
+    /// More of the field section a [`Frame::Headers`] began.
+    Continuation {
+        /// The stream.
+        stream_id: StreamID,
+        /// Whether the field section is complete.
+        end_headers: bool,
+        /// The next part of the compressed field block.
+        block: Vec<u8>,
+    },
 }
 
 impl Frame {
+    /// The frame's type.
     pub fn kind(&self) -> FrameType {
         match self {
             Self::Data { .. } => FrameType::Data,
@@ -175,6 +344,7 @@ impl Frame {
         }
     }
 
+    /// The stream the frame belongs to, or zero for a connection-wide one.
     pub fn stream_id(&self) -> StreamID {
         match self {
             Self::Data { stream_id, .. }
@@ -188,6 +358,9 @@ impl Frame {
         }
     }
 
+    /// The flags this frame goes out with.
+    ///
+    /// Frames written here are never padded, so [`PADDED`] is never set.
     pub fn flags(&self) -> u8 {
         match self {
             Self::Data { end_stream, .. } => u8::from(*end_stream) * END_STREAM,
@@ -201,6 +374,7 @@ impl Frame {
         }
     }
 
+    /// Appends the payload, without the frame header.
     pub fn write_payload(&self, out: &mut BytesMut) {
         match self {
             Self::Data { data, .. } => out.extend_from_slice(data),
@@ -238,12 +412,17 @@ impl Frame {
         }
     }
 
+    /// The payload on its own.
     pub fn payload(&self) -> Vec<u8> {
         let mut out = BytesMut::new();
         self.write_payload(&mut out);
         out.to_vec()
     }
 
+    /// Appends the whole frame, header included.
+    ///
+    /// The header is reserved first and filled in once the payload length is
+    /// known, so the payload need not be sized in advance.
     pub fn encode_into(&self, out: &mut BytesMut) {
         let start = out.len();
         out.extend_from_slice(&[0u8; FRAME_HEADER_SIZE]);
@@ -254,20 +433,45 @@ impl Frame {
         out[start..start + FRAME_HEADER_SIZE].copy_from_slice(&header.encode());
     }
 
+    /// The whole frame as its own buffer.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = BytesMut::new();
         self.encode_into(&mut out);
         out.to_vec()
     }
 
+    /// Decodes a frame, copying its payload.
+    ///
+    /// # Errors
+    ///
+    /// As [`Frame::assemble`].
     pub fn decode(header: FrameHeader, payload: &[u8]) -> Result<Self, Error> {
         Self::assemble(header, payload, None)
     }
 
+    /// [`Frame::decode`] over a shared buffer, so a body is referenced rather
+    /// than copied.
+    ///
+    /// # Errors
+    ///
+    /// As [`Frame::assemble`].
     pub fn decode_shared(header: FrameHeader, payload: &Bytes) -> Result<Self, Error> {
         Self::assemble(header, payload.as_ref(), Some(payload))
     }
 
+    /// Decodes a frame, referencing `shared` where one is given.
+    ///
+    /// Padding is stripped here, and a frame on the wrong kind of stream is
+    /// rejected before its payload is looked at.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when the payload does not match its
+    /// declared length, when the frame is on a stream its type does not
+    /// belong on, when padding runs past the payload, when a fixed-size
+    /// frame is the wrong size, when a SETTINGS acknowledgement carries a
+    /// payload or its length is not a multiple of six, or when a
+    /// `WINDOW_UPDATE` increment is zero.
     pub fn assemble(header: FrameHeader, payload: &[u8], shared: Option<&Bytes>) -> Result<Self, Error> {
         if payload.len() != header.length as usize {
             return Err(Error::Protocol("frame payload does not match its declared length".into()));
@@ -407,6 +611,10 @@ impl Frame {
     }
 }
 
+/// Appends a frame straight from its parts, without building a [`Frame`].
+///
+/// This is the path body and field block writes take, where the payload is
+/// already sitting in a buffer and a [`Frame`] would only copy it.
 pub fn write_frame_into(out: &mut BytesMut, kind: FrameType, flags: u8, stream_id: StreamID, payload: &[u8]) {
     let header = FrameHeader { length: payload.len() as u32, kind, flags, stream_id };
 
@@ -415,23 +623,43 @@ pub fn write_frame_into(out: &mut BytesMut, kind: FrameType, flags: u8, stream_i
     out.extend_from_slice(payload);
 }
 
+/// Reads a payload that must be exactly `N` octets.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] when the payload is any other length.
 pub fn exact<const N: usize>(payload: &[u8], name: &str) -> Result<[u8; N], Error> {
     <[u8; N]>::try_from(payload)
         .map_err(|_| Error::Protocol(format!("{name} length is {} rather than {N}", payload.len())))
 }
 
+/// The parameters one end of a connection has announced.
+///
+/// Each connection keeps two: what this end advertised, and what the peer did.
+/// The defaults are what both ends must assume before any SETTINGS arrives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settings {
+    /// The HPACK dynamic table ceiling.
     pub header_table_size: u32,
+    /// Whether server push is allowed. Always advertised off here.
     pub enable_push: bool,
+    /// How many streams may be open at once; `None` leaves it unbounded.
     pub max_concurrent_streams: Option<u32>,
+    /// The flow control window a new stream starts at.
     pub initial_window_size: u32,
+    /// The largest frame payload that will be accepted.
     pub max_frame_size: u32,
+    /// The largest decoded field section; `None` leaves it unbounded.
     pub max_header_list_size: Option<u32>,
+    /// Whether extended CONNECT, and so WebSocket, is allowed.
     pub enable_connect_protocol: bool,
 }
 
 impl Settings {
+    /// The parameters as they go on the wire.
+    ///
+    /// The two optional ones are omitted when unset rather than sent as a
+    /// sentinel, since absent and unbounded are the same thing.
     pub fn parameters(&self) -> Vec<(u16, u32)> {
         let mut params = vec![
             (SETTINGS_HEADER_TABLE_SIZE, self.header_table_size),
@@ -452,6 +680,18 @@ impl Settings {
         params
     }
 
+    /// Applies one parameter.
+    ///
+    /// Returns how much [`SETTINGS_INITIAL_WINDOW_SIZE`] moved, which every
+    /// open stream's send window must be adjusted by; zero for every other
+    /// parameter. Unknown identifiers are ignored, so extensions do not break
+    /// the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when a flag is neither zero nor one, when
+    /// the window size is above [`MAXIMUM_WINDOW_SIZE`], or when the frame
+    /// size is outside [`DEFAULT_MAX_FRAME_SIZE`]..=[`MAXIMUM_FRAME_SIZE`].
     pub fn apply(&mut self, id: u16, value: u32) -> Result<i64, Error> {
         match id {
             SETTINGS_HEADER_TABLE_SIZE => self.header_table_size = value,
@@ -512,26 +752,41 @@ impl Default for Settings {
     }
 }
 
+/// Where a stream is in its lifetime.
+///
+/// A stream is half-closed once one side has finished, and closed once both
+/// have. The two reserved states belong to server push, which is disabled
+/// here, so they are never entered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamState {
+    /// Nothing has been sent on it yet.
     Idle,
+    /// Reserved by a push this end promised.
     ReservedLocal,
+    /// Reserved by a push the peer promised.
     ReservedRemote,
+    /// Both ends may still send.
     Open,
+    /// This end has finished sending.
     HalfClosedLocal,
+    /// The peer has finished sending.
     HalfClosedRemote,
+    /// Both ends have finished.
     Closed,
 }
 
 impl StreamState {
+    /// Whether the peer may still send on this stream.
     pub fn receivable(&self) -> bool {
         matches!(self, Self::Idle | Self::Open | Self::HalfClosedLocal)
     }
 
+    /// Whether this end may still send on this stream.
     pub fn sendable(&self) -> bool {
         matches!(self, Self::Idle | Self::Open | Self::HalfClosedRemote)
     }
 
+    /// The state after this end finishes sending.
     pub fn close_local(&self) -> Self {
         match self {
             Self::Open | Self::Idle => Self::HalfClosedLocal,
@@ -539,6 +794,7 @@ impl StreamState {
         }
     }
 
+    /// The state after the peer finishes sending.
     pub fn close_remote(&self) -> Self {
         match self {
             Self::Open | Self::Idle => Self::HalfClosedRemote,
@@ -547,6 +803,11 @@ impl StreamState {
     }
 }
 
+/// One stream within an HTTP/2 connection.
+///
+/// Holds the message being assembled and the two flow control windows, which
+/// are signed because a shrinking `SETTINGS_INITIAL_WINDOW_SIZE` can push the
+/// send window legitimately below zero.
 pub struct H2Stream {
     id: StreamID,
     state: StreamState,
@@ -564,6 +825,7 @@ pub struct H2Stream {
 }
 
 impl H2Stream {
+    /// An idle stream with the given starting windows.
     pub fn new(id: StreamID, window_local: i64, window_remote: i64) -> Self {
         Self {
             id,
@@ -579,18 +841,24 @@ impl H2Stream {
         }
     }
 
+    /// Where the stream is in its lifetime.
     pub fn state(&self) -> StreamState {
         self.state
     }
 
+    /// How many octets of message have arrived, compressed head and body alike.
+    ///
+    /// This is what [`Limits::max_message_size`] is checked against.
     pub fn received(&self) -> u64 {
         self.head + self.body.len() as u64
     }
 
+    /// The credit the peer has left to send on this stream.
     pub fn window_local(&self) -> i64 {
         self.window_local
     }
 
+    /// The credit this end has left to send on this stream.
     pub fn window_remote(&self) -> i64 {
         self.window_remote
     }
@@ -607,6 +875,15 @@ impl common::Stream for H2Stream {
     }
 }
 
+/// An HTTP/2 connection.
+///
+/// Many streams multiplexed over one transport. Frames are queued into an
+/// output buffer and flushed together, so a message that spans several frames
+/// costs one write rather than one per frame.
+///
+/// [`Connection::receive`] drives the whole connection, not just the stream a
+/// caller is waiting on: it answers PING and SETTINGS, tracks flow control,
+/// and hands back messages as they complete, whichever stream they arrived on.
 pub struct H2Connection<T> {
     transport: T,
     role: Role,
@@ -642,10 +919,18 @@ impl<T> H2Connection<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    /// A connection over a transport nothing has been read from yet.
+    ///
+    /// The preface and the opening SETTINGS are not sent until the first
+    /// [`H2Connection::start`], which every send and receive does for itself.
     pub fn new(transport: T, role: Role, id: ConnectionID, limits: Limits) -> Self {
         Self::resume(transport, role, id, limits, Buffer::new())
     }
 
+    /// A connection over a transport that has already been read from.
+    ///
+    /// This is what preface sniffing on a plaintext port needs: the octets
+    /// read to recognise HTTP/2 are handed over rather than lost.
     pub fn resume(transport: T, role: Role, id: ConnectionID, limits: Limits, buffer: Buffer) -> Self {
         let settings_local = Settings { max_concurrent_streams: Some(limits.max_concurrent_streams), ..Settings::default() };
 
@@ -676,42 +961,67 @@ where
         }
     }
 
+    /// Attaches an HSTS policy to be added to the responses this connection sends.
     pub fn with_hsts(mut self, hsts: Option<crate::helpers::hsts::HstsPolicy>) -> Self {
         self.hsts = hsts;
         self
     }
 
+    /// The limits this connection holds itself to.
     pub fn limits(&self) -> &Limits {
         &self.limits
     }
 
+    /// The settings this end advertised.
     pub fn settings_local(&self) -> &Settings {
         &self.settings_local
     }
 
+    /// The settings the peer advertised.
     pub fn settings_remote(&self) -> &Settings {
         &self.settings_remote
     }
 
+    /// The HPACK encoder for this direction.
     pub fn hpack_encoder(&self) -> &HPACKEncoder {
         &self.hpack_encoder
     }
 
+    /// How many streams this end may open at once.
+    ///
+    /// The peer's advertised ceiling where it gave one, and
+    /// [`Limits::max_concurrent_streams`] otherwise. Never zero, so that a
+    /// peer advertising none cannot deadlock the connection.
     pub fn local_stream_ceiling(&self) -> usize {
         let advertised = self.settings_remote.max_concurrent_streams.unwrap_or(self.limits.max_concurrent_streams);
         (advertised as usize).max(1)
     }
 
+    /// One open stream, if it is still open.
     pub fn stream(&self, stream_id: StreamID) -> Option<&H2Stream> {
         self.streams.get(&stream_id)
     }
 
+    /// One open stream, mutably.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when the stream is no longer open.
     pub fn open_stream(&mut self, stream_id: StreamID) -> Result<&mut H2Stream, Error> {
         self.streams
             .get_mut(&stream_id)
             .ok_or_else(|| Error::Protocol(format!("stream {} is no longer open", stream_id.0)))
     }
 
+    /// Exchanges the preface and sends the opening SETTINGS, once.
+    ///
+    /// Every send and receive calls this for itself, so it rarely needs
+    /// calling directly. Repeat calls do nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when a server's peer does not begin with
+    /// [`PREFACE`], and otherwise as [`Buffer::require`].
     pub async fn start(&mut self) -> Result<(), Error> {
         if self.started {
             return Ok(());
@@ -736,10 +1046,20 @@ where
         self.flush_out().await
     }
 
+    /// Adds a frame to the output buffer, without writing anything yet.
     pub fn queue(&mut self, frame: &Frame) {
         frame.encode_into(&mut self.out);
     }
 
+    /// Writes and flushes everything queued.
+    ///
+    /// The buffer is kept and reused, and given back with [`common::reclaim`]
+    /// once it has grown past what an idle connection should hold.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Timeout`] past [`Limits::write_timeout`], and
+    /// [`Error::Io`] when the transport fails.
     pub async fn flush_out(&mut self) -> Result<(), Error> {
         if self.out.is_empty() {
             return Ok(());
@@ -765,11 +1085,25 @@ where
         }
     }
 
+    /// Queues one frame and flushes.
+    ///
+    /// # Errors
+    ///
+    /// As [`H2Connection::flush_out`].
     pub async fn write(&mut self, frame: &Frame) -> Result<(), Error> {
         self.queue(frame);
         self.flush_out().await
     }
 
+    /// Drives the connection until a message completes.
+    ///
+    /// Messages that completed while an earlier send was blocked on flow
+    /// control are handed back first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`] once the peer has sent GOAWAY and no stream
+    /// is left, and otherwise as [`H2Connection::pump`].
     pub async fn receive_message(&mut self) -> Result<Message, Error> {
         loop {
             if let Some(message) = self.ready.pop_front() {
@@ -786,6 +1120,22 @@ where
         }
     }
 
+    /// Sends one whole message on a stream.
+    ///
+    /// A message with no [`Message::stream_id`] opens a new stream; one with a
+    /// stream identifier uses that stream, which is how a server answers the
+    /// request it was asked. The stream is left open for a tunnel or an
+    /// informational response, since more is to follow on it.
+    ///
+    /// Body writes block on flow control, and pump the connection while they
+    /// wait, so messages that complete meanwhile are held for the next
+    /// [`H2Connection::receive_message`] rather than dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Limit`] when opening a stream would go past
+    /// [`H2Connection::local_stream_ceiling`], and otherwise as
+    /// [`common::fields`] and [`H2Connection::flush_out`].
     pub async fn send_message(&mut self, message: Message) -> Result<(), Error> {
         let mut message = message;
         if self.role.is_server() && message.is_response() {
@@ -877,11 +1227,20 @@ where
         Ok(())
     }
 
+    /// Abandons one stream and tells the peer why.
+    ///
+    /// # Errors
+    ///
+    /// As [`H2Connection::flush_out`]. The stream is forgotten either way.
     pub async fn reset(&mut self, stream_id: StreamID, error_code: u32) -> Result<(), Error> {
         self.streams.remove(&stream_id);
         self.write(&Frame::RstStream { stream_id, error_code }).await
     }
 
+    /// Sends GOAWAY with `ENHANCE_YOUR_CALM` and builds the matching error.
+    ///
+    /// Used where the peer is costing far more than it is spending. Failing to
+    /// send the GOAWAY is ignored: the connection is going down regardless.
     pub async fn overloaded(&mut self, reason: impl Into<String>) -> Error {
         let goaway = Frame::GoAway {
             last_stream_id: StreamID(self.highest_peer_stream_id),
@@ -893,6 +1252,16 @@ where
         Error::Limit(reason.into())
     }
 
+    /// Counts one frame that did not advance any stream.
+    ///
+    /// PING and SETTINGS floods cost a server work while costing the peer
+    /// almost nothing, so a run of frames that move nothing forward is capped.
+    /// The counter is reset by anything that does make progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Limit`] past [`Limits::max_idle_frames`], having first
+    /// told the peer with GOAWAY.
     pub async fn idle(&mut self) -> Result<(), Error> {
         self.idle_frames = self.idle_frames.saturating_add(1);
 
@@ -904,16 +1273,30 @@ where
         Ok(())
     }
 
+    /// How much unread body the connection is holding across all its streams.
+    ///
+    /// Checked against [`Limits::max_connection_buffer_size`], so that many
+    /// streams each within their own limit cannot add up without bound.
     pub fn buffered(&self) -> u64 {
         self.streams.values().map(|stream| stream.body.len() as u64).sum()
     }
 
+    /// Drops a stream if it has finished, so its state is not held forever.
     pub fn retire(&mut self, stream_id: StreamID) {
         if self.streams.get(&stream_id).is_some_and(|stream| stream.state == StreamState::Closed) {
             self.streams.remove(&stream_id);
         }
     }
 
+    /// Reads one frame.
+    ///
+    /// `None` for a frame of unknown type, which has been read past and
+    /// discarded rather than failing the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Limit`] when the frame is larger than this end
+    /// advertised, and otherwise as [`Buffer::require`] and [`Frame::assemble`].
     pub async fn read_frame(&mut self) -> Result<Option<Frame>, Error> {
         let head = self.buffer.require(&mut self.transport, FRAME_HEADER_SIZE, self.limits.read_timeout).await?;
         let octets = <[u8; FRAME_HEADER_SIZE]>::try_from(head).map_err(|_| Error::Closed)?;
@@ -933,6 +1316,11 @@ where
         }
     }
 
+    /// Reads and handles one frame, returning a message if that completed one.
+    ///
+    /// # Errors
+    ///
+    /// As [`H2Connection::read_frame`] and [`H2Connection::handle`].
     pub async fn pump(&mut self) -> Result<Option<Message>, Error> {
         self.start().await?;
         self.flush_resets().await?;
@@ -952,6 +1340,19 @@ where
         Ok(message)
     }
 
+    /// Acts on one frame, returning a message if that completed one.
+    ///
+    /// This is where the connection is actually run: settings applied, PINGs
+    /// answered, flow control credit tracked and replenished, and field blocks
+    /// and body octets gathered into messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] for a frame that breaks the protocol — a
+    /// PUSH_PROMISE with push disabled, a CONTINUATION outside a field block,
+    /// DATA on a stream that is not open, a window overflowed — and
+    /// [`Error::Limit`] when one of the [`Limits`] ceilings is passed. A
+    /// stream-level flow control failure resets that stream instead.
     pub async fn handle(&mut self, frame: Frame) -> Result<Option<Message>, Error> {
         match frame {
             Frame::Settings { ack: false, params } => {
@@ -1139,6 +1540,18 @@ where
         }
     }
 
+    /// Reads CONTINUATION frames until the field section is complete.
+    ///
+    /// Nothing else may arrive in between, so this reads the connection
+    /// directly rather than going back through the frame loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Limit`] when the block goes past
+    /// [`Limits::max_headers_size`] or spans more than
+    /// [`Limits::max_header_count`] frames — a CONTINUATION flood otherwise
+    /// costs unbounded memory — and [`Error::Protocol`] when any other frame
+    /// interrupts the block.
     pub async fn continue_headers(&mut self, stream_id: StreamID, end_stream: bool) -> Result<Option<Message>, Error> {
         let mut frames = 0u64;
 
@@ -1167,6 +1580,17 @@ where
         }
     }
 
+    /// Opens the stream a HEADERS frame names, if the peer may open it.
+    ///
+    /// Clients use odd identifiers and servers even ones, and each must be
+    /// higher than the last that end opened; a peer that reuses or goes
+    /// backwards is trying to reopen a stream that has been closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when the stream is not the peer's to open,
+    /// does not exceed the last it opened, or would go past
+    /// [`Settings::max_concurrent_streams`].
     pub fn begin_stream(&mut self, stream_id: StreamID) -> Result<(), Error> {
         let peer_odd = !self.role.is_client();
         if stream_id.0 == 0 || (stream_id.0 % 2 == 1) != peer_odd {
@@ -1196,6 +1620,18 @@ where
         Ok(())
     }
 
+    /// Decodes a complete field section and folds it into the stream's message.
+    ///
+    /// The first section on a stream becomes the message; a second becomes its
+    /// trailers. Informational responses are handed back as they are, since
+    /// the real response follows on the same stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Limit`] past [`Limits::max_message_size`] or
+    /// [`Limits::max_header_count`], [`Error::Protocol`] when a trailer
+    /// section carries a pseudo-header, and otherwise as the HPACK decoder and
+    /// [`common::message_from`].
     pub fn finish_headers(&mut self, stream_id: StreamID, end_stream: bool) -> Result<Option<Message>, Error> {
         self.idle_frames = 0;
 
@@ -1262,6 +1698,9 @@ where
         Ok(None)
     }
 
+    /// Takes the finished message off a stream, attaching whatever body arrived.
+    ///
+    /// `None` when the stream is gone or has no message waiting.
     pub fn complete(&mut self, stream_id: StreamID, end_stream: bool) -> Option<Message> {
         let stream = self.streams.get_mut(&stream_id)?;
         if end_stream {
@@ -1277,11 +1716,25 @@ where
         Some(message)
     }
 
+    /// Takes whatever body octets have arrived on a stream, without waiting for
+    /// the message to finish.
+    ///
+    /// This is what a tunnel reads through, where the octets are a byte stream
+    /// rather than a message.
     pub fn drain(&mut self, stream_id: StreamID) -> Option<Bytes> {
         let stream = self.streams.get_mut(&stream_id)?;
         (!stream.body.is_empty()).then(|| std::mem::take(&mut stream.body).freeze())
     }
 
+    /// Queues a RST_STREAM for every stream that [`common::Stream::reset`] marked.
+    ///
+    /// [`common::Stream::reset`] cannot write, so it records the intent and
+    /// this sends it the next time the connection is driven.
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible; the signature leaves room for a reset that has to
+    /// flush.
     pub async fn flush_resets(&mut self) -> Result<(), Error> {
         let pending: Vec<(StreamID, u64)> = self
             .streams
@@ -1297,6 +1750,14 @@ where
         Ok(())
     }
 
+    /// Queues a field section, split across CONTINUATION frames if it is large.
+    ///
+    /// Field sections are not flow controlled, so this never blocks.
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible; the signature matches
+    /// [`H2Connection::write_data`], which is not.
     pub async fn write_block(&mut self, stream_id: StreamID, block: &[u8], end_stream: bool) -> Result<(), Error> {
         let size = self.settings_remote.max_frame_size as usize;
         let mut chunks = block.chunks(size.max(1));
@@ -1316,6 +1777,17 @@ where
         Ok(())
     }
 
+    /// Sends body octets, respecting flow control.
+    ///
+    /// Bounded by whichever of the connection and stream windows is smaller,
+    /// and by the peer's maximum frame size. When credit runs out this pumps
+    /// the connection rather than parking, since it is the peer's
+    /// WINDOW_UPDATE that will unblock it; any message that completes while
+    /// waiting is held for the next [`H2Connection::receive_message`].
+    ///
+    /// # Errors
+    ///
+    /// As [`H2Connection::pump`] and [`H2Connection::flush_out`].
     pub async fn write_data(&mut self, stream_id: StreamID, data: &[u8], end_stream: bool) -> Result<(), Error> {
         let mut rest = data;
 
@@ -1356,6 +1828,11 @@ impl<T> H2Connection<T>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    /// Turns the connection into a byte stream over one of its streams.
+    ///
+    /// The connection is given over to a task that does nothing but relay
+    /// octets, which is what a `CONNECT` tunnel — and so WebSocket over
+    /// HTTP/2 — needs. Every other stream on the connection is given up.
     pub fn tunnel(self, stream_id: StreamID) -> H2Tunnel {
         let (application, internal) = tokio::io::duplex(Buffer::CHUNK_SIZE);
         let driver = tokio::spawn(async move { self.drive(stream_id, internal).await });
@@ -1363,6 +1840,12 @@ where
         H2Tunnel { stream: application, driver }
     }
 
+    /// Relays octets between one stream and an in-memory duplex, until either
+    /// end finishes.
+    ///
+    /// # Errors
+    ///
+    /// Any [`Error`] the connection raises while relaying.
     pub async fn drive(mut self, stream_id: StreamID, internal: tokio::io::DuplexStream) -> Result<(), Error> {
         let (mut reader, mut writer) = tokio::io::split(internal);
         let mut scratch = vec![0u8; Buffer::CHUNK_SIZE];
@@ -1404,16 +1887,23 @@ where
     }
 }
 
+/// One HTTP/2 stream as a plain byte stream.
+///
+/// Reads and writes as any transport does, so a protocol that expects one —
+/// WebSocket, say — can run over it unchanged. A background task relays octets
+/// between this and the connection.
 pub struct H2Tunnel {
     stream: tokio::io::DuplexStream,
     driver: tokio::task::JoinHandle<Result<(), Error>>,
 }
 
 impl H2Tunnel {
+    /// Stops the relay task without waiting for either end to finish.
     pub fn abort(&self) {
         self.driver.abort();
     }
 
+    /// Whether the relay task has stopped, for any reason.
     pub fn finished(&self) -> bool {
         self.driver.is_finished()
     }

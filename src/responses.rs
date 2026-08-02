@@ -1,8 +1,20 @@
+//! Constructors for the responses a handler reaches for most.
+//!
+//! Each one builds a [`Message`] with its `Content-Type` already set, so a
+//! handler can answer in a line. They extend [`Message`] itself rather than
+//! wrapping it, so the result is an ordinary response that can be adjusted
+//! further before it is sent.
+
 use crate::errors::Error;
 use crate::headers::SetCookie;
 use crate::helpers::text::Text;
 use crate::models::{Body, Headers, Message, Version};
 
+/// The media type a path's extension suggests.
+///
+/// The extension is matched case-insensitively, and anything unrecognised —
+/// including a path with no extension at all — becomes
+/// `application/octet-stream`.
 pub fn content_type(path: &str) -> &'static str {
     let extension = path.rsplit('/').next().unwrap_or(path).rsplit_once('.').map(|(_, extension)| extension);
 
@@ -40,6 +52,7 @@ pub fn content_type(path: &str) -> &'static str {
 }
 
 impl Message {
+    /// A `200 OK` carrying `body` under the given media type.
     pub fn content(content_type: impl Into<Text>, body: Body, version: Version) -> Self {
         let mut response = Self::response(200, version);
         response.headers.get_or_insert_with(Headers::new).insert("content-type", content_type);
@@ -47,38 +60,63 @@ impl Message {
         response
     }
 
+    /// A `200 OK` of `text/plain`.
     pub fn text(content: impl Into<String>, version: Version) -> Self {
         Self::content("text/plain", Body::Text(content.into()), version)
     }
 
+    /// A `200 OK` of `text/html`.
     pub fn html(content: impl Into<String>, version: Version) -> Self {
         Self::content("text/html", Body::Text(content.into()), version)
     }
 
+    /// A `200 OK` of `text/markdown`.
     pub fn markdown(content: impl Into<String>, version: Version) -> Self {
         Self::content("text/markdown", Body::Text(content.into()), version)
     }
 
+    /// A `200 OK` of `application/json`.
+    ///
+    /// The content is sent as given; nothing checks that it is valid JSON.
     pub fn json(content: impl Into<String>, version: Version) -> Self {
         Self::content("application/json", Body::Text(content.into()), version)
     }
 
+    /// A `200 OK` serving a file, typed by its extension.
+    ///
+    /// The file is not opened here — the body stays a [`Body::File`] until the
+    /// connection sends it, so a missing or unreadable file surfaces then.
     pub fn file(path: impl Into<String>, version: Version) -> Self {
         let path = path.into();
         Self::content(content_type(&path), Body::File(path), version)
     }
 
+    /// A `307 Temporary Redirect` to `target`, which preserves the method.
     pub fn redirect(target: impl Into<Text>, version: Version) -> Self {
         let mut response = Self::response(307, version);
         response.headers.get_or_insert_with(Headers::new).insert("location", target);
         response
     }
 
+    /// Adds a `Set-Cookie` field, keeping any already on the response.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`SetCookie::build`] rejects the cookie with.
     pub fn set_cookie(&mut self, cookie: &SetCookie) -> Result<(), Error> {
         self.headers.get_or_insert_with(Headers::new).append("set-cookie", cookie.build()?);
         Ok(())
     }
 
+    /// Adds a `Set-Cookie` field that deletes the cookie.
+    ///
+    /// The value is emptied and `Max-Age=0` replaces any lifetime, so the
+    /// client drops the cookie. The name, domain and path have to match those
+    /// the cookie was stored under for the deletion to reach it.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`SetCookie::build`] rejects the cookie with.
     pub fn delete_cookie(&mut self, cookie: SetCookie) -> Result<(), Error> {
         let mut cookie = cookie;
         cookie.value = String::new();

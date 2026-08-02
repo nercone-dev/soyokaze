@@ -1,12 +1,34 @@
+//! Word-at-a-time scanning over the octets of a message.
+//!
+//! Parsing HTTP/1.x means walking bytes looking for delimiters and rejecting
+//! forbidden octets, which is most of the work in a small request. The
+//! routines here do that eight octets at a time using the usual SWAR
+//! bit-twiddling, and fall back to a byte loop for the tail.
+//!
+//! Everything here works on raw octets and makes no assumption about encoding.
+
+/// How many octets one machine word holds.
 pub const LANES: usize = size_of::<u64>();
+/// The low bit of every lane.
 pub const LOW: u64 = 0x0101_0101_0101_0101;
+/// The high bit of every lane.
 pub const HIGH: u64 = 0x8080_8080_8080_8080;
 
+/// Marks the high bit of each lane of `word` that holds zero.
+///
+/// Non-zero exactly when some lane is zero, which is how a search for one
+/// octet is done: exclusive-or the word against a broadcast of the needle and
+/// ask whether any lane went to zero.
 #[inline]
 pub fn holds_zero(word: u64) -> u64 {
     word.wrapping_sub(LOW) & !word & HIGH
 }
 
+/// Reads the eight octets at `offset` as a little-endian word.
+///
+/// # Panics
+///
+/// Panics when fewer than [`LANES`] octets remain at `offset`.
 #[inline]
 pub fn word_at(haystack: &[u8], offset: usize) -> u64 {
     let mut octets = [0u8; LANES];
@@ -14,6 +36,7 @@ pub fn word_at(haystack: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(octets)
 }
 
+/// The offset of the first `needle` in `haystack`, if it is there.
 #[inline]
 pub fn find(haystack: &[u8], needle: u8) -> Option<usize> {
     let broadcast = LOW.wrapping_mul(needle as u64);
@@ -32,6 +55,16 @@ pub fn find(haystack: &[u8], needle: u8) -> Option<usize> {
     haystack[offset..].iter().position(|octet| *octet == needle).map(|index| offset + index)
 }
 
+/// Copies `source` to the front of `destination`.
+///
+/// Short copies — which is most of them, since field names and values usually
+/// are — are done as a pair of overlapping fixed-width copies rather than a
+/// length-driven loop.
+///
+/// # Panics
+///
+/// Debug builds assert that `destination` is long enough; release builds
+/// panic on the slice bounds instead.
 #[inline]
 pub fn copy(destination: &mut [u8], source: &[u8]) {
     let len = source.len();
@@ -59,9 +92,21 @@ pub fn copy(destination: &mut [u8], source: &[u8]) {
     }
 }
 
+/// [`classify_field_value`]: the value carries a control octet, and so is not
+/// a valid field value.
 pub const VALUE_CONTROL: u8 = 1 << 0;
+/// [`classify_field_value`]: the value carries an octet at or above `0x80`.
+///
+/// Such a value is legal but not ASCII, so it has to go through UTF-8
+/// validation rather than being taken as ASCII outright.
 pub const VALUE_OBS_TEXT: u8 = 1 << 1;
 
+/// Marks the high bit of each lane of `word` that holds less than `bound`.
+///
+/// # Panics
+///
+/// Debug builds assert `bound <= 0x80`; above that the subtraction borrows
+/// across lane boundaries and the answer is meaningless.
 #[inline]
 pub fn holds_less(word: u64, bound: u64) -> u64 {
     debug_assert!(bound <= 0x80, "a bound above 0x80 can borrow out of its byte");
@@ -70,11 +115,20 @@ pub fn holds_less(word: u64, bound: u64) -> u64 {
     !lowered & !word & HIGH
 }
 
+/// Marks the high bit of each lane of `word` that holds zero.
+///
+/// Unlike [`holds_zero`] this is exact rather than approximate, so it can be
+/// used where the marks themselves are combined with other masks.
 #[inline]
 pub fn marks_zero(word: u64) -> u64 {
     !((word & !HIGH).wrapping_add(!HIGH) | word) & HIGH
 }
 
+/// Classifies a field value in one pass.
+///
+/// Returns the or of [`VALUE_CONTROL`] and [`VALUE_OBS_TEXT`]. A horizontal
+/// tab is permitted and does not count as a control octet; every other octet
+/// below `0x20`, and `0x7f`, does.
 #[inline]
 pub fn classify_field_value(text: &[u8]) -> u8 {
     let mut control = 0u64;
@@ -103,6 +157,9 @@ pub fn classify_field_value(text: &[u8]) -> u8 {
     (control as u8) | (obs_text as u8) << 1
 }
 
+/// Whether `text` may be sent as a field value.
+///
+/// Octets at or above `0x80` are allowed; control octets other than tab are not.
 #[inline]
 pub fn is_field_value(text: &[u8]) -> bool {
     classify_field_value(text) & VALUE_CONTROL == 0
