@@ -19,7 +19,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
       - uses: dtolnay/rust-toolchain@stable
@@ -36,7 +36,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
@@ -57,7 +57,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
@@ -76,12 +76,21 @@ jobs:
           cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c -Ltarget/debug -lsoyokaze -o ffi-shared
           LD_LIBRARY_PATH=target/debug DYLD_LIBRARY_PATH=target/debug ./ffi-shared
       # The static library needs whatever the platform links Rust's own runtime
-      # and BoringSSL against, which rustc is the one that knows.
+      # and BoringSSL against, which rustc is the one that knows. It reports
+      # them as a diagnostic, so the colour the rest of the workflow asks for is
+      # turned off here: coloured, the note arrives wrapped in escape sequences
+      # and matches nothing.
       - name: Build and run the C test against the static library
         shell: bash
+        env:
+          CARGO_TERM_COLOR: never
         run: |
           libs=$(cargo rustc --lib --crate-type staticlib -- --print native-static-libs 2>&1 \
                  | sed -n 's/^note: native-static-libs: //p' | tail -n1)
+          if [ -z "$libs" ]; then
+            echo "::error::rustc reported no native static libs; the link would fail obscurely"
+            exit 1
+          fi
           echo "native static libs: $libs"
           cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c target/debug/libsoyokaze.a $libs -o ffi-static
           ./ffi-static
@@ -90,7 +99,7 @@ jobs:
     name: MSRV (1.88)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
       - uses: dtolnay/rust-toolchain@1.88
@@ -103,7 +112,7 @@ jobs:
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
       - uses: dtolnay/rust-toolchain@stable

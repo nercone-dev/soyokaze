@@ -20,7 +20,7 @@ jobs:
     name: Verify the release matches Cargo.toml
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.release.tag_name }}
       - name: Compare the tag with the package version
@@ -38,7 +38,7 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.release.tag_name }}
       - name: Install system dependencies
@@ -64,7 +64,7 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.release.tag_name }}
 
@@ -94,15 +94,25 @@ jobs:
       # check on the symbol table's alignment that has nothing to do with this
       # crate, and a release must not be blocked by it. The same check runs on
       # both platforms in test.yml, against the debug build.
+      # CARGO_TERM_COLOR is off for this step because rustc reports the native
+      # static libs as a diagnostic; coloured, the note arrives wrapped in
+      # escape sequences and the pattern below matches nothing.
       - name: Check the C header against what is about to ship
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          CARGO_TERM_COLOR: never
         run: |
           cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c -Ltarget/release -lsoyokaze -o ffi-shared
           LD_LIBRARY_PATH=target/release ./ffi-shared
 
           libs=$(cargo rustc --release --lib --crate-type staticlib -- --print native-static-libs 2>&1 \
                  | sed -n 's/^note: native-static-libs: //p' | tail -n1)
+          if [ -z "$libs" ]; then
+            echo "::error::rustc reported no native static libs; the link would fail obscurely"
+            exit 1
+          fi
+          echo "native static libs: $libs"
           cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c target/release/libsoyokaze.a $libs -o ffi-static
           ./ffi-static
 
@@ -159,7 +169,7 @@ jobs:
     needs: assets
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.release.tag_name }}
       - name: Install system dependencies
