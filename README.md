@@ -44,5 +44,5 @@ cargo +nightly fuzz run everything
 ```
 
 ## Links
-- [docs.rs](https://docs.rs/soyokaze/latest/soyokaze/) - Documentation
+- [docs.rs](https://docs.rs/soyokaze/) - Documentation
 - [deepwiki.com](https://deepwiki.com/nercone-dev/soyokaze/) - Documentation; Automatically generated.
