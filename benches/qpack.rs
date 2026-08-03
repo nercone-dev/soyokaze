@@ -1,6 +1,6 @@
 mod support;
 
-use soyokaze::helpers::hpack::HeaderField;
+use soyokaze::helpers::fields::HeaderField;
 use soyokaze::helpers::qpack::{self, Decoder, DecoderInstruction, Encoder, EncoderInstruction};
 use support::{opaque, Group};
 
@@ -39,8 +39,7 @@ fn octets(fields: &[HeaderField]) -> usize {
 
 fn ready() -> Encoder {
     let mut encoder = Encoder::new();
-    encoder.set_max_capacity(qpack::ADVERTISED_TABLE_CAPACITY);
-    encoder.set_capacity(qpack::ADVERTISED_TABLE_CAPACITY);
+    encoder.set_max_capacity(qpack::Decoder::DEFAULT_MAX_CAPACITY);
     encoder
 }
 
@@ -109,9 +108,9 @@ fn main() {
     group.bench("SectionAcknowledgment::decode", || DecoderInstruction::decode(opaque(&encoded)));
 
     let mut group = Group::new("qpack insert counts");
-    let capacity = qpack::ADVERTISED_TABLE_CAPACITY;
-    group.bench("encode_insert_count", || qpack::encode_insert_count(opaque(64), capacity));
-    group.bench("decode_insert_count", || qpack::decode_insert_count(opaque(65), 64, capacity));
+    let capacity = qpack::Decoder::DEFAULT_MAX_CAPACITY;
+    group.bench("encode_insert_count", || qpack::Prefix::encode_insert_count(opaque(64), capacity));
+    group.bench("decode_insert_count", || qpack::Prefix::decode_insert_count(opaque(65), 64, capacity));
 
     let mut group = Group::new("qpack::Decoder::decode (rejected)");
     group.bench("blocked on a missing insert", || Decoder::new().decode(0, opaque(&[0xff, 0xff, 0xff, 0x00])));

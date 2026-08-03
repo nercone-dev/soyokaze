@@ -10,7 +10,7 @@ use bytes::Bytes;
 use crate::errors::Error;
 use crate::ffi::errors::{ErrorHandle, Status};
 use crate::ffi::{borrow, borrow_text, Buffer, Runtime, Slice};
-use crate::models::{Body, Message, Method, Url, Version};
+use crate::models::{Body, Message, Method, Role, Url, Version};
 
 /// Which transport a port names, and so which versions it can carry.
 ///
@@ -294,7 +294,7 @@ pub unsafe extern "C" fn soyokaze_message_is_informational(message: *const Messa
 /// As [`soyokaze_message_version`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_secure(message: *const Message) -> bool {
-    unsafe { message.as_ref() }.is_some_and(|message| message.secure)
+    unsafe { message.as_ref() }.is_some_and(|message| message.security.secure)
 }
 
 /// How many fields the message's section holds.
@@ -593,7 +593,7 @@ pub unsafe extern "C" fn soyokaze_message_set_secure(message: *mut Message, secu
         return false;
     };
 
-    message.secure = secure;
+    message.security.secure = secure;
     true
 }
 
@@ -604,7 +604,7 @@ pub unsafe extern "C" fn soyokaze_message_set_secure(message: *mut Message, secu
 /// As [`soyokaze_message_version`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_early_data(message: *const Message) -> bool {
-    unsafe { message.as_ref() }.is_some_and(|message| message.early_data)
+    unsafe { message.as_ref() }.is_some_and(|message| message.security.early_data)
 }
 
 /// Whether the transport underneath was TLS.
@@ -614,7 +614,7 @@ pub unsafe extern "C" fn soyokaze_message_early_data(message: *const Message) ->
 /// As [`soyokaze_message_version`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_tls(message: *const Message) -> bool {
-    unsafe { message.as_ref() }.is_some_and(|message| message.tls)
+    unsafe { message.as_ref() }.is_some_and(|message| message.security.tls)
 }
 
 /// The negotiated TLS version as its two-octet wire code, or `-1`.
@@ -624,7 +624,7 @@ pub unsafe extern "C" fn soyokaze_message_tls(message: *const Message) -> bool {
 /// As [`soyokaze_message_version`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_tls_version(message: *const Message) -> i32 {
-    match unsafe { message.as_ref() }.and_then(|message| message.tls_version) {
+    match unsafe { message.as_ref() }.and_then(|message| message.security.tls_version) {
         Some(version) => version.0 as i32,
         None => -1,
     }
@@ -637,7 +637,7 @@ pub unsafe extern "C" fn soyokaze_message_tls_version(message: *const Message) -
 /// As [`soyokaze_message_version`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_tls_group(message: *const Message) -> i32 {
-    match unsafe { message.as_ref() }.and_then(|message| message.tls_group) {
+    match unsafe { message.as_ref() }.and_then(|message| message.security.tls_group) {
         Some(group) => group.0 as i32,
         None => -1,
     }
@@ -650,7 +650,7 @@ pub unsafe extern "C" fn soyokaze_message_tls_group(message: *const Message) -> 
 /// As [`soyokaze_message_version`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_tls_cipher(message: *const Message) -> i32 {
-    match unsafe { message.as_ref() }.and_then(|message| message.tls_cipher) {
+    match unsafe { message.as_ref() }.and_then(|message| message.security.tls_cipher) {
         Some(cipher) => cipher.0 as i32,
         None => -1,
     }
@@ -663,7 +663,7 @@ pub unsafe extern "C" fn soyokaze_message_tls_cipher(message: *const Message) ->
 /// As [`soyokaze_message_version`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_quic(message: *const Message) -> bool {
-    unsafe { message.as_ref() }.is_some_and(|message| message.quic)
+    unsafe { message.as_ref() }.is_some_and(|message| message.security.quic)
 }
 
 /// The negotiated QUIC version, or `-1`.
@@ -673,7 +673,7 @@ pub unsafe extern "C" fn soyokaze_message_quic(message: *const Message) -> bool 
 /// As [`soyokaze_message_version`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_quic_version(message: *const Message) -> i64 {
-    match unsafe { message.as_ref() }.and_then(|message| message.quic_version) {
+    match unsafe { message.as_ref() }.and_then(|message| message.security.quic_version) {
         Some(version) => version as i64,
         None => -1,
     }
@@ -774,5 +774,232 @@ pub unsafe extern "C" fn soyokaze_message_body(runtime: *mut Runtime, message: *
             Status::Ok
         }
         Err(failure) => unsafe { ErrorHandle::report(error, &Error::Io(failure)) },
+    }
+}
+
+/// What one connection is allowed to spend on the peer's behalf.
+///
+/// The C half of [`Limits`], field for field. Passing null wherever one of
+/// these is asked for takes every default; a caller that wants to change one
+/// ceiling starts from [`soyokaze_limits_default`] and adjusts it.
+///
+/// [`Limits`]: crate::models::Limits
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Limits {
+    /// In bytes, the total size of the HTTP message allowed for reception.
+    pub max_message_size: u64,
+    /// In bytes, the size of the HTTP message body allowed for reception.
+    pub max_message_body_size: u64,
+
+    /// In bytes, the request/status line ceiling.
+    pub max_startline_size: u32,
+    /// In bytes, the whole header (or trailer) block.
+    pub max_headers_size: u64,
+    /// The number of header fields allowed in one block.
+    pub max_header_count: u16,
+    /// In bytes, the chunk-size line ceiling for chunked transfer encoding.
+    pub max_chunk_header_size: u32,
+
+    /// In bytes, how much room each read from a transport is given.
+    pub read_chunk_size: u64,
+    /// In bytes, the buffer size above which an idle connection gives memory back.
+    pub idle_capacity: u64,
+
+    /// The number of connections a listener may negotiate at once.
+    pub max_pending_handshakes: u32,
+
+    /// In seconds, how long one read may wait. Zero waits forever.
+    pub read_timeout: f64,
+    /// In seconds, how long one write may wait. Zero waits forever.
+    pub write_timeout: f64,
+    /// In seconds, how long one whole message may take to arrive. Zero waits forever.
+    pub receive_timeout: f64,
+    /// In seconds, how long one whole message may take to send. Zero waits forever.
+    pub send_timeout: f64,
+
+    /// In bytes, the body size up to which an HTTP/1.x head and body go out as one write.
+    pub inline_body_size: u64,
+
+    /// The number of streams a peer may have open at once, per connection.
+    pub max_concurrent_streams: u32,
+    /// In bytes, the unread message data one connection may hold.
+    pub max_connection_buffer_size: u64,
+    /// The number of streams a peer may reset before a response was sent.
+    pub max_premature_resets: u32,
+    /// In bytes, the largest field compression encoder table this end will keep.
+    pub max_encoder_table_size: u64,
+
+    /// The number of frames a peer may send without advancing a stream.
+    pub max_idle_frames: u32,
+    /// In bytes, the buffered output size at which a body write flushes rather than growing.
+    pub output_high_water: u64,
+
+    /// In seconds, how long to wait for a blocking QPACK reference.
+    pub qpack_block_timeout: f64,
+    /// The number of unidirectional streams a peer may open at once.
+    pub max_peer_uni_streams: u32,
+    /// The number of unacknowledged QPACK field sections the encoder may track.
+    pub max_outstanding_sections: u32,
+    /// The number of streams that may wait QPACK-blocked at once.
+    pub max_blocked_streams: u32,
+    /// The number of reads or writes a tunnel will hold before it applies back pressure.
+    pub tunnel_backlog: u32,
+    pub command_backlog: u32,
+
+    /// In seconds, how long a WebSocket close waits for the peer's echo.
+    pub ws_linger_timeout: f64,
+    /// The number of continuation frames allowed in one WebSocket message.
+    pub ws_max_fragments: u16,
+
+    /// The number of cookies one jar may hold across all origins.
+    pub max_cookies: u32,
+    /// The number of cookies one jar may hold for a single domain.
+    pub max_cookies_per_domain: u16,
+    /// The number of hosts one HSTS store may remember.
+    pub max_hsts_entries: u32,
+}
+
+impl Limits {
+    /// The [`Limits`] this stands for.
+    ///
+    /// [`Limits`]: crate::models::Limits
+    pub fn parse(&self) -> crate::models::Limits {
+        crate::models::Limits {
+            max_message_size: self.max_message_size,
+            max_message_body_size: self.max_message_body_size,
+            max_startline_size: self.max_startline_size,
+            max_headers_size: self.max_headers_size,
+            max_header_count: self.max_header_count,
+            max_chunk_header_size: self.max_chunk_header_size,
+            read_chunk_size: self.read_chunk_size,
+            idle_capacity: self.idle_capacity,
+            max_pending_handshakes: self.max_pending_handshakes,
+            read_timeout: self.read_timeout,
+            write_timeout: self.write_timeout,
+            receive_timeout: self.receive_timeout,
+            send_timeout: self.send_timeout,
+            inline_body_size: self.inline_body_size,
+            max_concurrent_streams: self.max_concurrent_streams,
+            max_connection_buffer_size: self.max_connection_buffer_size,
+            max_premature_resets: self.max_premature_resets,
+            max_encoder_table_size: self.max_encoder_table_size,
+            max_idle_frames: self.max_idle_frames,
+            output_high_water: self.output_high_water,
+            qpack_block_timeout: self.qpack_block_timeout,
+            max_peer_uni_streams: self.max_peer_uni_streams,
+            max_outstanding_sections: self.max_outstanding_sections,
+            max_blocked_streams: self.max_blocked_streams,
+            tunnel_backlog: self.tunnel_backlog,
+            command_backlog: self.command_backlog,
+            ws_linger_timeout: self.ws_linger_timeout,
+            ws_max_fragments: self.ws_max_fragments,
+            max_cookies: self.max_cookies,
+            max_cookies_per_domain: self.max_cookies_per_domain,
+            max_hsts_entries: self.max_hsts_entries,
+        }
+    }
+
+    /// The C half of `limits`.
+    pub fn build(limits: &crate::models::Limits) -> Self {
+        Self {
+            max_message_size: limits.max_message_size,
+            max_message_body_size: limits.max_message_body_size,
+            max_startline_size: limits.max_startline_size,
+            max_headers_size: limits.max_headers_size,
+            max_header_count: limits.max_header_count,
+            max_chunk_header_size: limits.max_chunk_header_size,
+            read_chunk_size: limits.read_chunk_size,
+            idle_capacity: limits.idle_capacity,
+            max_pending_handshakes: limits.max_pending_handshakes,
+            read_timeout: limits.read_timeout,
+            write_timeout: limits.write_timeout,
+            receive_timeout: limits.receive_timeout,
+            send_timeout: limits.send_timeout,
+            inline_body_size: limits.inline_body_size,
+            max_concurrent_streams: limits.max_concurrent_streams,
+            max_connection_buffer_size: limits.max_connection_buffer_size,
+            max_premature_resets: limits.max_premature_resets,
+            max_encoder_table_size: limits.max_encoder_table_size,
+            max_idle_frames: limits.max_idle_frames,
+            output_high_water: limits.output_high_water,
+            qpack_block_timeout: limits.qpack_block_timeout,
+            max_peer_uni_streams: limits.max_peer_uni_streams,
+            max_outstanding_sections: limits.max_outstanding_sections,
+            max_blocked_streams: limits.max_blocked_streams,
+            tunnel_backlog: limits.tunnel_backlog,
+            command_backlog: limits.command_backlog,
+            ws_linger_timeout: limits.ws_linger_timeout,
+            ws_max_fragments: limits.ws_max_fragments,
+            max_cookies: limits.max_cookies,
+            max_cookies_per_domain: limits.max_cookies_per_domain,
+            max_hsts_entries: limits.max_hsts_entries,
+        }
+    }
+
+    /// The [`Limits`] a pointer stands for: what it points at, or the defaults
+    /// when it is null.
+    ///
+    /// [`Limits`]: crate::models::Limits
+    ///
+    /// # Safety
+    ///
+    /// `limits` must either be null or point to a readable [`Limits`].
+    pub unsafe fn or_default(limits: *const Limits) -> crate::models::Limits {
+        match unsafe { limits.as_ref() } {
+            Some(limits) => limits.parse(),
+            None => crate::models::Limits::default(),
+        }
+    }
+}
+
+/// The default [`Limits`], to be adjusted and passed back.
+///
+/// [`Limits`]: crate::models::Limits
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_limits_default() -> Limits {
+    Limits::build(&crate::models::Limits::default())
+}
+
+/// Reads a version list out of a C array of `soyokaze_version_t` values.
+///
+/// A null `versions` means take the default list. `None` when an entry names
+/// no version.
+///
+/// # Safety
+///
+/// `versions` must either be null or point to `count` readable numbers.
+pub unsafe fn parse_versions(versions: *const i32, count: usize) -> Option<Vec<Version>> {
+    if versions.is_null() {
+        return Some(Vec::new());
+    }
+
+    let mut parsed = Vec::with_capacity(count);
+
+    for index in 0..count {
+        parsed.push(match unsafe { *versions.add(index) } {
+            0 => Version::V1_0,
+            1 => Version::V1_1,
+            2 => Version::V2_0,
+            3 => Version::V3_0,
+            _ => return None,
+        });
+    }
+
+    Some(parsed)
+}
+
+/// The `soyokaze_role_t` number for a [`Role`].
+///
+/// The two enums are kept in the same order, so this is the crate's own
+/// grading rather than a narrowing of it: a caller can still tell a proxy from
+/// a user agent, and a tunnel from either.
+pub fn role(role: Role) -> u32 {
+    match role {
+        Role::UserAgent => 0,
+        Role::Origin => 1,
+        Role::Proxy => 2,
+        Role::Gateway => 3,
+        Role::Tunnel => 4,
     }
 }

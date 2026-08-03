@@ -20,16 +20,20 @@ use std::time::Instant;
 use bytes::Bytes;
 use tokio::net::{TcpStream, UnixStream};
 
-use crate::api::common::{Limits, VERSIONS};
-use crate::headers::CookieJar;
-use crate::helpers::hsts::HstsStore;
-use crate::models::{Body, ConnectionID, Headers, Message, Method, Port, Url, Version};
-use crate::tls;
+use crate::api::common::VERSIONS;
+use crate::cookies::CookieJar;
+use crate::hsts::HstsStore;
+use crate::helpers::text::Text;
+use crate::models::{Alpn, Body, ConnectionID, Headers, Limits, Message, Method, Port, TransportKind, Url, Version};
+use crate::tls::Security;
 use crate::protocol::base::{AnyConnection, Connection, Transport};
-use crate::protocol::common::{self, Error};
+use crate::protocol::common::Error;
 use crate::protocol::h1::H1Connection;
 use crate::protocol::h2::H2Connection;
 use crate::protocol::h3::{H3Connection, H3Session};
+use crate::protocol::handler::QuicApplication;
+use crate::protocol::quic;
+use crate::helpers::sync;
 
 /// How a [`Client`] is configured.
 ///
@@ -58,6 +62,11 @@ pub struct ClientConfig {
     /// Each entry is DER or PEM, so a whole bundle of roots may be one entry.
     pub roots: Option<Vec<Vec<u8>>>,
 
+    /// The TLS details every context is built with: cipher suites, groups,
+    /// signature algorithms, session tickets, early data and certificate
+    /// compression.
+    pub tls: crate::tls::TlsConfig,
+
     /// The ECH configuration list to use when dialling each host.
     ///
     /// A host of `*` applies wherever no exact entry matches. Each list is
@@ -80,6 +89,7 @@ impl Default for ClientConfig {
             limits: ClientLimits::default(),
             secure: true,
             roots: None,
+            tls: crate::tls::TlsConfig::default(),
             ech: std::collections::HashMap::new(),
             cookies: true,
             hsts: true,
@@ -145,6 +155,31 @@ impl Client {
         ConnectionID(Bytes::from(format!("{host}/{target:?}")))
     }
 
+    /// The authority a request over a connection to this host and port carries.
+    ///
+    /// The scheme comes from [`ClientConfig::secure`], since that is what
+    /// decides whether the connection is wrapped in TLS, and the port is
+    /// omitted when it is the one that scheme implies. A Unix socket has no
+    /// port to name, so the host stands alone.
+    pub fn authority(&self, host: &str, target: &Port) -> String {
+        let scheme = if self.config.secure { "https" } else { "http" };
+
+        match target {
+            Port::UDS(_) => host.to_owned(),
+            Port::TCP(port) | Port::QUIC(port) => Url::authority_of(scheme, host, *port),
+        }
+    }
+
+    /// The finalisation every connection this client makes applies to the
+    /// requests it sends.
+    ///
+    /// This is where `Host` — and so, above HTTP/1.1, `:authority` — comes
+    /// from: the client knows what it dialled and the connection does not, so
+    /// the client is what tells it.
+    pub fn request_finalizer(&self, authority: impl Into<Text>) -> crate::finalizer::RequestFinalizer {
+        crate::finalizer::RequestFinalizer::new(Some(authority.into()))
+    }
+
     /// Opens a connection to a host on a given port.
     ///
     /// The port decides the transport, and so the versions available: QUIC
@@ -161,19 +196,20 @@ impl Client {
     /// long.
     pub async fn connect(&self, host: &str, target: Port) -> Result<AnyConnection, Error> {
         let id = self.id(host, &target);
+        let authority = self.authority(host, &target);
 
-        common::within(self.config.limits.connection_timeout, async move {
+        sync::Timeout::within(self.config.limits.connection_timeout, async move {
             match target {
-                Port::QUIC(port) => self.connect_quic(host, port, id).await,
+                Port::QUIC(port) => self.connect_quic(host, port, id, &authority).await,
 
                 Port::TCP(port) => {
                     let transport = TcpStream::connect((host, port)).await?;
-                    self.connect_stream(host, Box::new(transport), id).await
+                    self.connect_stream(host, Box::new(transport), id, &authority).await
                 }
 
                 Port::UDS(ref path) => {
                     let transport = UnixStream::connect(path).await?;
-                    self.assemble(self.prior_version(), Box::new(transport), id).await
+                    self.assemble(self.prior_version()?, Box::new(transport), id, &authority).await
                 }
             }
         })
@@ -187,12 +223,12 @@ impl Client {
     /// # Errors
     ///
     /// As [`Client::connect_stream_tls`] and [`Client::assemble`].
-    pub async fn connect_stream(&self, host: &str, transport: Box<dyn Transport>, id: ConnectionID) -> Result<AnyConnection, Error> {
+    pub async fn connect_stream(&self, host: &str, transport: Box<dyn Transport>, id: ConnectionID, authority: &str) -> Result<AnyConnection, Error> {
         if !self.config.secure {
-            return self.assemble(self.prior_version(), transport, id).await;
+            return self.assemble(self.prior_version()?, transport, id, authority).await;
         }
 
-        self.connect_stream_tls(host, transport, id).await
+        self.connect_stream_tls(host, transport, id, authority).await
     }
 
     /// Runs the TLS handshake over a transport and builds the negotiated
@@ -205,13 +241,13 @@ impl Client {
     /// Returns [`Error::Version`] when HTTP/3 is the only version configured,
     /// or when nothing usable is negotiated, and [`Error::Tls`] when the
     /// handshake fails.
-    pub async fn connect_stream_tls(&self, host: &str, transport: Box<dyn Transport>, id: ConnectionID) -> Result<AnyConnection, Error> {
-        let versions: Vec<Version> = self.config.versions.iter().copied().filter(|version| version.major() != 3).collect();
+    pub async fn connect_stream_tls(&self, host: &str, transport: Box<dyn Transport>, id: ConnectionID, authority: &str) -> Result<AnyConnection, Error> {
+        let versions: Vec<Version> = self.config.versions.iter().copied().filter(|version| version.transport() == TransportKind::Stream).collect();
         if versions.is_empty() {
-            return Err(Error::Version("HTTP/3 needs a QUIC port".into()));
+            return Err(Error::Version("no configured version runs over a stream transport".into()));
         }
 
-        let connector = tls::client_config(self.config.roots.as_deref().unwrap_or(&[]), &versions)?;
+        let connector = self.config.tls.client(self.config.roots.as_deref().unwrap_or(&[]), &versions)?;
         let mut config = connector.configure().map_err(|err| Error::Tls(err.to_string()))?;
 
         if let Some(list) = self.ech(host) {
@@ -219,22 +255,27 @@ impl Client {
         }
 
         let stream = tokio_boring::connect(config, host, transport).await.map_err(|err| Error::Tls(err.to_string()))?;
-        let version = tls::negotiated(stream.ssl().selected_alpn_protocol(), &versions)?;
-        let security = tls::security(stream.ssl());
+        let version = Alpn::negotiated(stream.ssl().selected_alpn_protocol(), &versions)?;
+        let security = Security::of(stream.ssl());
 
-        Ok(self.assemble(version, Box::new(stream), id).await?.with_security(security))
+        Ok(self.assemble(version, Box::new(stream), id, authority).await?.with_security(security))
     }
 
-    /// Opens an HTTP/3 connection over QUIC.
+    /// Opens a connection over QUIC.
     ///
     /// The local socket is bound to match the address family the host resolved
-    /// to.
+    /// to. The version is settled before the handshake rather than after it —
+    /// the QUIC driver fixes the application first — so a QUIC port offers the
+    /// one version it will run, per [`Port::offers`], and the match below is
+    /// over every version rather than assuming the one that runs over QUIC
+    /// today.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Io`] when the host resolves to nothing or the socket
-    /// cannot be set up, and [`Error::Tls`] when the QUIC handshake fails.
-    pub async fn connect_quic(&self, host: &str, port: u16, id: ConnectionID) -> Result<AnyConnection, Error> {
+    /// cannot be set up, [`Error::Version`] when no configured version runs
+    /// over QUIC, and [`Error::Tls`] when the QUIC handshake fails.
+    pub async fn connect_quic(&self, host: &str, port: u16, id: ConnectionID, authority: &str) -> Result<AnyConnection, Error> {
         let address = tokio::net::lookup_host((host, port))
             .await?
             .next()
@@ -247,41 +288,70 @@ impl Client {
 
         let udp = tokio::net::UdpSocket::bind(bind).await?;
         udp.connect(address).await?;
-        let socket: tokio_quiche::socket::Socket<std::sync::Arc<tokio::net::UdpSocket>, std::sync::Arc<tokio::net::UdpSocket>> = udp.try_into().map_err(|err: std::io::Error| Error::Io(err))?;
 
-        let mut settings = tokio_quiche::settings::QuicSettings::default();
-        settings.alpn = vec![Version::V3_0.alpn().as_bytes().to_vec()];
-        settings.max_idle_timeout = crate::protocol::common::duration(self.config.limits.message.read_timeout);
-        settings.enable_dgram = false;
-
-        let hooks = tokio_quiche::settings::Hooks {
-            connection_hook: Some(std::sync::Arc::new(tls::QuicClientTls { roots: self.config.roots.clone().unwrap_or_default() })),
+        let versions = Port::QUIC(port).offers(&self.config.versions);
+        let Some(version) = versions.first().copied() else {
+            return Err(Error::Version("no configured version runs over QUIC".into()));
         };
 
-        let params = tokio_quiche::ConnectionParams::new_client(
-            settings,
-            Some(tokio_quiche::settings::TlsCertificatePaths { cert: "", private_key: "", kind: tokio_quiche::settings::CertificateKind::X509 }),
-            hooks,
-        );
+        match version {
+            Version::V3_0 => {
+                let config = quic::QuicConfig {
+                    versions: versions.clone(),
+                    idle_timeout: self.config.limits.message.read_timeout,
+                    max_streams_bidi: None,
+                    enable_dgram: false,
+                };
+                let hook = std::sync::Arc::new(quic::QuicClientTls {
+                    roots: self.config.roots.clone().unwrap_or_default(),
+                    tls: self.config.tls.clone(),
+                });
 
-        let session = H3Session::new(crate::models::Role::UserAgent, id, self.config.limits.message);
-        let (mut connection, worker) = H3Connection::pair(session, None);
-        let quic = tokio_quiche::quic::connect_with_config(socket, Some(host), &params, worker)
-            .await
-            .map_err(|err| Error::Tls(err.to_string()))?;
-        connection.guard = Some(std::sync::Arc::new(quic));
+                let session = H3Session::new(crate::models::Role::UserAgent, id, self.config.limits.message);
+                let (connection, worker) = H3Connection::pair(session);
+                let connection = connection.with_request_finalizer(self.request_finalizer(authority));
+                let application = QuicApplication::new(versions, version, worker);
 
-        Ok(AnyConnection::H3(connection))
+                let guard = quic::QuicDialer::connect(host, udp, &config, hook, application).await?;
+                Ok(AnyConnection::H3(connection.with_guard(std::sync::Arc::new(guard))))
+            }
+
+            Version::V1_0 | Version::V1_1 | Version::V2_0 => Err(Error::Version(format!("{version} needs a stream transport"))),
+        }
     }
 
     /// The version to use where nothing can be negotiated.
     ///
-    /// Whatever [`ClientConfig::versions`] pinned, or HTTP/1.1.
-    pub fn prior_version(&self) -> Version {
-        match self.config.versions[..] {
-            [version] if version.major() != 3 => version,
-            _ => Version::V1_1,
+    /// A plaintext port and a Unix socket have no ALPN, so the version cannot
+    /// be agreed on and has to be settled in advance. One configured version
+    /// that runs over a stream is taken as prior knowledge — HTTP/2 that way is
+    /// h2c, and [`H2Connection`] sends the preface RFC 9113 §3.4 requires.
+    /// Where several are configured, only HTTP/1.x can be assumed of a peer
+    /// that was never asked, so the most preferred HTTP/1.x is used.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Version`] when no configured version can be spoken
+    /// without negotiating — pinning HTTP/3 alone and then dialling a stream,
+    /// for instance. A version the caller pinned is never silently exchanged
+    /// for another.
+    pub fn prior_version(&self) -> Result<Version, Error> {
+        let mut stream = self.config.versions.iter().copied().filter(|version| version.transport() == TransportKind::Stream);
+
+        let Some(first) = stream.next() else {
+            return Err(Error::Version("no configured version runs over a stream transport".into()));
+        };
+
+        if stream.next().is_none() {
+            return Ok(first);
         }
+
+        self.config
+            .versions
+            .iter()
+            .copied()
+            .find(|version| version.major() == 1)
+            .ok_or_else(|| Error::Version("several versions are configured and none of them is HTTP/1.x, which is the only one a peer that cannot negotiate may be assumed to speak".into()))
     }
 
     /// Wraps a transport in the connection type for a version.
@@ -290,14 +360,17 @@ impl Client {
     ///
     /// Returns [`Error::Version`] for [`Version::V3_0`], which cannot run over
     /// a stream transport.
-    pub async fn assemble(&self, version: Version, transport: Box<dyn Transport>, id: ConnectionID) -> Result<AnyConnection, Error> {
+    pub async fn assemble(&self, version: Version, transport: Box<dyn Transport>, id: ConnectionID, authority: &str) -> Result<AnyConnection, Error> {
         let role = crate::models::Role::UserAgent;
+        let finalizer = self.request_finalizer(authority);
 
         match version {
-            Version::V1_0 | Version::V1_1 => {
-                Ok(AnyConnection::H1(H1Connection::new(transport, role, id, self.config.limits.message)))
-            }
-            Version::V2_0 => Ok(AnyConnection::H2(H2Connection::new(transport, role, id, self.config.limits.message))),
+            Version::V1_0 | Version::V1_1 => Ok(AnyConnection::H1(
+                H1Connection::new(transport, role, id, self.config.limits.message).with_version(version).with_request_finalizer(finalizer),
+            )),
+            Version::V2_0 => Ok(AnyConnection::H2(
+                H2Connection::new(transport, role, id, self.config.limits.message).with_request_finalizer(finalizer),
+            )),
             Version::V3_0 => Err(Error::Version("HTTP/3 needs a QUIC port".into())),
         }
     }
@@ -322,10 +395,10 @@ impl Client {
         }
     }
 
-    /// Whether HTTP/3 is the only version on offer, and so QUIC the only
-    /// transport to dial.
-    pub fn only_h3(&self) -> bool {
-        self.config.versions.contains(&Version::V3_0) && self.config.versions.iter().all(|version| version.major() == 3)
+    /// Whether every version on offer runs over QUIC, and so QUIC is the
+    /// only transport to dial.
+    pub fn only_quic(&self) -> bool {
+        !self.config.versions.is_empty() && self.config.versions.iter().all(|version| version.transport() == TransportKind::Quic)
     }
 
     /// Opens a connection for a URL, taking the transport from its scheme.
@@ -339,19 +412,20 @@ impl Client {
     /// As [`Client::connect`].
     pub async fn open(&self, url: &Url) -> Result<AnyConnection, Error> {
         let id = self.id(&url.host, &Port::TCP(url.port));
+        let authority = url.authority();
 
-        common::within(self.config.limits.connection_timeout, async move {
+        sync::Timeout::within(self.config.limits.connection_timeout, async move {
             if !url.secure() {
                 let transport = TcpStream::connect((url.host.as_str(), url.port)).await?;
-                return self.assemble(self.prior_version(), Box::new(transport), id).await;
+                return self.assemble(self.prior_version()?, Box::new(transport), id, &authority).await;
             }
 
-            if self.only_h3() {
-                return self.connect_quic(&url.host, url.port, id).await;
+            if self.only_quic() {
+                return self.connect_quic(&url.host, url.port, id, &authority).await;
             }
 
             let transport = TcpStream::connect((url.host.as_str(), url.port)).await?;
-            self.connect_stream_tls(&url.host, Box::new(transport), id).await
+            self.connect_stream_tls(&url.host, Box::new(transport), id, &authority).await
         })
         .await?
     }
@@ -375,9 +449,10 @@ impl Client {
     /// Makes one request and returns the response.
     ///
     /// Dials, exchanges, and closes the connection. HSTS is applied to the URL
-    /// first; `Host` and `Cookie` are filled in unless the caller set them;
-    /// and any `Set-Cookie` and `Strict-Transport-Security` on the response
-    /// are taken into the client's state.
+    /// first; `Cookie` is filled in unless the caller set it, and `Host` by the
+    /// connection's own [`Client::request_finalizer`]; and any `Set-Cookie` and
+    /// `Strict-Transport-Security` on the response are taken into the client's
+    /// state.
     ///
     /// Redirects are not followed — the response is returned as it came.
     ///
@@ -393,9 +468,6 @@ impl Client {
         let mut connection = self.open(&url).await?;
 
         let mut fields = headers.unwrap_or_default();
-        if !fields.contains("host") {
-            fields.append("host", url.authority());
-        }
         if let Some(jar) = &self.jar
             && !fields.contains("cookie")
             && let Some(cookie) = jar.cookie(&url, now)
@@ -404,7 +476,7 @@ impl Client {
         }
 
         let mut request = Message::request(method, url.target.clone(), connection.version());
-        request.secure = url.secure();
+        request.security.secure = url.secure();
         request.headers = Some(fields);
         request.body = body;
 
@@ -485,6 +557,6 @@ impl Client {
         self.apply_hsts(&mut url, Instant::now());
 
         let connection = self.open(&url).await?;
-        connection.open_websocket(&url.authority(), &url.target).await
+        connection.open_websocket(&url.authority(), &url.target, self.config.limits.message).await
     }
 }

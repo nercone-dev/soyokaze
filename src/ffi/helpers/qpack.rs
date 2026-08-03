@@ -8,9 +8,9 @@
 
 use crate::errors::Error;
 use crate::ffi::errors::{ErrorHandle, Status};
-use crate::ffi::helpers::hpack::{parse_fields, Field, Fields};
+use crate::ffi::helpers::fields::{parse_fields, Field, Fields};
 use crate::ffi::{borrow, Buffer};
-use crate::helpers::qpack::{Decoder, DecoderInstruction, Encoder, EncoderInstruction};
+use crate::helpers::qpack::{Decoder, Encoder};
 
 /// Builds a QPACK encoder that references only the static table until it is
 /// given capacity.
@@ -32,20 +32,62 @@ pub unsafe extern "C" fn soyokaze_qpack_encoder_free(encoder: *mut Encoder) {
     }
 }
 
-/// Records the peer's `SETTINGS_QPACK_MAX_TABLE_CAPACITY`.
+/// Records the peer's `SETTINGS_QPACK_MAX_TABLE_CAPACITY`, resizing the
+/// table under it.
 ///
-/// The encoder may never set a capacity above this.
+/// The instruction octets announcing the new capacity go through
+/// `instructions`, and are empty when the capacity did not change; send them
+/// down the encoder stream.
 ///
 /// # Safety
 ///
-/// `encoder` must either be null or be a handle that has not been freed.
+/// `encoder` must be a handle that has not been freed, and `instructions`
+/// must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_qpack_encoder_set_max_capacity(encoder: *mut Encoder, max_capacity: usize) -> bool {
+pub unsafe extern "C" fn soyokaze_qpack_encoder_set_max_capacity(encoder: *mut Encoder, max_capacity: usize, instructions: *mut Buffer) -> bool {
     let Some(encoder) = (unsafe { encoder.as_mut() }) else {
         return false;
     };
 
-    encoder.set_max_capacity(max_capacity);
+    if instructions.is_null() {
+        return false;
+    }
+
+    unsafe {
+        *instructions = match encoder.set_max_capacity(max_capacity) {
+            Some(instruction) => Buffer::new(instruction.encode()),
+            None => Buffer::EMPTY,
+        };
+    }
+
+    true
+}
+
+/// Bounds the capacity the encoder keeps, whatever the peer permits.
+///
+/// The instruction octets announcing a shrunk capacity go through
+/// `instructions`, and are empty when the capacity did not change.
+///
+/// # Safety
+///
+/// As [`soyokaze_qpack_encoder_set_max_capacity`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_qpack_encoder_set_capacity_limit(encoder: *mut Encoder, capacity_limit: usize, instructions: *mut Buffer) -> bool {
+    let Some(encoder) = (unsafe { encoder.as_mut() }) else {
+        return false;
+    };
+
+    if instructions.is_null() {
+        return false;
+    }
+
+    unsafe {
+        *instructions = match encoder.set_capacity_limit(capacity_limit) {
+            Some(instruction) => Buffer::new(instruction.encode()),
+            None => Buffer::EMPTY,
+        };
+    }
+
     true
 }
 
@@ -54,7 +96,7 @@ pub unsafe extern "C" fn soyokaze_qpack_encoder_set_max_capacity(encoder: *mut E
 ///
 /// # Safety
 ///
-/// As [`soyokaze_qpack_encoder_set_max_capacity`].
+/// `encoder` must either be null or be a handle that has not been freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_qpack_encoder_set_max_outstanding_sections(encoder: *mut Encoder, max_sections: usize) -> bool {
     let Some(encoder) = (unsafe { encoder.as_mut() }) else {
@@ -65,32 +107,18 @@ pub unsafe extern "C" fn soyokaze_qpack_encoder_set_max_outstanding_sections(enc
     true
 }
 
-/// Sets the dynamic table capacity, writing the instruction that announces it.
-///
-/// The instruction octets go through `instructions`, and are empty when the
-/// capacity did not change; send them down the encoder stream.
+/// Caps how large a single instruction on the peer's decoder stream may grow.
 ///
 /// # Safety
 ///
-/// `encoder` must be a handle that has not been freed, and `instructions`
-/// must be writable.
+/// As [`soyokaze_qpack_encoder_set_max_outstanding_sections`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_qpack_encoder_set_capacity(encoder: *mut Encoder, capacity: usize, instructions: *mut Buffer) -> bool {
+pub unsafe extern "C" fn soyokaze_qpack_encoder_set_max_instruction_size(encoder: *mut Encoder, max_size: usize) -> bool {
     let Some(encoder) = (unsafe { encoder.as_mut() }) else {
         return false;
     };
 
-    if instructions.is_null() {
-        return false;
-    }
-
-    unsafe {
-        *instructions = match encoder.set_capacity(capacity) {
-            Some(instruction) => Buffer::new(instruction.encode()),
-            None => Buffer::EMPTY,
-        };
-    }
-
+    encoder.set_max_instruction_size(max_size);
     true
 }
 
@@ -132,8 +160,8 @@ pub unsafe extern "C" fn soyokaze_qpack_encode(encoder: *mut Encoder, stream_id:
 
 /// Feeds the encoder what arrived on the decoder stream.
 ///
-/// `data` must hold whole instructions; QPACK's streams deliver them in
-/// order, so pass along exactly what arrived.
+/// Partial instructions are buffered until the rest arrives, so pass along
+/// exactly what arrived, as it arrives.
 ///
 /// # Safety
 ///
@@ -145,21 +173,14 @@ pub unsafe extern "C" fn soyokaze_qpack_encoder_on_decoder_instructions(encoder:
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 
-    let Some(mut data) = (unsafe { borrow(data, data_len) }) else {
+    let Some(data) = (unsafe { borrow(data, data_len) }) else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 
-    while !data.is_empty() {
-        match DecoderInstruction::decode(data) {
-            Ok((consumed, instruction)) => {
-                encoder.on_decoder_instruction(instruction);
-                data = &data[consumed..];
-            }
-            Err(failure) => return unsafe { ErrorHandle::report(error, &Error::from(failure)) },
-        }
+    match encoder.on_decoder_stream(data) {
+        Ok(()) => Status::Ok,
+        Err(failure) => unsafe { ErrorHandle::report(error, &Error::from(failure)) },
     }
-
-    Status::Ok
 }
 
 /// Forgets the outstanding sections of a stream that was reset.
@@ -226,11 +247,43 @@ pub unsafe extern "C" fn soyokaze_qpack_decoder_set_max_capacity(decoder: *mut D
     true
 }
 
+/// Caps how large a single instruction on the peer's encoder stream may grow.
+///
+/// # Safety
+///
+/// As [`soyokaze_qpack_decoder_set_max_decoded_size`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_qpack_decoder_set_max_instruction_size(decoder: *mut Decoder, max_size: usize) -> bool {
+    let Some(decoder) = (unsafe { decoder.as_mut() }) else {
+        return false;
+    };
+
+    decoder.set_max_instruction_size(max_size);
+    true
+}
+
+/// Caps how many streams may wait QPACK-blocked at once, which is what
+/// `SETTINGS_QPACK_BLOCKED_STREAMS` promises the peer.
+///
+/// # Safety
+///
+/// As [`soyokaze_qpack_decoder_set_max_decoded_size`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_qpack_decoder_set_max_blocked_streams(decoder: *mut Decoder, max_streams: usize) -> bool {
+    let Some(decoder) = (unsafe { decoder.as_mut() }) else {
+        return false;
+    };
+
+    decoder.set_max_blocked_streams(max_streams);
+    true
+}
+
 /// Feeds the decoder what arrived on the encoder stream.
 ///
-/// Whatever answer the instructions call for — an Insert Count Increment —
-/// goes through `instructions`, ready for the decoder stream, and is empty
-/// when nothing needs saying.
+/// Partial instructions are buffered until the rest arrives. Whatever answer
+/// the instructions call for — an Insert Count Increment — goes through
+/// `instructions`, ready for the decoder stream, and is empty when nothing
+/// needs saying.
 ///
 /// # Safety
 ///
@@ -242,7 +295,7 @@ pub unsafe extern "C" fn soyokaze_qpack_decoder_on_encoder_instructions(decoder:
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 
-    let Some(mut data) = (unsafe { borrow(data, data_len) }) else {
+    let Some(data) = (unsafe { borrow(data, data_len) }) else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 
@@ -250,22 +303,11 @@ pub unsafe extern "C" fn soyokaze_qpack_decoder_on_encoder_instructions(decoder:
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     }
 
-    let mut stream = Vec::new();
-
-    while !data.is_empty() {
-        match EncoderInstruction::decode(data) {
-            Ok((consumed, instruction)) => {
-                match decoder.on_encoder_instruction(instruction) {
-                    Ok(Some(answer)) => answer.encode_into(&mut stream),
-                    Ok(None) => {}
-                    Err(failure) => return unsafe { ErrorHandle::report(error, &Error::from(failure)) },
-                }
-                data = &data[consumed..];
-            }
-            Err(failure) => return unsafe { ErrorHandle::report(error, &Error::from(failure)) },
-        }
+    if let Err(failure) = decoder.on_encoder_stream(data) {
+        return unsafe { ErrorHandle::report(error, &Error::from(failure)) };
     }
 
+    let stream = decoder.take_decoder_stream();
     unsafe { *instructions = if stream.is_empty() { Buffer::EMPTY } else { Buffer::new(stream) } };
     Status::Ok
 }

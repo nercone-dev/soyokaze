@@ -2,12 +2,19 @@
 //!
 //! Everything here builds on BoringSSL. The version of HTTP a connection ends
 //! up speaking is decided during the handshake by ALPN, so this module is
-//! where negotiation happens: [`client_config`] and [`server_config`] offer
-//! the versions, and [`negotiated`] reads back what was chosen.
+//! where negotiation happens: [`TlsConfig::client`] and [`TlsConfig::server`]
+//! offer the versions, and [`Alpn::negotiated`] reads back what was chosen.
 //!
-//! What the handshake settled is read back here too: [`negotiated`] gives the
-//! HTTP version, and [`security`] the TLS version, group and cipher suite that
-//! every message crossing the connection is then stamped with.
+//! What the handshake settled is read back here too: [`Alpn::negotiated`]
+//! gives the HTTP version, and [`Security::of`] the TLS version, group and
+//! cipher suite that every message crossing the connection is then stamped
+//! with.
+//!
+//! [`Alpn::negotiated`]: crate::models::Alpn::negotiated
+//!
+//! How a context is tuned beyond its identity and roots — cipher suites,
+//! groups, signature algorithms, session tickets, early data and certificate
+//! compression — is what [`TlsConfig`] carries, and both sides take one.
 //!
 //! Encrypted Client Hello encrypts the server name in the handshake, so a
 //! watcher sees only the public name. [`EchKeys`] is what a server holds,
@@ -16,117 +23,132 @@
 //!
 //! Certificates and keys are taken in whichever encoding they arrive in:
 //! [`Format`] tells DER and PEM apart by their contents, so nothing has to be
-//! declared. [`certificates`] and [`private_key`] are what read them, and
+//! declared. [`Format::certificates`] and [`Format::private_key`] are what read
+//! them, and
 //! [`Identity::from_pkcs12`] unwraps a `.p12` or `.pfx` archive into the same
 //! shape.
+
+use std::io::Write;
 
 use boring::hpke::HpkeKey;
 use boring::pkcs12::Pkcs12;
 use boring::pkey::{PKey, Private};
-use boring::ssl::{AlpnError, SslAcceptor, SslConnector, SslContextBuilder, SslEchKeys, SslMethod, SslVerifyMode};
+use boring::ssl::{
+    AlpnError, CertificateCompressionAlgorithm, CertificateCompressor, SslAcceptor, SslConnector, SslContextBuilder, SslEchKeys,
+    SslMethod, SslOptions, SslVerifyMode,
+};
 use boring::stack::Stack;
 use boring::x509::store::X509StoreBuilder;
 use boring::x509::X509;
 use foreign_types::{ForeignType, ForeignTypeRef};
 
 use crate::errors::Error;
-use crate::models::{Security, TLSCipher, TLSGroup, TLSVersion, Version};
+use crate::models::{Alpn, Message, Version};
 
-/// Wraps a BoringSSL failure as an [`Error`].
-pub fn tls_error(error: impl std::fmt::Display) -> Error {
-    Error::Tls(error.to_string())
-}
+/// A TLS protocol version, as the two-octet code that appears on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TLSVersion(pub u16);
 
-/// The ALPN protocol identifiers for a list of versions, one per entry.
-pub fn alpn(versions: &[Version]) -> Vec<Vec<u8>> {
-    versions.iter().map(|version| version.alpn().as_bytes().to_vec()).collect()
-}
+/// A TLS cipher suite, as the two-octet code that appears on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TLSCipher(pub u16);
 
-/// The ALPN protocol identifiers in wire form: each length-prefixed, run together.
-pub fn alpn_wire(versions: &[Version]) -> Vec<u8> {
-    let mut out = Vec::new();
+/// A TLS named group, as the two-octet code that appears on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TLSGroup(pub u16);
 
-    for version in versions {
-        let protocol = version.alpn().as_bytes();
-        out.push(protocol.len() as u8);
-        out.extend_from_slice(protocol);
-    }
-
-    out
-}
-
-/// Picks a protocol from what a client offered.
+/// The wire code for TLS 1.3, which is the version QUIC carries.
 ///
-/// The server's preference wins: `offered` is walked in order and the first
-/// entry the client also lists is chosen. `None` when nothing overlaps, which
-/// must fail the handshake rather than fall back to something unnegotiated.
-pub fn select_alpn<'a>(offered: &[Vec<u8>], client: &'a [u8]) -> Option<&'a [u8]> {
-    for wanted in offered {
-        let mut index = 0;
+/// RFC 9001 admits nothing older underneath QUIC version 1.
+pub const TLS_1_3: u16 = 0x0304;
 
-        while index < client.len() {
-            let length = client[index] as usize;
-            let end = index + 1 + length;
+/// What the transport underneath a connection turned out to be.
+///
+/// Read off the handshake once, when the connection is assembled, and stamped
+/// onto every message that crosses it by [`Security::apply`] — which is how
+/// [`Message::security`] comes to be filled in. A plaintext transport leaves
+/// every field at its default, so [`Security::default`] is exactly "nothing
+/// underneath".
+///
+/// [`Security::of`] reads one off a completed TLS handshake, and
+/// [`Security::quic`] builds the one a QUIC connection stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Security {
+    /// Whether the transport was a secure one, as the `https` scheme and the
+    /// `:scheme` pseudo-header reflect it.
+    pub secure: bool,
+    /// Whether the request arrived in TLS early data, and so may be a replay.
+    pub early_data: bool,
 
-            let Some(protocol) = client.get(index + 1..end) else {
-                break;
-            };
+    /// Whether the transport underneath was TLS.
+    pub tls: bool,
+    /// The negotiated TLS version.
+    pub tls_version: Option<TLSVersion>,
+    /// The negotiated TLS named group.
+    pub tls_group: Option<TLSGroup>,
+    /// The negotiated TLS cipher suite.
+    ///
+    /// A QUIC connection leaves this and [`Security::tls_group`] absent: the
+    /// QUIC stack does not hand its TLS session out to be read.
+    pub tls_cipher: Option<TLSCipher>,
 
-            if protocol == wanted.as_slice() {
-                return Some(protocol);
-            }
+    /// Whether the transport underneath was QUIC.
+    pub quic: bool,
+    /// The negotiated QUIC version.
+    pub quic_version: Option<u32>,
+}
 
-            index = end;
+impl Security {
+    /// Reads the transport facts off a completed handshake.
+    ///
+    /// The counterpart of [`Alpn::negotiated`]: that reads back which HTTP
+    /// version was chosen, this reads back everything else the handshake
+    /// settled — the TLS version, named group and cipher suite as their wire
+    /// codes, and whether the peer's first flight was accepted as early data. A
+    /// code the session does not report is left absent rather than guessed at.
+    pub fn of(ssl: &boring::ssl::SslRef) -> Self {
+        let version = unsafe { boring_sys::SSL_version(ssl.as_ptr()) };
+        let group = unsafe { boring_sys::SSL_get_curve_id(ssl.as_ptr()) };
+
+        Self {
+            secure: true,
+            early_data: unsafe { boring_sys::SSL_early_data_accepted(ssl.as_ptr()) } != 0,
+
+            tls: true,
+            tls_version: u16::try_from(version).ok().filter(|version| *version != 0).map(TLSVersion),
+            tls_group: (group != 0).then_some(TLSGroup(group)),
+            tls_cipher: ssl.current_cipher().map(|cipher| TLSCipher(cipher.protocol_id())),
+
+            ..Self::default()
         }
     }
 
-    None
-}
+    /// What a QUIC connection stands for, of `version` when it is known.
+    ///
+    /// QUIC is secure by construction and carries TLS 1.3 within it, so both
+    /// are set. The cipher suite and named group are left absent: the QUIC
+    /// stack does not hand its TLS session out to be read. `None` builds the
+    /// facts a connection stands for before its handshake has reported a
+    /// version.
+    pub fn quic(version: Option<u32>) -> Self {
+        Self {
+            secure: true,
+            tls: true,
+            tls_version: Some(TLSVersion(TLS_1_3)),
+            quic: true,
+            quic_version: version,
+            ..Self::default()
+        }
+    }
 
-/// The version a completed handshake settled on.
-///
-/// A peer that selected nothing falls back to HTTP/1.x, which predates ALPN,
-/// and only when that was on offer.
-///
-/// # Errors
-///
-/// Returns [`Error::Version`] when the peer selected nothing and no HTTP/1.x
-/// was offered, or selected something outside `versions`.
-pub fn negotiated(alpn: Option<&[u8]>, versions: &[Version]) -> Result<Version, Error> {
-    let Some(alpn) = alpn else {
-        return versions
-            .iter()
-            .copied()
-            .find(|version| version.major() == 1)
-            .ok_or_else(|| Error::Version("the peer selected no protocol".into()));
-    };
-
-    Version::from_alpn(alpn)
-        .filter(|version| versions.contains(version))
-        .ok_or_else(|| Error::Version(format!("the peer selected {:?}", String::from_utf8_lossy(alpn))))
-}
-
-/// Reads the transport facts off a completed handshake.
-///
-/// The counterpart of [`negotiated`]: that reads back which HTTP version was
-/// chosen, this reads back everything else the handshake settled — the TLS
-/// version, named group and cipher suite as their wire codes, and whether the
-/// peer's first flight was accepted as early data. A code the session does not
-/// report is left absent rather than guessed at.
-pub fn security(ssl: &boring::ssl::SslRef) -> Security {
-    let version = unsafe { boring_sys::SSL_version(ssl.as_ptr()) };
-    let group = unsafe { boring_sys::SSL_get_curve_id(ssl.as_ptr()) };
-
-    Security {
-        secure: true,
-        early_data: unsafe { boring_sys::SSL_early_data_accepted(ssl.as_ptr()) } != 0,
-
-        tls: true,
-        tls_version: u16::try_from(version).ok().filter(|version| *version != 0).map(TLSVersion),
-        tls_group: (group != 0).then_some(TLSGroup(group)),
-        tls_cipher: ssl.current_cipher().map(|cipher| TLSCipher(cipher.protocol_id())),
-
-        ..Security::default()
+    /// Stamps these facts onto a message the connection has just received.
+    ///
+    /// Every version's connection does this on the way in, which is how
+    /// [`Message::security`] comes to be filled in, and doing it here rather
+    /// than assigning the field at each of the three keeps the three from
+    /// drifting apart.
+    pub fn apply(&self, message: &mut Message) {
+        message.security = *self;
     }
 }
 
@@ -161,137 +183,311 @@ impl Format {
             _ => Self::Pem,
         }
     }
-}
 
-/// Parses every certificate in one blob, DER or PEM.
-///
-/// A DER blob carries exactly one certificate; a PEM blob carries as many as
-/// it holds, returned in the order they appear. PEM sections that are not
-/// certificates are skipped, so a file holding a chain and its key parses to
-/// the chain alone.
-///
-/// # Errors
-///
-/// Returns [`Error::Tls`] when the blob will not parse, or when a PEM blob
-/// carries no certificate at all.
-pub fn certificates(raw: &[u8]) -> Result<Vec<X509>, Error> {
-    match Format::of(raw) {
-        Format::Der => Ok(vec![X509::from_der(raw).map_err(tls_error)?]),
-        Format::Pem => {
-            let parsed = X509::stack_from_pem(raw).map_err(tls_error)?;
+    /// Parses every certificate in one blob, DER or PEM.
+    ///
+    /// A DER blob carries exactly one certificate; a PEM blob carries as many
+    /// as it holds, returned in the order they appear. PEM sections that are
+    /// not certificates are skipped, so a file holding a chain and its key
+    /// parses to the chain alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Tls`] when the blob will not parse, or when a PEM blob
+    /// carries no certificate at all.
+    pub fn certificates(raw: &[u8]) -> Result<Vec<X509>, Error> {
+        match Self::of(raw) {
+            Self::Der => Ok(vec![X509::from_der(raw).map_err(Error::tls)?]),
+            Self::Pem => {
+                let parsed = X509::stack_from_pem(raw).map_err(Error::tls)?;
 
-            if parsed.is_empty() {
-                return Err(Error::Tls("PEM data carries no certificate".into()));
+                if parsed.is_empty() {
+                    return Err(Error::Tls("PEM data carries no certificate".into()));
+                }
+
+                Ok(parsed)
             }
+        }
+    }
 
-            Ok(parsed)
+    /// [`Format::certificates`] across several blobs, each DER or PEM.
+    ///
+    /// Certificates come back in the order the blobs give them, so a chain may
+    /// arrive as one PEM bundle, as one blob per certificate, or as a mixture
+    /// of the two.
+    ///
+    /// # Errors
+    ///
+    /// As [`Format::certificates`].
+    pub fn certificate_list(blobs: &[Vec<u8>]) -> Result<Vec<X509>, Error> {
+        let mut list = Vec::with_capacity(blobs.len());
+
+        for blob in blobs {
+            list.extend(Self::certificates(blob)?);
+        }
+
+        Ok(list)
+    }
+
+    /// Parses a private key, DER or PEM.
+    ///
+    /// PKCS#8 (`PRIVATE KEY`), PKCS#1 (`RSA PRIVATE KEY`) and SEC1
+    /// (`EC PRIVATE KEY`) are all accepted, in either format; which one it is
+    /// is read off the key itself. A key encrypted under a passphrase is not
+    /// accepted — decrypt it first, or ship it as PKCS#12 and use
+    /// [`Identity::from_pkcs12`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Tls`] when the blob will not parse as any of those.
+    pub fn private_key(raw: &[u8]) -> Result<PKey<Private>, Error> {
+        match Self::of(raw) {
+            Self::Der => PKey::private_key_from_der(raw).map_err(Error::tls),
+            Self::Pem => PKey::private_key_from_pem(raw).map_err(Error::tls),
         }
     }
 }
 
-/// Parses every certificate across several blobs, each DER or PEM.
+/// The TLS details a context is built with, beyond its identity and roots.
 ///
-/// Certificates come back in the order the blobs give them, so a chain may
-/// arrive as one PEM bundle, as one blob per certificate, or as a mixture of
-/// the two.
+/// Every field has a working default, so `TlsConfig::default()` changes
+/// nothing about how a context would otherwise behave: the profile's cipher
+/// suites, BoringSSL's groups, every signature algorithm, the client's suite
+/// order, session tickets on, early data off and certificates uncompressed.
 ///
-/// # Errors
-///
-/// As [`certificates`].
-pub fn certificate_list(blobs: &[Vec<u8>]) -> Result<Vec<X509>, Error> {
-    let mut list = Vec::with_capacity(blobs.len());
+/// The string fields take the OpenSSL list syntax, entries separated by `:`
+/// and most preferred first — the same strings an Nginx `ssl_ciphers`,
+/// `ssl_ecdh_curve` or `SignatureAlgorithms` directive would carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsConfig {
+    /// The cipher suites to allow, for TLS 1.2 and 1.3 in one list.
+    ///
+    /// BoringSSL keeps a built-in preference order for the TLS 1.3 suites, so
+    /// entries naming them are tolerated but change nothing; what this
+    /// restricts and orders is TLS 1.2. `None` keeps the profile's list.
+    pub ciphers: Option<String>,
 
-    for blob in blobs {
-        list.extend(certificates(blob)?);
-    }
+    /// The key exchange groups to offer, most preferred first.
+    ///
+    /// Which names exist — `X25519`, `prime256v1`, `secp384r1`, and the
+    /// post-quantum hybrids — depends on the BoringSSL linked in. `None`
+    /// keeps BoringSSL's defaults.
+    pub groups: Option<String>,
 
-    Ok(list)
+    /// The signature algorithms to accept, as `ecdsa_secp384r1_sha384` names.
+    ///
+    /// `None` accepts everything BoringSSL would.
+    pub signature_algorithms: Option<String>,
+
+    /// Whether the server's suite order wins over the client's.
+    ///
+    /// Read by a server; a client's context ignores it.
+    pub prefer_server_ciphers: bool,
+
+    /// Whether sessions may resume over tickets. On by default; turning it
+    /// off trades resumption away so no ticket key ever protects a past
+    /// session.
+    pub session_tickets: bool,
+
+    /// Whether early data is allowed on a resumed session. Off by default;
+    /// whether a message actually rode in on it shows in
+    /// [`Security::early_data`].
+    pub early_data: bool,
+
+    /// Whether certificates are compressed with zlib, as RFC 8879 describes.
+    ///
+    /// A server compresses what it serves, a client decompresses what it is
+    /// served, and either falls back to plain certificates against a peer
+    /// that does not join in.
+    pub certificate_compression: bool,
 }
 
-/// Parses a private key, DER or PEM.
-///
-/// PKCS#8 (`PRIVATE KEY`), PKCS#1 (`RSA PRIVATE KEY`) and SEC1
-/// (`EC PRIVATE KEY`) are all accepted, in either format; which one it is is
-/// read off the key itself. A key encrypted under a passphrase is not
-/// accepted — decrypt it first, or ship it as PKCS#12 and use
-/// [`Identity::from_pkcs12`].
-///
-/// # Errors
-///
-/// Returns [`Error::Tls`] when the blob will not parse as any of those.
-pub fn private_key(raw: &[u8]) -> Result<PKey<Private>, Error> {
-    match Format::of(raw) {
-        Format::Der => PKey::private_key_from_der(raw).map_err(tls_error),
-        Format::Pem => PKey::private_key_from_pem(raw).map_err(tls_error),
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            ciphers: None,
+            groups: None,
+            signature_algorithms: None,
+            prefer_server_ciphers: false,
+            session_tickets: true,
+            early_data: false,
+            certificate_compression: false,
+        }
     }
 }
 
-/// Points a context at the roots it should verify against.
-///
-/// An empty `roots` leaves the platform's trust store in place; otherwise only
-/// the certificates given are trusted. Each is DER or PEM, so one PEM bundle
-/// of roots is as good as one blob apiece.
-///
-/// # Errors
-///
-/// Returns [`Error::Tls`] when a certificate will not parse or BoringSSL
-/// rejects the store.
-pub fn install_roots(roots: &[Vec<u8>], builder: &mut SslContextBuilder) -> Result<(), Error> {
-    if roots.is_empty() {
-        builder.set_default_verify_paths().map_err(tls_error)?;
-        return Ok(());
+impl TlsConfig {
+    /// Applies every setting to a context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Tls`] when BoringSSL rejects a list — a name it does
+    /// not know, or a list that leaves nothing usable.
+    pub fn install(&self, builder: &mut SslContextBuilder) -> Result<(), Error> {
+        if let Some(ciphers) = &self.ciphers {
+            builder.set_cipher_list(ciphers).map_err(Error::tls)?;
+        }
+
+        if let Some(groups) = &self.groups {
+            builder.set_curves_list(groups).map_err(Error::tls)?;
+        }
+
+        if let Some(algorithms) = &self.signature_algorithms {
+            builder.set_sigalgs_list(algorithms).map_err(Error::tls)?;
+        }
+
+        if self.prefer_server_ciphers {
+            builder.set_options(SslOptions::CIPHER_SERVER_PREFERENCE);
+        }
+
+        if !self.session_tickets {
+            builder.set_options(SslOptions::NO_TICKET);
+        }
+
+        unsafe { boring_sys::SSL_CTX_set_early_data_enabled(builder.as_ptr(), i32::from(self.early_data)) };
+
+        if self.certificate_compression {
+            builder.add_certificate_compression_algorithm(ZlibCertificateCompressor).map_err(Error::tls)?;
+        }
+
+        Ok(())
     }
 
-    let mut store = X509StoreBuilder::new().map_err(tls_error)?;
+    /// Points a context at the roots it should verify against.
+    ///
+    /// An empty `roots` leaves the platform's trust store in place; otherwise
+    /// only the certificates given are trusted. Each is DER or PEM, so one PEM
+    /// bundle of roots is as good as one blob apiece.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Tls`] when a certificate will not parse or BoringSSL
+    /// rejects the store.
+    pub fn install_roots(roots: &[Vec<u8>], builder: &mut SslContextBuilder) -> Result<(), Error> {
+        if roots.is_empty() {
+            builder.set_default_verify_paths().map_err(Error::tls)?;
+            return Ok(());
+        }
 
-    for root in certificate_list(roots)? {
-        store.add_cert(root).map_err(tls_error)?;
+        let mut store = X509StoreBuilder::new().map_err(Error::tls)?;
+
+        for root in Format::certificate_list(roots)? {
+            store.add_cert(root).map_err(Error::tls)?;
+        }
+
+        builder.set_verify_cert_store(store.build()).map_err(Error::tls)?;
+        Ok(())
     }
 
-    builder.set_verify_cert_store(store.build()).map_err(tls_error)?;
-    Ok(())
+    /// Builds the TLS configuration a client dials with.
+    ///
+    /// An empty `roots` uses the platform's trust store; otherwise only the
+    /// certificates given are trusted, each in DER or PEM. Certificates are
+    /// verified either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Tls`] when BoringSSL rejects the configuration or a
+    /// certificate will not parse.
+    pub fn client(&self, roots: &[Vec<u8>], versions: &[Version]) -> Result<SslConnector, Error> {
+        let mut builder = SslConnector::builder(SslMethod::tls()).map_err(Error::tls)?;
+        builder.set_alpn_protos(&Alpn::wire(versions)).map_err(Error::tls)?;
+        Self::install_roots(roots, &mut builder)?;
+        self.install(&mut builder)?;
+
+        Ok(builder.build())
+    }
+
+    /// Builds the TLS configuration a server accepts with.
+    ///
+    /// A handshake offering none of `versions` is failed rather than completed
+    /// without a protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Tls`] when the identity carries no certificate, when a
+    /// certificate or key will not parse, or when BoringSSL rejects the
+    /// configuration.
+    pub fn server(&self, identity: &Identity, versions: &[Version], ech: Option<&EchKeys>) -> Result<SslAcceptor, Error> {
+        let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).map_err(Error::tls)?;
+        identity.install(&mut builder)?;
+        self.install(&mut builder)?;
+
+        let offered = Alpn::list(versions);
+        builder.set_alpn_select_callback(move |_ssl, client| Alpn::select(&offered, client).ok_or(AlpnError::NOACK));
+
+        if let Some(ech) = ech {
+            ech.install(&builder)?;
+        }
+
+        Ok(builder.build())
+    }
+
+    /// Builds the TLS context a QUIC client uses.
+    ///
+    /// The server's certificate is verified, against the platform trust store
+    /// when `roots` is empty.
+    ///
+    /// # Errors
+    ///
+    /// As [`TlsConfig::client`].
+    pub fn quic_client(&self, roots: &[Vec<u8>]) -> Result<SslContextBuilder, Error> {
+        let mut builder = SslContextBuilder::new(SslMethod::tls()).map_err(Error::tls)?;
+        Self::install_roots(roots, &mut builder)?;
+        self.install(&mut builder)?;
+
+        builder.set_verify(SslVerifyMode::PEER);
+        Ok(builder)
+    }
+
+    /// Builds the TLS context a QUIC server uses.
+    ///
+    /// No ALPN callback is installed: `tokio-quiche` handles ALPN itself from
+    /// the list in its settings. Peer certificates are not requested, since
+    /// HTTP/3 clients do not present them.
+    ///
+    /// # Errors
+    ///
+    /// As [`TlsConfig::server`].
+    pub fn quic_server(&self, identity: &Identity, ech: Option<&EchKeys>) -> Result<SslContextBuilder, Error> {
+        let mut builder = SslContextBuilder::new(SslMethod::tls()).map_err(Error::tls)?;
+        identity.install(&mut builder)?;
+        self.install(&mut builder)?;
+        builder.set_verify(SslVerifyMode::NONE);
+
+        if let Some(ech) = ech {
+            ech.install(&builder)?;
+        }
+
+        Ok(builder)
+    }
 }
 
-/// Builds the TLS configuration a client dials with.
+/// Certificate compression with zlib, as RFC 8879 assigns it.
 ///
-/// An empty `roots` uses the platform's trust store; otherwise only the
-/// certificates given are trusted, each in DER or PEM. Certificates are
-/// verified either way.
-///
-/// # Errors
-///
-/// Returns [`Error::Tls`] when BoringSSL rejects the configuration or a
-/// certificate will not parse.
-pub fn client_config(roots: &[Vec<u8>], versions: &[Version]) -> Result<SslConnector, Error> {
-    let mut builder = SslConnector::builder(SslMethod::tls()).map_err(tls_error)?;
-    builder.set_alpn_protos(&alpn_wire(versions)).map_err(tls_error)?;
-    install_roots(roots, &mut builder)?;
+/// Works in both directions, so the one algorithm serves a server, which
+/// compresses, and a client, which decompresses. [`TlsConfig::install`]
+/// registers it when [`TlsConfig::certificate_compression`] asks for it.
+pub struct ZlibCertificateCompressor;
 
-    Ok(builder.build())
-}
+impl CertificateCompressor for ZlibCertificateCompressor {
+    const ALGORITHM: CertificateCompressionAlgorithm = CertificateCompressionAlgorithm::ZLIB;
+    const CAN_COMPRESS: bool = true;
+    const CAN_DECOMPRESS: bool = true;
 
-/// Builds the TLS configuration a server accepts with.
-///
-/// A handshake offering none of `versions` is failed rather than completed
-/// without a protocol.
-///
-/// # Errors
-///
-/// Returns [`Error::Tls`] when the identity carries no certificate, when a
-/// certificate or key will not parse, or when BoringSSL rejects the
-/// configuration.
-pub fn server_config(identity: &Identity, versions: &[Version], ech: Option<&EchKeys>) -> Result<SslAcceptor, Error> {
-    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).map_err(tls_error)?;
-    identity.install(&mut builder)?;
-
-    let offered = alpn(versions);
-    builder.set_alpn_select_callback(move |_ssl, client| select_alpn(&offered, client).ok_or(AlpnError::NOACK));
-
-    if let Some(ech) = ech {
-        ech.install(&builder)?;
+    fn compress<W: Write>(&self, input: &[u8], output: &mut W) -> std::io::Result<()> {
+        let mut encoder = flate2::write::ZlibEncoder::new(output, flate2::Compression::default());
+        encoder.write_all(input)?;
+        encoder.finish()?;
+        Ok(())
     }
 
-    Ok(builder.build())
+    fn decompress<W: Write>(&self, input: &[u8], output: &mut W) -> std::io::Result<()> {
+        let mut decoder = flate2::write::ZlibDecoder::new(output);
+        decoder.write_all(input)?;
+        decoder.finish()?;
+        Ok(())
+    }
 }
 
 /// A certificate chain and the private key that goes with it.
@@ -331,8 +527,8 @@ impl Identity {
     /// does not open it, it carries no certificate for its key, or its
     /// contents will not re-encode.
     pub fn from_pkcs12(raw: &[u8], passphrase: &str) -> Result<Self, Error> {
-        let archive = Pkcs12::from_der(raw).map_err(tls_error)?;
-        let passphrase = std::ffi::CString::new(passphrase).map_err(tls_error)?;
+        let archive = Pkcs12::from_der(raw).map_err(Error::tls)?;
+        let passphrase = std::ffi::CString::new(passphrase).map_err(Error::tls)?;
 
         let mut key = std::ptr::null_mut();
         let mut leaf = std::ptr::null_mut();
@@ -345,20 +541,20 @@ impl Identity {
         let rest = (!rest.is_null()).then(|| unsafe { Stack::<X509>::from_ptr(rest) });
 
         if opened != 1 {
-            return Err(tls_error(boring::error::ErrorStack::get()));
+            return Err(Error::tls(boring::error::ErrorStack::get()));
         }
 
         let (Some(key), Some(leaf)) = (key, leaf) else {
             return Err(Error::Tls("the PKCS#12 archive carries no certificate for its key".into()));
         };
 
-        let mut certificates = vec![leaf.to_der().map_err(tls_error)?];
+        let mut certificates = vec![leaf.to_der().map_err(Error::tls)?];
 
         for extra in rest.into_iter().flatten() {
-            certificates.push(extra.to_der().map_err(tls_error)?);
+            certificates.push(extra.to_der().map_err(Error::tls)?);
         }
 
-        Ok(Self { certificates, key: key.private_key_to_der_pkcs8().map_err(tls_error)? })
+        Ok(Self { certificates, key: key.private_key_to_der_pkcs8().map_err(Error::tls)? })
     }
 
     /// The chain as parsed certificates, leaf first.
@@ -367,7 +563,7 @@ impl Identity {
     ///
     /// Returns [`Error::Tls`] when a certificate will not parse.
     pub fn chain(&self) -> Result<Vec<X509>, Error> {
-        certificate_list(&self.certificates)
+        Format::certificate_list(&self.certificates)
     }
 
     /// The private key, parsed.
@@ -376,7 +572,7 @@ impl Identity {
     ///
     /// Returns [`Error::Tls`] when the key will not parse.
     pub fn private_key(&self) -> Result<PKey<Private>, Error> {
-        private_key(&self.key)
+        Format::private_key(&self.key)
     }
 
     /// Gives a context the chain and key to serve.
@@ -388,14 +584,14 @@ impl Identity {
     pub fn install(&self, builder: &mut SslContextBuilder) -> Result<(), Error> {
         let mut chain = self.chain()?.into_iter();
         let leaf = chain.next().ok_or_else(|| Error::Tls("identity has no certificate".into()))?;
-        builder.set_certificate(&leaf).map_err(tls_error)?;
+        builder.set_certificate(&leaf).map_err(Error::tls)?;
 
         for extra in chain {
-            builder.add_extra_chain_cert(extra).map_err(tls_error)?;
+            builder.add_extra_chain_cert(extra).map_err(Error::tls)?;
         }
 
         let key = self.private_key()?;
-        builder.set_private_key(&key).map_err(tls_error)?;
+        builder.set_private_key(&key).map_err(Error::tls)?;
         Ok(())
     }
 }
@@ -596,10 +792,10 @@ impl EchKeys {
     ///
     /// Returns [`Error::Tls`] when BoringSSL rejects the key or the config.
     pub fn install(&self, builder: &SslContextBuilder) -> Result<(), Error> {
-        let key = HpkeKey::dhkem_p256_sha256(&self.private_key).map_err(tls_error)?;
-        let mut keys = SslEchKeys::builder().map_err(tls_error)?;
-        keys.add_key(true, &self.config, key).map_err(tls_error)?;
-        builder.set_ech_keys(&keys.build()).map_err(tls_error)?;
+        let key = HpkeKey::dhkem_p256_sha256(&self.private_key).map_err(Error::tls)?;
+        let mut keys = SslEchKeys::builder().map_err(Error::tls)?;
+        keys.add_key(true, &self.config, key).map_err(Error::tls)?;
+        builder.set_ech_keys(&keys.build()).map_err(Error::tls)?;
         Ok(())
     }
 }
@@ -627,77 +823,3 @@ impl EchStatus {
     }
 }
 
-/// Builds the TLS context a QUIC server uses.
-///
-/// No ALPN callback is installed: `tokio-quiche` handles ALPN itself from the
-/// list in its settings. Peer certificates are not requested, since HTTP/3
-/// clients do not present them.
-///
-/// # Errors
-///
-/// As [`server_config`].
-pub fn quic_server_context(identity: &Identity, ech: Option<&EchKeys>) -> Result<SslContextBuilder, Error> {
-    let mut builder = SslContextBuilder::new(SslMethod::tls()).map_err(tls_error)?;
-    identity.install(&mut builder)?;
-    builder.set_verify(SslVerifyMode::NONE);
-
-    if let Some(ech) = ech {
-        ech.install(&builder)?;
-    }
-
-    Ok(builder)
-}
-
-/// Builds the TLS context a QUIC client uses.
-///
-/// The server's certificate is verified, against the platform trust store when
-/// `roots` is empty.
-///
-/// # Errors
-///
-/// As [`client_config`].
-pub fn quic_client_context(roots: &[Vec<u8>]) -> Result<SslContextBuilder, Error> {
-    let mut builder = SslContextBuilder::new(SslMethod::tls()).map_err(tls_error)?;
-    install_roots(roots, &mut builder)?;
-
-    builder.set_verify(SslVerifyMode::PEER);
-    Ok(builder)
-}
-
-/// Gives a QUIC server its TLS context.
-///
-/// `tokio-quiche` would otherwise load certificates from paths on disk; this
-/// hook supplies a context built from an in-memory [`Identity`] instead, which
-/// is also the only way to install ECH keys.
-pub struct QuicServerTls {
-    /// The certificate chain and key to serve.
-    pub identity: Identity,
-    /// The ECH keys, if the server offers ECH.
-    pub ech: Option<EchKeys>,
-}
-
-impl tokio_quiche::quic::ConnectionHook for QuicServerTls {
-    /// Builds the context, ignoring the certificate paths in the settings.
-    ///
-    /// A failure returns `None`, which `tokio-quiche` turns into a failed
-    /// connection.
-    fn create_custom_ssl_context_builder(&self, _settings: tokio_quiche::settings::TlsCertificatePaths<'_>) -> Option<SslContextBuilder> {
-        quic_server_context(&self.identity, self.ech.as_ref()).ok()
-    }
-}
-
-/// Gives a QUIC client its TLS context.
-pub struct QuicClientTls {
-    /// The trusted roots, each DER or PEM; empty uses the platform trust store.
-    pub roots: Vec<Vec<u8>>,
-}
-
-impl tokio_quiche::quic::ConnectionHook for QuicClientTls {
-    /// Builds the context, ignoring the certificate paths in the settings.
-    ///
-    /// A failure returns `None`, which `tokio-quiche` turns into a failed
-    /// connection.
-    fn create_custom_ssl_context_builder(&self, _settings: tokio_quiche::settings::TlsCertificatePaths<'_>) -> Option<SslContextBuilder> {
-        quic_client_context(&self.roots).ok()
-    }
-}

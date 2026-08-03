@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
-use soyokaze::helpers::hpack::HeaderField;
-use soyokaze::api::common::Limits;
+use soyokaze::helpers::fields::HeaderField;
+use soyokaze::models::Limits;
 use soyokaze::models::{Body, ConnectionID, Headers, Message, Role, StreamID, Version};
 use soyokaze::protocol::h3::{Frame, H3Connection, H3Session, Settings, StreamState};
 use support::{opaque, Group};
@@ -168,7 +168,7 @@ fn deadline(group: &mut Group) {
         let mut session = server();
         held_streams(&mut session, held);
 
-        let (_connection, worker) = H3Connection::pair(session, None);
+        let (_connection, worker) = H3Connection::pair(session);
         group.bench(&format!("block_deadline ({held} streams held)"), || opaque(&worker).block_deadline());
     }
 

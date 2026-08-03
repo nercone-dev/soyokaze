@@ -3,12 +3,13 @@ mod harness;
 use std::time::{Duration, Instant};
 
 use soyokaze::helpers::base64::{self, DecodeError};
-use soyokaze::helpers::hsts::{HstsPolicy, HstsStore};
+use soyokaze::hsts::{HstsPolicy, HstsStore};
 use soyokaze::helpers::scan;
 use soyokaze::helpers::sha1::{self, Sha1};
 use soyokaze::models::{Headers, Message, Version};
+use soyokaze::protocol::common::Fields;
 use soyokaze::protocol::h1;
-use soyokaze::{http_date, DateCache};
+use soyokaze::DateCache;
 
 const VECTORS: &[(&[u8], &str)] = &[
     (b"", ""),
@@ -189,10 +190,10 @@ fn hsts_never_applies_to_an_address_literal() {
 
 #[test]
 fn http_date_formats_the_imf_fixdate_form() {
-    assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
-    assert_eq!(http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
-    assert_eq!(http_date(1_382_386_401), "Mon, 21 Oct 2013 20:13:21 GMT");
-    assert_eq!(http_date(951_782_400), "Tue, 29 Feb 2000 00:00:00 GMT");
+    assert_eq!(DateCache::format(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+    assert_eq!(DateCache::format(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
+    assert_eq!(DateCache::format(1_382_386_401), "Mon, 21 Oct 2013 20:13:21 GMT");
+    assert_eq!(DateCache::format(951_782_400), "Tue, 29 Feb 2000 00:00:00 GMT");
 }
 
 #[test]
@@ -210,7 +211,7 @@ fn a_response_gains_a_date_and_a_server_field() {
     let cache = DateCache::new();
     let mut response = Message::response(200, Version::V1_1);
 
-    soyokaze::finalizer::finalize_response(&mut response, &cache, None);
+    response.finalize_response(&cache, None);
 
     let headers = response.headers.as_ref().expect("the response lost its fields");
     assert!(headers.contains("date"));
@@ -228,7 +229,7 @@ fn finalizing_leaves_fields_the_handler_already_set() {
     let mut response = Message::response(200, Version::V1_1);
     response.headers = Some(headers);
 
-    soyokaze::finalizer::finalize_response(&mut response, &cache, None);
+    response.finalize_response(&cache, None);
 
     let headers = response.headers.as_ref().expect("the response lost its fields");
     assert_eq!(headers.get("date"), Some("Thu, 01 Jan 1970 00:00:00 GMT"));
@@ -241,7 +242,7 @@ fn an_informational_response_is_left_alone() {
     let cache = DateCache::new();
     let mut response = Message::response(103, Version::V2_0);
 
-    soyokaze::finalizer::finalize_response(&mut response, &cache, None);
+    response.finalize_response(&cache, None);
 
     let headers = response.headers.as_ref().expect("the response lost its fields");
     assert!(!headers.contains("date"), "an informational response must not carry a Date");
@@ -253,12 +254,12 @@ fn hsts_is_only_advertised_on_a_secure_response() {
     let policy = HstsPolicy::new(600);
 
     let mut plain = Message::response(200, Version::V1_1);
-    soyokaze::finalizer::finalize_response(&mut plain, &cache, Some(&policy));
+    plain.finalize_response(&cache, Some(&policy));
     assert!(!plain.headers.as_ref().is_some_and(|headers| headers.contains("strict-transport-security")));
 
     let mut secure = Message::response(200, Version::V1_1);
-    secure.secure = true;
-    soyokaze::finalizer::finalize_response(&mut secure, &cache, Some(&policy));
+    secure.security.secure = true;
+    secure.finalize_response(&cache, Some(&policy));
     assert_eq!(
         secure.headers.as_ref().and_then(|headers| headers.get("strict-transport-security")),
         Some("max-age=600"),
@@ -266,15 +267,51 @@ fn hsts_is_only_advertised_on_a_secure_response() {
 }
 
 #[test]
-fn a_request_gains_a_host_field_on_http_1() {
+fn a_request_gains_the_authority_it_was_dialled_with() {
+    // RFC 9112 §3.2 requires Host on every HTTP/1.1 request.
     let mut request = Message::request(soyokaze::Method::GET, "/", Version::V1_1);
-    soyokaze::finalizer::finalize_request(&mut request, "example.test:8443");
+    request.finalize_request("example.test:8443");
+    assert_eq!(
+        request.headers.as_ref().and_then(|headers| headers.get("host")),
+        Some("example.test:8443"),
+        "an HTTP/1.1 request must carry the authority it was dialled with",
+    );
 
-    assert_eq!(request.headers.as_ref().and_then(|headers| headers.get("host")), Some("example.test:8443"));
+    // RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require the same authority, framed
+    // as :authority rather than Host — which is what Fields::of does with it,
+    // so every version has to be given one.
+    for version in [Version::V2_0, Version::V3_0] {
+        let mut later = Message::request(soyokaze::Method::GET, "/", version);
+        later.finalize_request("example.test");
 
-    let mut later = Message::request(soyokaze::Method::GET, "/", Version::V2_0);
-    soyokaze::finalizer::finalize_request(&mut later, "example.test");
-    assert!(!later.headers.as_ref().is_some_and(|headers| headers.contains("host")));
+        let fields = Fields::of(&later).expect("a well-formed request did not frame");
+        assert!(
+            fields.iter().any(|field| field.name == ":authority" && field.value == "example.test"),
+            "{version} must carry the authority as :authority",
+        );
+        assert!(
+            !fields.iter().any(|field| field.name == "host"),
+            "{version} must not carry the authority as Host as well",
+        );
+    }
+
+    // Nothing the caller set is overwritten.
+    let mut chosen = Message::request(soyokaze::Method::GET, "/", Version::V1_1);
+    chosen.headers.get_or_insert_with(Headers::new).append("host", "chosen.test");
+    chosen.finalize_request("example.test");
+    assert_eq!(
+        chosen.headers.as_ref().and_then(|headers| headers.get("host")),
+        Some("chosen.test"),
+        "an authority the caller set must not be replaced",
+    );
+
+    // Only a request carries an authority.
+    let mut response = Message::response(200, Version::V1_1);
+    response.finalize_request("example.test");
+    assert!(
+        !response.headers.as_ref().is_some_and(|headers| headers.contains("host")),
+        "a response must not gain an authority",
+    );
 }
 
 #[test]
@@ -374,7 +411,7 @@ fn the_field_value_classifier_agrees_with_a_byte_at_a_time_reading() {
 #[test]
 fn a_field_value_carrying_obs_text_still_parses() {
     let block = b"x-note: caf\xc3\xa9\r\nx-broken: caf\xe9\r\n";
-    let headers = h1::parse_header_block(block, 100).expect("obs-text is allowed in a field value");
+    let headers = h1::Field::parse_block(block, 100).expect("obs-text is allowed in a field value");
 
     assert_eq!(headers.get("x-note"), Some("café"), "valid UTF-8 obs-text was not kept");
     assert_eq!(headers.get("x-broken"), Some("caf\u{fffd}"), "invalid UTF-8 obs-text was not replaced");
@@ -418,4 +455,46 @@ fn the_octet_class_check_agrees_with_a_byte_at_a_time_reading() {
             assert_eq!(scan::all_in_class(&text, &table, 1), naive(&text, 1), "{text:?}");
         }
     }
+}
+
+#[tokio::test]
+async fn how_much_room_a_read_is_given_follows_the_limit_it_was_configured_with() {
+    use soyokaze::protocol::common::Buffer;
+
+    // Each read is measured on a fresh buffer, so what is seen is the room the
+    // read was given rather than whatever capacity a grown buffer happened to
+    // have left over.
+    async fn first_read(chunk_size: usize) -> usize {
+        let mut buffer = Buffer::with_chunk_size(chunk_size);
+        assert_eq!(buffer.chunk_size(), chunk_size.max(1), "the buffer did not take the size it was given");
+
+        let (mut writer, mut reader) = tokio::io::duplex(1 << 20);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = writer.write_all(&vec![0u8; 1 << 20]).await;
+        });
+
+        assert!(buffer.fill(&mut reader, 5.0).await.expect("the read failed"), "nothing was read");
+        buffer.len()
+    }
+
+    // The size is a tunable and not a constant: a connection told to read in
+    // small pieces must actually do so, and one told to read in large pieces
+    // must reach them. The first read is a CHUNK_RAMP-th of the size, so a
+    // small message costs a small read.
+    let sizes = [1024usize, 16 * 1024, 256 * 1024];
+    let mut previous = 0;
+
+    for size in sizes {
+        let read = first_read(size).await;
+
+        assert!(read >= size / Buffer::CHUNK_RAMP, "a size of {size} gave its first read only {read} octets");
+        assert!(read > previous, "a size of {size} read {read} octets, no more than the {previous} a smaller size did");
+        previous = read;
+    }
+
+    // A size of zero would ask for nothing at all, so it is floored rather than
+    // leaving a connection unable to read.
+    assert!(Buffer::with_chunk_size(0).chunk_size() >= 1, "a zero size must not stop reads entirely");
+    assert!(first_read(0).await >= 1, "a zero size must still read");
 }

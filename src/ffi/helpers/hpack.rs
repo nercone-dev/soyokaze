@@ -1,98 +1,16 @@
 //! HPACK, the HTTP/2 field compression format, from C.
 //!
-//! [`Field`] carries one name and value pair in, and [`Fields`] carries a
-//! decoded block back out; QPACK borrows both, the way
-//! [`crate::helpers::qpack`] borrows [`HeaderField`] from
-//! [`crate::helpers::hpack`]. An encoder and a decoder are stateful — each
-//! keeps a dynamic table — so one handle serves one connection's lifetime,
-//! blocks fed in the order they travel.
+//! Fields cross as [`Field`] in and [`Fields`] out, the shared vocabulary in
+//! [`crate::ffi::helpers::fields`]. An encoder and a decoder are stateful —
+//! each keeps a dynamic table — so one handle serves one connection's
+//! lifetime, blocks fed in the order they travel.
 
 use crate::ffi::errors::{ErrorHandle, Status};
-use crate::ffi::{borrow, borrow_text, Buffer, Slice};
-use crate::helpers::hpack::{Decoder, Encoder, HeaderField};
+use crate::ffi::helpers::fields::{parse_fields, Field, Fields};
+use crate::ffi::{borrow, Buffer};
+use crate::helpers::hpack::{Decoder, Encoder};
 
-/// One field going in: a name and a value.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Field {
-    /// The field name.
-    pub name: Slice,
-    /// The field value.
-    pub value: Slice,
-}
-
-/// Reads `count` fields out of a C array.
-///
-/// `None` when the array is null with a non-zero count, or any name or value
-/// is null or not UTF-8.
-///
-/// # Safety
-///
-/// `fields` must either be null or point to `count` readable [`Field`] values
-/// whose own pointers are valid.
-pub unsafe fn parse_fields(fields: *const Field, count: usize) -> Option<Vec<HeaderField>> {
-    if fields.is_null() {
-        return (count == 0).then(Vec::new);
-    }
-
-    let mut parsed = Vec::with_capacity(count);
-
-    for index in 0..count {
-        let field = unsafe { *fields.add(index) };
-        let name = unsafe { borrow_text(field.name.data, field.name.len) }?;
-        let value = unsafe { borrow_text(field.value.data, field.value.len) }?;
-        parsed.push(HeaderField::new(name, value));
-    }
-
-    Some(parsed)
-}
-
-/// A decoded field section, as a decoder hands it back.
-pub struct Fields(pub Vec<HeaderField>);
-
-/// Releases a [`Fields`].
-///
-/// # Safety
-///
-/// `fields` must come from a decode call and not have been freed.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_fields_free(fields: *mut Fields) {
-    if !fields.is_null() {
-        drop(unsafe { Box::from_raw(fields) });
-    }
-}
-
-/// How many fields the section holds.
-///
-/// # Safety
-///
-/// `fields` must either be null or be a handle that has not been freed.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_fields_count(fields: *const Fields) -> usize {
-    unsafe { fields.as_ref() }.map_or(0, |fields| fields.0.len())
-}
-
-/// The name of the field at `index`, borrowed from `fields`.
-///
-/// # Safety
-///
-/// As [`soyokaze_fields_count`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_fields_name(fields: *const Fields, index: usize) -> Slice {
-    Slice::maybe(unsafe { fields.as_ref() }.and_then(|fields| fields.0.get(index)).map(|field| field.name.as_str()))
-}
-
-/// The value of the field at `index`, borrowed from `fields`.
-///
-/// # Safety
-///
-/// As [`soyokaze_fields_count`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_fields_value(fields: *const Fields, index: usize) -> Slice {
-    Slice::maybe(unsafe { fields.as_ref() }.and_then(|fields| fields.0.get(index)).map(|field| field.value.as_str()))
-}
-
-/// Builds an HPACK encoder with the default dynamic table size.
+/// Builds an HPACK encoder with the default dynamic table capacity.
 #[unsafe(no_mangle)]
 pub extern "C" fn soyokaze_hpack_encoder_new() -> *mut Encoder {
     Box::into_raw(Box::new(Encoder::new()))
@@ -111,18 +29,35 @@ pub unsafe extern "C" fn soyokaze_hpack_encoder_free(encoder: *mut Encoder) {
     }
 }
 
-/// Caps the encoder's dynamic table, as a `SETTINGS_HEADER_TABLE_SIZE` would.
+/// Records the peer's `SETTINGS_HEADER_TABLE_SIZE`.
+///
+/// The encoder may never size its table above this.
 ///
 /// # Safety
 ///
 /// `encoder` must either be null or be a handle that has not been freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_hpack_encoder_set_dynamic_table_size(encoder: *mut Encoder, max_size: usize) -> bool {
+pub unsafe extern "C" fn soyokaze_hpack_encoder_set_max_capacity(encoder: *mut Encoder, max_capacity: usize) -> bool {
     let Some(encoder) = (unsafe { encoder.as_mut() }) else {
         return false;
     };
 
-    encoder.set_dynamic_table_size(max_size);
+    encoder.set_max_capacity(max_capacity);
+    true
+}
+
+/// Bounds the capacity the encoder keeps, whatever the peer permits.
+///
+/// # Safety
+///
+/// As [`soyokaze_hpack_encoder_set_max_capacity`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_hpack_encoder_set_capacity_limit(encoder: *mut Encoder, capacity_limit: usize) -> bool {
+    let Some(encoder) = (unsafe { encoder.as_mut() }) else {
+        return false;
+    };
+
+    encoder.set_capacity_limit(capacity_limit);
     true
 }
 
@@ -180,18 +115,18 @@ pub unsafe extern "C" fn soyokaze_hpack_decoder_set_max_decoded_size(decoder: *m
     true
 }
 
-/// Caps the decoder's dynamic table, as a `SETTINGS_HEADER_TABLE_SIZE` would.
+/// Records this side's advertised `SETTINGS_HEADER_TABLE_SIZE`.
 ///
 /// # Safety
 ///
 /// As [`soyokaze_hpack_decoder_set_max_decoded_size`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_hpack_decoder_set_dynamic_table_size(decoder: *mut Decoder, max_size: usize) -> bool {
+pub unsafe extern "C" fn soyokaze_hpack_decoder_set_max_capacity(decoder: *mut Decoder, max_capacity: usize) -> bool {
     let Some(decoder) = (unsafe { decoder.as_mut() }) else {
         return false;
     };
 
-    decoder.set_dynamic_table_size(max_size);
+    decoder.set_max_capacity(max_capacity);
     true
 }
 

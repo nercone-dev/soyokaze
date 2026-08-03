@@ -1,4 +1,4 @@
-use soyokaze::helpers::hpack::HeaderField;
+use soyokaze::helpers::fields::HeaderField;
 
 pub const NAMES: &[&str] = &[
     ":method",

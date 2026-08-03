@@ -3,7 +3,7 @@ mod support;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use soyokaze::api::common::Limits;
+use soyokaze::models::Limits;
 use soyokaze::models::{Body, ConnectionID, Message, Role, Version};
 use soyokaze::protocol::base::Connection;
 use soyokaze::protocol::h1::H1Connection;

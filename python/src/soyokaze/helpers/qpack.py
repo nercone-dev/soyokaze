@@ -11,7 +11,7 @@ import ctypes
 from .. import ffi
 from ..errors import InvalidError, error_out, raise_for
 from ..ffi import library
-from .hpack import fields_argument, fields_taken
+from .fields import fields_argument, fields_taken
 
 class Encoder:
     """A QPACK encoder with its dynamic table and instruction stream."""
@@ -25,23 +25,35 @@ class Encoder:
             self.handle = None
 
     def set_max_capacity(self, max_capacity):
-        """Records the peer's ``SETTINGS_QPACK_MAX_TABLE_CAPACITY``."""
-        library.soyokaze_qpack_encoder_set_max_capacity(self.handle, max_capacity)
+        """Records the peer's ``SETTINGS_QPACK_MAX_TABLE_CAPACITY``.
+
+        Returns the instruction octets announcing the new capacity — send
+        them down the encoder stream — or empty octets when it did not
+        change.
+        """
+        instructions = ffi.Buffer()
+        if not library.soyokaze_qpack_encoder_set_max_capacity(self.handle, max_capacity, ctypes.byref(instructions)):
+            raise InvalidError("the capacity was refused")
+        return ffi.take(instructions)
+
+    def set_capacity_limit(self, capacity_limit):
+        """Bounds the capacity the encoder keeps, whatever the peer permits.
+
+        Returns the instruction octets announcing a shrunk capacity, or
+        empty octets when it did not change.
+        """
+        instructions = ffi.Buffer()
+        if not library.soyokaze_qpack_encoder_set_capacity_limit(self.handle, capacity_limit, ctypes.byref(instructions)):
+            raise InvalidError("the capacity limit was refused")
+        return ffi.take(instructions)
 
     def set_max_outstanding_sections(self, max_sections):
         """Caps how many unacknowledged sections the encoder tracks."""
         library.soyokaze_qpack_encoder_set_max_outstanding_sections(self.handle, max_sections)
 
-    def set_capacity(self, capacity):
-        """Sets the dynamic table capacity.
-
-        Returns the instruction octets that announce it — send them down the
-        encoder stream — or empty octets when the capacity did not change.
-        """
-        instructions = ffi.Buffer()
-        if not library.soyokaze_qpack_encoder_set_capacity(self.handle, capacity, ctypes.byref(instructions)):
-            raise InvalidError("the capacity was refused")
-        return ffi.take(instructions)
+    def set_max_instruction_size(self, max_size):
+        """Caps how large a single buffered instruction may grow."""
+        library.soyokaze_qpack_encoder_set_max_instruction_size(self.handle, max_size)
 
     def encode(self, stream_id, fields):
         """Encodes one field section.
@@ -85,6 +97,14 @@ class Decoder:
     def set_max_capacity(self, max_capacity):
         """Records this side's advertised ``SETTINGS_QPACK_MAX_TABLE_CAPACITY``."""
         library.soyokaze_qpack_decoder_set_max_capacity(self.handle, max_capacity)
+
+    def set_max_instruction_size(self, max_size):
+        """Caps how large a single buffered instruction may grow."""
+        library.soyokaze_qpack_decoder_set_max_instruction_size(self.handle, max_size)
+
+    def set_max_blocked_streams(self, max_streams):
+        """Caps how many streams may wait QPACK-blocked at once."""
+        library.soyokaze_qpack_decoder_set_max_blocked_streams(self.handle, max_streams)
 
     def on_encoder_instructions(self, data):
         """Feeds the decoder what arrived on the encoder stream.

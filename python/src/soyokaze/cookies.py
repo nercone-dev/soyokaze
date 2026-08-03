@@ -10,7 +10,7 @@ import ctypes
 import enum
 
 from . import ffi
-from .api.common import limits_argument, limits_pointer
+from .models import limits_argument, limits_pointer
 from .errors import InvalidError, error_out, raise_for
 from .ffi import library
 

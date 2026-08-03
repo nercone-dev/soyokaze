@@ -9,7 +9,7 @@ use bytes::Bytes;
 
 use crate::ffi::errors::{ErrorHandle, Status};
 use crate::ffi::{borrow, borrow_text};
-use crate::headers::SetCookie;
+use crate::cookies::SetCookie;
 use crate::models::{Body, Message, Version};
 
 /// A `200 OK` carrying `body` under the given media type.

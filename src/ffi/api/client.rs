@@ -5,41 +5,15 @@
 //! instead, so several messages may go over one.
 
 use crate::api::client::Client;
-use crate::ffi::api::common::Limits;
+use crate::ffi::models::{parse_versions, role, Limits};
 use crate::ffi::errors::{ErrorHandle, Status};
 use crate::ffi::models::Port;
+use crate::ffi::tls::{EchEntry, TlsConfig};
 use crate::ffi::websocket::WebSocket;
 use crate::ffi::{borrow, borrow_text, Buffer, Runtime, Slice};
 use crate::models::{Message, Method, Role, Url, Version};
 use crate::protocol::base::{AnyConnection, Connection};
 
-/// Reads a version list out of a C array of `soyokaze_version_t` values.
-///
-/// A null `versions` means take the default list. `None` when an entry names
-/// no version.
-///
-/// # Safety
-///
-/// `versions` must either be null or point to `count` readable numbers.
-pub unsafe fn parse_versions(versions: *const i32, count: usize) -> Option<Vec<Version>> {
-    if versions.is_null() {
-        return Some(Vec::new());
-    }
-
-    let mut parsed = Vec::with_capacity(count);
-
-    for index in 0..count {
-        parsed.push(match unsafe { *versions.add(index) } {
-            0 => Version::V1_0,
-            1 => Version::V1_1,
-            2 => Version::V2_0,
-            3 => Version::V3_0,
-            _ => return None,
-        });
-    }
-
-    Some(parsed)
-}
 
 /// The limits a client applies on top of the per-message [`Limits`].
 ///
@@ -74,20 +48,6 @@ pub extern "C" fn soyokaze_client_limits_default() -> ClientLimits {
     ClientLimits { message: Limits::build(&limits.message), connection_timeout: limits.connection_timeout }
 }
 
-/// One host's ECH configuration list.
-///
-/// A host of `*` applies wherever no exact entry matches, as
-/// [`ClientConfig::ech`] documents.
-///
-/// [`ClientConfig::ech`]: crate::api::client::ClientConfig::ech
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct EchEntry {
-    /// The host the list applies to.
-    pub host: Slice,
-    /// The `ECHConfigList`, as `soyokaze_ech_keys_config_list` produces it.
-    pub config_list: Slice,
-}
 
 /// How a [`Client`] is configured.
 ///
@@ -121,6 +81,10 @@ pub struct ClientConfig {
     /// How many entries `roots` holds.
     pub root_count: usize,
 
+    /// The TLS details every context is built with. Null takes every default,
+    /// as `soyokaze_tls_config_default` hands them out.
+    pub tls: *const TlsConfig,
+
     /// The ECH configuration lists to use when dialling each host.
     pub ech: *const EchEntry,
     /// How many entries `ech` holds.
@@ -138,6 +102,7 @@ impl ClientConfig {
         hsts: true,
         roots: std::ptr::null(),
         root_count: 0,
+        tls: std::ptr::null(),
         ech: std::ptr::null(),
         ech_count: 0,
     };
@@ -145,7 +110,8 @@ impl ClientConfig {
     /// The [`Client`] this configures.
     ///
     /// `None` when an entry is unusable: a number that names no version, a
-    /// null root, or an ECH host that is null or not UTF-8.
+    /// null root, a TLS list that is not UTF-8, or an ECH host that is null
+    /// or not UTF-8.
     ///
     /// # Safety
     ///
@@ -175,6 +141,10 @@ impl ClientConfig {
                 roots.push(unsafe { borrow(slice.data, slice.len) }?.to_vec());
             }
             config.roots = Some(roots);
+        }
+
+        if let Some(tls) = unsafe { self.tls.as_ref() } {
+            config.tls = unsafe { tls.parse() }?;
         }
 
         if !self.ech.is_null() {
@@ -471,20 +441,6 @@ pub unsafe extern "C" fn soyokaze_connection_role(connection: *const AnyConnecti
     }
 }
 
-/// The `soyokaze_role_t` number for a [`Role`].
-///
-/// The two enums are kept in the same order, so this is the crate's own
-/// grading rather than a narrowing of it: a caller can still tell a proxy from
-/// a user agent, and a tunnel from either.
-pub fn role(role: Role) -> u32 {
-    match role {
-        Role::UserAgent => 0,
-        Role::Origin => 1,
-        Role::Proxy => 2,
-        Role::Gateway => 3,
-        Role::Tunnel => 4,
-    }
-}
 
 /// The connection's identifier, owned by the caller.
 ///
@@ -569,9 +525,10 @@ pub unsafe extern "C" fn soyokaze_connection_receive(runtime: *mut Runtime, conn
 ///
 /// `runtime` must be a handle that has not been freed, `connection` must be
 /// one the caller owns, `authority` and `target` must point to their stated
-/// number of readable octets, and `out` must be writable.
+/// number of readable octets, `limits` must be null or readable, and `out`
+/// must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_connection_open_websocket(runtime: *mut Runtime, connection: *mut AnyConnection, authority: *const u8, authority_len: usize, target: *const u8, target_len: usize, out: *mut *mut WebSocket, error: *mut *mut ErrorHandle) -> Status {
+pub unsafe extern "C" fn soyokaze_connection_open_websocket(runtime: *mut Runtime, connection: *mut AnyConnection, authority: *const u8, authority_len: usize, target: *const u8, target_len: usize, limits: *const crate::ffi::models::Limits, out: *mut *mut WebSocket, error: *mut *mut ErrorHandle) -> Status {
     if connection.is_null() {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     }
@@ -590,7 +547,9 @@ pub unsafe extern "C" fn soyokaze_connection_open_websocket(runtime: *mut Runtim
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     }
 
-    match runtime.0.block_on(connection.open_websocket(authority, target)) {
+    let limits = unsafe { crate::ffi::models::Limits::or_default(limits) };
+
+    match runtime.0.block_on(connection.open_websocket(authority, target, limits)) {
         Ok(socket) => {
             unsafe { *out = Box::into_raw(Box::new(WebSocket { connection: socket, handle: runtime.0.handle().clone() })) };
             Status::Ok

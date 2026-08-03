@@ -7,10 +7,10 @@ server builds one to send, a client parses one it received — and
 
 import ctypes
 
-from .. import ffi
-from ..api.common import limits_argument, limits_pointer
-from ..errors import ProtocolError
-from ..ffi import library
+from . import ffi
+from .models import limits_argument, limits_pointer
+from .errors import ProtocolError
+from .ffi import library
 
 class HstsPolicy:
     """One ``Strict-Transport-Security`` policy."""

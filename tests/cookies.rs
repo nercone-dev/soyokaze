@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
-use soyokaze::headers::{self, StoredCookie};
-use soyokaze::models::{Headers, Url, Version};
+use soyokaze::cookies::{self, StoredCookie};
+use soyokaze::models::Url;
 use soyokaze::{Cookie, CookieJar, SameSite, SetCookie};
 
 fn url(text: &str) -> Url {
@@ -110,22 +110,22 @@ fn same_site_values_round_trip() {
 
 #[test]
 fn paths_match_by_segment() {
-    assert!(headers::path_matches("/app", "/app"));
-    assert!(headers::path_matches("/app/page", "/app"));
-    assert!(headers::path_matches("/app/page", "/app/"));
-    assert!(headers::path_matches("/app?q=1", "/app"));
-    assert!(headers::path_matches("/anything", "/"));
-    assert!(!headers::path_matches("/application", "/app"));
-    assert!(!headers::path_matches("/other", "/app"));
+    assert!(cookies::StoredCookie::path_matches("/app", "/app"));
+    assert!(cookies::StoredCookie::path_matches("/app/page", "/app"));
+    assert!(cookies::StoredCookie::path_matches("/app/page", "/app/"));
+    assert!(cookies::StoredCookie::path_matches("/app?q=1", "/app"));
+    assert!(cookies::StoredCookie::path_matches("/anything", "/"));
+    assert!(!cookies::StoredCookie::path_matches("/application", "/app"));
+    assert!(!cookies::StoredCookie::path_matches("/other", "/app"));
 }
 
 #[test]
 fn a_default_path_is_the_directory_of_the_target() {
-    assert_eq!(headers::default_path("/app/page.html"), "/app");
-    assert_eq!(headers::default_path("/app/sub/page"), "/app/sub");
-    assert_eq!(headers::default_path("/page"), "/");
-    assert_eq!(headers::default_path("/"), "/");
-    assert_eq!(headers::default_path("/app/page?q=1"), "/app");
+    assert_eq!(cookies::StoredCookie::default_path("/app/page.html"), "/app");
+    assert_eq!(cookies::StoredCookie::default_path("/app/sub/page"), "/app/sub");
+    assert_eq!(cookies::StoredCookie::default_path("/page"), "/");
+    assert_eq!(cookies::StoredCookie::default_path("/"), "/");
+    assert_eq!(cookies::StoredCookie::default_path("/app/page?q=1"), "/app");
 }
 
 #[test]
@@ -229,55 +229,6 @@ fn the_jar_joins_every_matching_cookie() {
 }
 
 #[test]
-fn http_1_1_persists_unless_told_otherwise() {
-    let mut headers = Headers::new();
-    assert!(headers::keep_alive(Some(&headers), Version::V1_1));
-    assert!(headers::keep_alive(None, Version::V1_1));
-
-    headers.append("connection", "close");
-    assert!(!headers::keep_alive(Some(&headers), Version::V1_1));
-}
-
-#[test]
-fn http_1_0_persists_only_when_asked() {
-    let mut headers = Headers::new();
-    assert!(!headers::keep_alive(Some(&headers), Version::V1_0));
-
-    headers.append("connection", "Keep-Alive");
-    assert!(headers::keep_alive(Some(&headers), Version::V1_0));
-}
-
-#[test]
-fn close_wins_over_keep_alive_wherever_it_appears() {
-    let mut headers = Headers::new();
-    headers.append("connection", "keep-alive, close");
-    assert!(!headers::keep_alive(Some(&headers), Version::V1_1));
-
-    let mut split = Headers::new();
-    split.append("connection", "keep-alive");
-    split.append("connection", "close");
-    assert!(!headers::keep_alive(Some(&split), Version::V1_1));
-}
-
-#[test]
-fn later_versions_persist_by_default() {
-    let headers = Headers::new();
-
-    assert!(headers::keep_alive(Some(&headers), Version::V2_0));
-    assert!(headers::keep_alive(Some(&headers), Version::V3_0));
-    assert!(headers::keep_alive(None, Version::V3_0));
-}
-
-#[test]
-fn an_unknown_connection_token_is_ignored() {
-    let mut headers = Headers::new();
-    headers.append("connection", "TE, Trailers");
-
-    assert!(headers::keep_alive(Some(&headers), Version::V1_1));
-    assert!(!headers::keep_alive(Some(&headers), Version::V1_0), "HTTP/1.0 still needs keep-alive");
-}
-
-#[test]
 fn a_domain_cannot_fill_the_jar_with_new_names() {
     let jar = CookieJar::new();
     let now = Instant::now();
@@ -334,4 +285,29 @@ fn an_unreachable_expiry_does_not_overflow_the_clock() {
     jar.learn(&target, &[&format!("session=value; Max-Age={}", i64::MAX)], now);
 
     assert_eq!(jar.cookie(&target, now).as_deref(), Some("session=value"));
+}
+
+/// A jar's ceilings are its own, not the whole crate's.
+///
+/// A cookie jar that cannot be built without QPACK timeouts and HTTP/2 window
+/// sizes is not a cookie jar; these are the only two numbers it needs.
+#[test]
+fn a_jar_is_built_from_its_own_limits() {
+    let jar = CookieJar::new().with_limits(soyokaze::CookieLimits { max_cookies: 2, max_cookies_per_domain: 1 });
+    let now = Instant::now();
+
+    jar.learn(&url("https://a.test/"), &["one=1"], now);
+    jar.learn(&url("https://b.test/"), &["two=2"], now);
+    jar.learn(&url("https://c.test/"), &["three=3"], now);
+
+    assert!(jar.entries.lock().expect("poisoned").len() <= 2, "the jar kept more than its ceiling");
+}
+
+#[test]
+fn the_whole_limits_still_configure_a_jar() {
+    let limits = soyokaze::Limits { max_cookies: 7, ..soyokaze::Limits::default() };
+    let jar = CookieJar::new().with_limits(limits);
+
+    assert_eq!(jar.limits.max_cookies, 7);
+    assert_eq!(jar.limits.max_cookies_per_domain, soyokaze::Limits::default().max_cookies_per_domain);
 }

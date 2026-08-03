@@ -1,4 +1,4 @@
-use soyokaze::helpers::hpack::HeaderField;
+use soyokaze::helpers::fields::HeaderField;
 use soyokaze::helpers::qpack::{self, Decoder, DecoderInstruction, Encoder, EncoderInstruction};
 
 use super::input::Input;
@@ -50,8 +50,8 @@ pub fn decoder_instruction(data: &[u8]) {
 pub fn insert_count(data: &[u8]) {
     let mut input = Input::new(data);
 
-    let capacity = qpack::ADVERTISED_TABLE_CAPACITY;
-    let entries = qpack::max_entries(capacity);
+    let capacity = qpack::Decoder::DEFAULT_MAX_CAPACITY;
+    let entries = qpack::Prefix::max_entries(capacity);
     let full_range = 2 * entries;
 
     let inserted = (input.byte() as u64) << 8 | input.byte() as u64;
@@ -61,10 +61,10 @@ pub fn insert_count(data: &[u8]) {
 
     let required = if span == 0 { 0 } else { floor + 1 + input.byte() as u64 % span };
 
-    let encoded = qpack::encode_insert_count(required, capacity);
+    let encoded = qpack::Prefix::encode_insert_count(required, capacity);
     assert!(encoded <= full_range, "an encoded insert count no decoder would accept");
 
-    let decoded = qpack::decode_insert_count(encoded, inserted, capacity);
+    let decoded = qpack::Prefix::decode_insert_count(encoded, inserted, capacity);
     assert_eq!(decoded, Ok(required), "required insert count {required} did not survive with {inserted} inserted");
 }
 
@@ -72,8 +72,7 @@ pub fn session(sections: &[Vec<HeaderField>]) {
     let mut encoder = Encoder::new();
     let mut decoder = Decoder::new();
 
-    encoder.set_max_capacity(qpack::ADVERTISED_TABLE_CAPACITY);
-    if let Some(update) = encoder.set_capacity(qpack::ADVERTISED_TABLE_CAPACITY) {
+    if let Some(update) = encoder.set_max_capacity(qpack::Decoder::DEFAULT_MAX_CAPACITY) {
         decoder.on_encoder_instruction(update).expect("the decoder refused the capacity update");
     }
 

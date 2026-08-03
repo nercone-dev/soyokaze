@@ -3,20 +3,20 @@
 //! [`HstsPolicy`] is the `Strict-Transport-Security` field itself, crossing
 //! by value since it is three plain fields, and [`HstsStore`] is the
 //! client-side memory of which hosts insist on TLS — the same two halves as
-//! [`crate::helpers::hsts`]. The store reads the clock itself, so the caller
+//! [`crate::hsts`]. The store reads the clock itself, so the caller
 //! never passes a timestamp.
 
 use std::time::Instant;
 
-use crate::ffi::api::common::Limits;
+use crate::ffi::models::Limits;
 use crate::ffi::{borrow_text, Buffer};
-use crate::helpers::hsts::HstsStore;
+use crate::hsts::HstsStore;
 
 /// One `Strict-Transport-Security` policy.
 ///
 /// The C half of [`HstsPolicy`], field for field.
 ///
-/// [`HstsPolicy`]: crate::helpers::hsts::HstsPolicy
+/// [`HstsPolicy`]: crate::hsts::HstsPolicy
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct HstsPolicy {
@@ -31,9 +31,9 @@ pub struct HstsPolicy {
 impl HstsPolicy {
     /// The [`HstsPolicy`] this stands for.
     ///
-    /// [`HstsPolicy`]: crate::helpers::hsts::HstsPolicy
-    pub fn parse(&self) -> crate::helpers::hsts::HstsPolicy {
-        crate::helpers::hsts::HstsPolicy {
+    /// [`HstsPolicy`]: crate::hsts::HstsPolicy
+    pub fn parse(&self) -> crate::hsts::HstsPolicy {
+        crate::hsts::HstsPolicy {
             max_age: self.max_age,
             include_subdomains: self.include_subdomains,
             preload: self.preload,
@@ -41,7 +41,7 @@ impl HstsPolicy {
     }
 
     /// The C half of `policy`.
-    pub fn build(policy: &crate::helpers::hsts::HstsPolicy) -> Self {
+    pub fn build(policy: &crate::hsts::HstsPolicy) -> Self {
         Self {
             max_age: policy.max_age,
             include_subdomains: policy.include_subdomains,
@@ -71,7 +71,7 @@ pub unsafe extern "C" fn soyokaze_hsts_policy_parse(value: *const u8, value_len:
         return false;
     };
 
-    match crate::helpers::hsts::HstsPolicy::parse(value) {
+    match crate::hsts::HstsPolicy::parse(value) {
         Some(policy) => {
             unsafe { *out = HstsPolicy::build(&policy) };
             true

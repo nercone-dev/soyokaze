@@ -1,10 +1,11 @@
 use bytes::BytesMut;
 use tokio::io::AsyncWriteExt;
 
-use soyokaze::helpers::hpack::HeaderField;
-use soyokaze::api::common::Limits;
-use soyokaze::helpers::hsts::HstsPolicy;
-use soyokaze::models::{Body, ConnectionID, Headers, Message, Method, Role, Security, StreamID, Version};
+use soyokaze::helpers::fields::HeaderField;
+use soyokaze::models::Limits;
+use soyokaze::hsts::HstsPolicy;
+use soyokaze::models::{Body, ConnectionID, Headers, Message, Method, Role, StreamID, Version};
+use soyokaze::tls::Security;
 use soyokaze::protocol::base::Connection;
 use soyokaze::protocol::common;
 use soyokaze::protocol::h2::{self, Frame, FrameHeader, FrameType, H2Connection, Settings, StreamState};
@@ -19,11 +20,11 @@ fn id() -> ConnectionID {
 }
 
 fn split(encoded: &[u8]) -> (FrameHeader, &[u8]) {
-    let octets = <[u8; h2::FRAME_HEADER_SIZE]>::try_from(&encoded[..h2::FRAME_HEADER_SIZE])
+    let octets = <[u8; h2::FrameHeader::SIZE]>::try_from(&encoded[..h2::FrameHeader::SIZE])
         .expect("an encoded frame is shorter than a frame header");
 
     let (_, header) = FrameHeader::decode(&octets);
-    (header.expect("an encoded frame named a frame type that does not exist"), &encoded[h2::FRAME_HEADER_SIZE..])
+    (header.expect("an encoded frame named a frame type that does not exist"), &encoded[h2::FrameHeader::SIZE..])
 }
 
 fn reencode(frame: &Frame) -> Option<Frame> {
@@ -37,7 +38,7 @@ fn a_frame_header_round_trips() {
     let header = FrameHeader { length: 1234, kind: FrameType::Headers, flags: 0x05, stream_id: StreamID(7) };
 
     let octets = header.encode();
-    assert_eq!(octets.len(), h2::FRAME_HEADER_SIZE);
+    assert_eq!(octets.len(), h2::FrameHeader::SIZE);
     assert_eq!(FrameHeader::decode(&octets), (1234, Some(header)));
 }
 
@@ -47,7 +48,7 @@ fn a_frame_header_masks_off_the_reserved_bit() {
     let (length, header) = FrameHeader::decode(&octets);
 
     assert_eq!(length, 0);
-    assert_eq!(header.map(|header| header.stream_id), Some(StreamID(h2::MAXIMUM_WINDOW_SIZE as u64)));
+    assert_eq!(header.map(|header| header.stream_id), Some(StreamID(h2::Settings::MAXIMUM_WINDOW_SIZE as u64)));
 }
 
 #[test]
@@ -75,11 +76,11 @@ fn every_frame_round_trips() {
         Frame::Data { stream_id: StreamID(1), end_stream: false, data: Vec::new().into() },
         Frame::Headers { stream_id: StreamID(3), end_stream: false, end_headers: true, block: vec![0x82].into() },
         Frame::Priority { stream_id: StreamID(5), dependency: StreamID(3), exclusive: true, weight: 16 },
-        Frame::RstStream { stream_id: StreamID(7), error_code: h2::CANCEL },
-        Frame::Settings { ack: false, params: vec![(h2::SETTINGS_MAX_FRAME_SIZE, 16_384)] },
+        Frame::RstStream { stream_id: StreamID(7), error_code: h2::Code::CANCEL },
+        Frame::Settings { ack: false, params: vec![(h2::Settings::MAX_FRAME_SIZE, 16_384)] },
         Frame::Settings { ack: true, params: Vec::new() },
         Frame::Ping { ack: false, payload: [1, 2, 3, 4, 5, 6, 7, 8] },
-        Frame::GoAway { last_stream_id: StreamID(9), error_code: h2::NO_ERROR, debug_data: b"bye".to_vec() },
+        Frame::GoAway { last_stream_id: StreamID(9), error_code: h2::Code::NO_ERROR, debug_data: b"bye".to_vec() },
         Frame::WindowUpdate { stream_id: StreamID(0), increment: 65_535 },
         Frame::Continuation { stream_id: StreamID(3), end_headers: true, block: vec![0x86].into() },
     ];
@@ -103,7 +104,7 @@ fn a_push_promise_round_trips_with_its_promised_stream() {
 #[test]
 fn padding_is_stripped_from_the_payload() {
     let payload = [0x02, b'a', b'b', b'c', 0x00, 0x00];
-    let header = FrameHeader { length: payload.len() as u32, kind: FrameType::Data, flags: h2::PADDED, stream_id: StreamID(1) };
+    let header = FrameHeader { length: payload.len() as u32, kind: FrameType::Data, flags: h2::Flag::PADDED, stream_id: StreamID(1) };
 
     assert_eq!(
         Frame::decode(header, &payload).ok(),
@@ -114,18 +115,18 @@ fn padding_is_stripped_from_the_payload() {
 #[test]
 fn refuses_padding_longer_than_the_payload() {
     let payload = [0xff, b'a'];
-    let header = FrameHeader { length: payload.len() as u32, kind: FrameType::Data, flags: h2::PADDED, stream_id: StreamID(1) };
+    let header = FrameHeader { length: payload.len() as u32, kind: FrameType::Data, flags: h2::Flag::PADDED, stream_id: StreamID(1) };
 
     assert!(Frame::decode(header, &payload).is_err());
 
-    let empty = FrameHeader { length: 0, kind: FrameType::Data, flags: h2::PADDED, stream_id: StreamID(1) };
+    let empty = FrameHeader { length: 0, kind: FrameType::Data, flags: h2::Flag::PADDED, stream_id: StreamID(1) };
     assert!(Frame::decode(empty, &[]).is_err(), "a padded frame must carry at least the padding length");
 }
 
 #[test]
 fn a_priority_prefix_is_stripped_from_a_header_block() {
     let payload = [0x00, 0x00, 0x00, 0x03, 0x10, 0x82];
-    let header = FrameHeader { length: payload.len() as u32, kind: FrameType::Headers, flags: h2::PRIORITY, stream_id: StreamID(1) };
+    let header = FrameHeader { length: payload.len() as u32, kind: FrameType::Headers, flags: h2::Flag::PRIORITY, stream_id: StreamID(1) };
 
     assert_eq!(
         Frame::decode(header, &payload).ok(),
@@ -167,7 +168,7 @@ fn refuses_a_settings_frame_that_is_not_a_run_of_pairs() {
     let header = FrameHeader { length: 7, kind: FrameType::Settings, flags: 0, stream_id: StreamID(0) };
     assert!(Frame::decode(header, &payload).is_err());
 
-    let acked = FrameHeader { length: 6, kind: FrameType::Settings, flags: h2::ACK, stream_id: StreamID(0) };
+    let acked = FrameHeader { length: 6, kind: FrameType::Settings, flags: h2::Flag::ACK, stream_id: StreamID(0) };
     assert!(Frame::decode(acked, &[0u8; 6]).is_err());
 }
 
@@ -194,7 +195,7 @@ fn decoding_arbitrary_payloads_never_panics() {
         };
 
         for length in 0..12usize {
-            for flags in [0u8, h2::PADDED, h2::PRIORITY, h2::END_STREAM | h2::END_HEADERS, 0xff] {
+            for flags in [0u8, h2::Flag::PADDED, h2::Flag::PRIORITY, h2::Flag::END_STREAM | h2::Flag::END_HEADERS, 0xff] {
                 for stream_id in [StreamID(0), StreamID(1)] {
                     let payload = vec![0xffu8; length];
                     let header = FrameHeader { length: length as u32, kind, flags, stream_id };
@@ -210,23 +211,23 @@ fn settings_carry_the_parameters_that_are_set() {
     let settings = Settings::default();
     let params = settings.parameters();
 
-    assert!(params.iter().any(|(id, _)| *id == h2::SETTINGS_INITIAL_WINDOW_SIZE));
-    assert!(!params.iter().any(|(id, _)| *id == h2::SETTINGS_MAX_CONCURRENT_STREAMS), "an unset limit is not advertised");
+    assert!(params.iter().any(|(id, _)| *id == h2::Settings::INITIAL_WINDOW_SIZE));
+    assert!(!params.iter().any(|(id, _)| *id == h2::Settings::MAX_CONCURRENT_STREAMS), "an unset limit is not advertised");
 
     let bounded = Settings { max_concurrent_streams: Some(100), max_header_list_size: Some(4096), ..settings };
     let params = bounded.parameters();
-    assert!(params.iter().any(|(id, value)| (*id, *value) == (h2::SETTINGS_MAX_CONCURRENT_STREAMS, 100)));
-    assert!(params.iter().any(|(id, value)| (*id, *value) == (h2::SETTINGS_MAX_HEADER_LIST_SIZE, 4096)));
+    assert!(params.iter().any(|(id, value)| (*id, *value) == (h2::Settings::MAX_CONCURRENT_STREAMS, 100)));
+    assert!(params.iter().any(|(id, value)| (*id, *value) == (h2::Settings::MAX_HEADER_LIST_SIZE, 4096)));
 }
 
 #[test]
 fn applying_a_window_size_reports_the_change_to_apply_to_open_streams() {
     let mut settings = Settings::default();
 
-    let change = settings.apply(h2::SETTINGS_INITIAL_WINDOW_SIZE, 131_070);
-    assert_eq!(change.ok(), Some(131_070 - h2::DEFAULT_INITIAL_WINDOW_SIZE as i64));
+    let change = settings.apply(h2::Settings::INITIAL_WINDOW_SIZE, 131_070);
+    assert_eq!(change.ok(), Some(131_070 - h2::Settings::DEFAULT_INITIAL_WINDOW_SIZE as i64));
 
-    let back = settings.apply(h2::SETTINGS_INITIAL_WINDOW_SIZE, 0);
+    let back = settings.apply(h2::Settings::INITIAL_WINDOW_SIZE, 0);
     assert_eq!(back.ok(), Some(-131_070));
 }
 
@@ -234,11 +235,11 @@ fn applying_a_window_size_reports_the_change_to_apply_to_open_streams() {
 fn refuses_settings_outside_their_permitted_range() {
     let mut settings = Settings::default();
 
-    assert!(settings.apply(h2::SETTINGS_ENABLE_PUSH, 2).is_err());
-    assert!(settings.apply(h2::SETTINGS_ENABLE_CONNECT_PROTOCOL, 2).is_err());
-    assert!(settings.apply(h2::SETTINGS_INITIAL_WINDOW_SIZE, h2::MAXIMUM_WINDOW_SIZE + 1).is_err());
-    assert!(settings.apply(h2::SETTINGS_MAX_FRAME_SIZE, h2::DEFAULT_MAX_FRAME_SIZE - 1).is_err());
-    assert!(settings.apply(h2::SETTINGS_MAX_FRAME_SIZE, h2::MAXIMUM_FRAME_SIZE + 1).is_err());
+    assert!(settings.apply(h2::Settings::ENABLE_PUSH, 2).is_err());
+    assert!(settings.apply(h2::Settings::ENABLE_CONNECT_PROTOCOL, 2).is_err());
+    assert!(settings.apply(h2::Settings::INITIAL_WINDOW_SIZE, h2::Settings::MAXIMUM_WINDOW_SIZE + 1).is_err());
+    assert!(settings.apply(h2::Settings::MAX_FRAME_SIZE, h2::Settings::DEFAULT_MAX_FRAME_SIZE - 1).is_err());
+    assert!(settings.apply(h2::Settings::MAX_FRAME_SIZE, h2::Settings::MAXIMUM_FRAME_SIZE + 1).is_err());
 
     assert!(settings.apply(0xff, 1).is_ok());
 }
@@ -264,18 +265,18 @@ fn a_request_becomes_pseudo_headers_and_back() {
 
     let mut request = Message::request(Method::GET, "/index.html", Version::V2_0);
     request.headers = Some(headers);
-    request.secure = true;
+    request.security.secure = true;
 
-    let fields = common::fields(&request).expect("a request did not become fields");
+    let fields = common::Fields::of(&request).expect("a request did not become fields");
     assert_eq!(fields[0], HeaderField::new(":method", "GET"));
     assert_eq!(fields[1], HeaderField::new(":scheme", "https"));
     assert_eq!(fields[2], HeaderField::new(":authority", "example.test"));
     assert_eq!(fields[3], HeaderField::new(":path", "/index.html"));
 
-    let back = common::message(&fields, Version::V2_0).expect("fields did not become a message");
+    let back = common::Fields::message(&fields, Version::V2_0).expect("fields did not become a message");
     assert_eq!(back.method, Some(Method::GET));
     assert_eq!(back.target.as_deref(), Some("/index.html"));
-    assert!(back.secure);
+    assert!(back.security.secure);
     assert_eq!(back.headers.as_ref().and_then(|headers| headers.get("host")), Some("example.test"));
 }
 
@@ -283,10 +284,10 @@ fn a_request_becomes_pseudo_headers_and_back() {
 fn a_connect_request_carries_only_an_authority() {
     let request = Message::request(Method::CONNECT, "example.test:443", Version::V2_0);
 
-    let fields = common::fields(&request).expect("a CONNECT did not become fields");
+    let fields = common::Fields::of(&request).expect("a CONNECT did not become fields");
     assert_eq!(fields, vec![HeaderField::new(":method", "CONNECT"), HeaderField::new(":authority", "example.test:443")]);
 
-    let back = common::message(&fields, Version::V2_0).expect("fields did not become a message");
+    let back = common::Fields::message(&fields, Version::V2_0).expect("fields did not become a message");
     assert_eq!(back.method, Some(Method::CONNECT));
     assert_eq!(back.target.as_deref(), Some("example.test:443"));
 }
@@ -317,7 +318,7 @@ fn refuses_a_field_section_that_breaks_the_rules() {
     ];
 
     for (description, fields) in cases {
-        assert!(common::message(fields, Version::V2_0).is_err(), "{description} should be refused");
+        assert!(common::Fields::message(fields, Version::V2_0).is_err(), "{description} should be refused");
     }
 }
 
@@ -329,7 +330,7 @@ fn refuses_to_frame_a_connection_specific_field() {
     let mut response = Message::response(200, Version::V2_0);
     response.headers = Some(headers);
 
-    assert!(matches!(common::fields(&response), Err(Error::Protocol(_))));
+    assert!(matches!(common::Fields::of(&response), Err(Error::Protocol(_))));
 }
 
 async fn pair() -> (H2Connection<tokio::io::DuplexStream>, H2Connection<tokio::io::DuplexStream>) {
@@ -351,7 +352,7 @@ async fn a_request_and_response_cross_a_connection() {
     let mut request = Message::request(Method::POST, "/submit", Version::V2_0);
     request.headers = Some(Headers::new());
     request.body = Some(Body::Text("hello".to_owned()));
-    request.secure = true;
+    request.security.secure = true;
 
     client.send(request).await.expect("the request did not send");
 
@@ -379,7 +380,7 @@ async fn a_configured_hsts_policy_rides_only_on_a_secure_transport() {
 
         let mut client = H2Connection::new(client_pipe, Role::UserAgent, id(), limits());
         let mut server = H2Connection::new(server_pipe, Role::Origin, id(), limits())
-            .with_hsts(Some(HstsPolicy::new(600)))
+            .with_response_finalizer(soyokaze::finalizer::ResponseFinalizer::new(Some(HstsPolicy::new(600))))
             .with_security(Security { secure, ..Security::default() });
 
         client.start().await.expect("the client preface did not send");
@@ -387,7 +388,7 @@ async fn a_configured_hsts_policy_rides_only_on_a_secure_transport() {
 
         let mut request = Message::request(Method::GET, "/", Version::V2_0);
         request.headers = Some(Headers::new());
-        request.secure = true;
+        request.security.secure = true;
         client.send(request).await.expect("the request did not send");
 
         let received = server.receive().await.expect("the request did not arrive");
@@ -440,9 +441,9 @@ async fn a_field_block_spanning_continuation_frames_is_reassembled() {
     let mut request = Message::request(Method::GET, "/", Version::V2_0);
     request.headers = Some(headers);
 
-    let fields = common::fields(&request).expect("the request did not become fields");
+    let fields = common::Fields::of(&request).expect("the request did not become fields");
     let block = soyokaze::helpers::hpack::Encoder::new().encode(&fields);
-    assert!(block.len() > h2::DEFAULT_MAX_FRAME_SIZE as usize, "the field section fits in one frame after all");
+    assert!(block.len() > h2::Settings::DEFAULT_MAX_FRAME_SIZE as usize, "the field section fits in one frame after all");
 
     client.send(request).await.expect("the request did not send");
 
@@ -463,7 +464,7 @@ async fn a_ping_is_answered_with_its_own_payload() {
 
     let mut acknowledged = None;
     for _ in 0..3 {
-        if let Some(Frame::Ping { ack: true, payload }) = client.read_frame().await.expect("nothing came back") {
+        if let Frame::Ping { ack: true, payload } = client.read_frame().await.expect("nothing came back") {
             acknowledged = Some(payload);
             break;
         }
@@ -538,7 +539,7 @@ async fn refuses_a_frame_larger_than_the_advertised_maximum() {
     let mut server = H2Connection::new(server_pipe, Role::Origin, id(), limits());
 
     let header = FrameHeader {
-        length: h2::DEFAULT_MAX_FRAME_SIZE + 1,
+        length: h2::Settings::DEFAULT_MAX_FRAME_SIZE + 1,
         kind: FrameType::Data,
         flags: 0,
         stream_id: StreamID(1),
@@ -710,4 +711,81 @@ async fn unread_bodies_are_bounded_across_every_stream_together() {
     }
 
     assert!(streams > 1, "the ceiling should be reached across several streams, not one");
+}
+
+#[test]
+fn the_assumed_peer_settings_are_the_ones_the_specification_names() {
+    // RFC 9113 §6.5.2 and RFC 8441 §3 fix what a peer must be taken to have
+    // advertised until its SETTINGS arrives. These are not the same as what
+    // this end advertises, which is Settings::default.
+    let peer = Settings::peer();
+
+    assert_eq!(peer.header_table_size, 4096, "SETTINGS_HEADER_TABLE_SIZE starts at 4096");
+    assert!(peer.enable_push, "SETTINGS_ENABLE_PUSH starts at 1");
+    assert_eq!(peer.max_concurrent_streams, None, "SETTINGS_MAX_CONCURRENT_STREAMS starts unbounded");
+    assert_eq!(peer.initial_window_size, 65_535, "SETTINGS_INITIAL_WINDOW_SIZE starts at 65535");
+    assert_eq!(peer.max_frame_size, 16_384, "SETTINGS_MAX_FRAME_SIZE starts at 16384");
+    assert_eq!(peer.max_header_list_size, None, "SETTINGS_MAX_HEADER_LIST_SIZE starts unbounded");
+    assert!(!peer.enable_connect_protocol, "SETTINGS_ENABLE_CONNECT_PROTOCOL starts at 0");
+
+    // A connection must not take its own advertisement for the peer's.
+    let connection = H2Connection::new(tokio::io::duplex(64).0, Role::UserAgent, id(), limits());
+    assert_eq!(*connection.settings_remote(), Settings::peer(), "the peer's settings start at the assumed ones");
+    assert_ne!(
+        *connection.settings_local(),
+        *connection.settings_remote(),
+        "what this end advertises differs from what a silent peer must be assumed to allow",
+    );
+}
+
+#[test]
+fn a_frame_is_taken_off_a_buffer_whole_or_not_at_all() {
+    let frame = Frame::Ping { ack: false, payload: [7; 8] };
+    let encoded = frame.encode();
+
+    // A partial frame leaves the buffer untouched, so the call can be repeated
+    // as more octets arrive.
+    for split in 0..encoded.len() {
+        let mut buffer = BytesMut::from(&encoded[..split]);
+        assert!(
+            h2::Frame::parse(&mut buffer, Settings::default().max_frame_size).expect("a partial frame must not fail").is_none(),
+            "a frame cut at {split} octets was read as complete",
+        );
+        assert_eq!(buffer.len(), split, "a partial frame must leave the buffer as it found it");
+    }
+
+    let mut buffer = BytesMut::from(&encoded[..]);
+    buffer.extend_from_slice(b"trailing");
+
+    let parsed = h2::Frame::parse(&mut buffer, Settings::default().max_frame_size).expect("a whole frame did not parse");
+    assert_eq!(parsed, Some(frame), "the frame did not come back as it went in");
+    assert_eq!(&buffer[..], b"trailing", "parsing must consume the frame and nothing more");
+}
+
+#[test]
+fn an_unknown_frame_type_is_read_past_rather_than_refused() {
+    // RFC 9113 §4.1: "Implementations MUST ignore and discard frames of
+    // unknown type."
+    let mut buffer = BytesMut::new();
+    FrameHeader::write(&mut buffer, FrameType::Ping, 0, StreamID(0), &[1, 2, 3]);
+    buffer[3] = 0xef;
+
+    let known = Frame::Ping { ack: false, payload: [3; 8] };
+    buffer.extend_from_slice(&known.encode());
+
+    let parsed = h2::Frame::parse(&mut buffer, Settings::default().max_frame_size).expect("an unknown frame must not fail");
+    assert_eq!(parsed, Some(known), "an unknown frame must be skipped and the next one returned");
+    assert!(buffer.is_empty(), "both frames must have been consumed");
+}
+
+#[test]
+fn a_frame_larger_than_advertised_is_refused_before_it_is_read() {
+    let mut buffer = BytesMut::new();
+    FrameHeader::write(&mut buffer, FrameType::Data, 0, StreamID(1), &[0; 64]);
+    buffer[0..3].copy_from_slice(&[0x00, 0xff, 0xff]);
+
+    // RFC 9113 §4.2: a frame above SETTINGS_MAX_FRAME_SIZE is an error, and it
+    // must be caught from the header rather than after buffering the payload.
+    let error = h2::Frame::parse(&mut buffer, 16_384).expect_err("an oversized frame was accepted");
+    assert!(matches!(error, Error::Limit(_)), "an oversized frame must be a limit failure, not {error:?}");
 }

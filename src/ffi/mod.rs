@@ -8,8 +8,9 @@
 //! # Layout
 //!
 //! The modules mirror the crate they wrap: [`models`] carries [`Url`] and
-//! [`Message`], [`errors`] carries [`Error`] across the boundary, [`headers`]
-//! carries the cookie types, [`responses`] the response constructors,
+//! [`Message`], [`errors`] carries [`Error`] across the boundary, [`cookies`]
+//! carries the cookie types, [`hsts`] the HSTS policy,
+//! [`responses`] the response constructors,
 //! [`finalizer`] the date formatting, [`websocket`] the WebSocket connection,
 //! [`tls`] the identities and Encrypted Client Hello, [`api`] the two entry
 //! points, and [`helpers`] the codecs. What every module shares lives here —
@@ -39,7 +40,8 @@
 
 pub mod models;
 pub mod errors;
-pub mod headers;
+pub mod cookies;
+pub mod hsts;
 pub mod responses;
 pub mod finalizer;
 pub mod websocket;
@@ -48,12 +50,11 @@ pub mod tls;
 pub mod api {
     //! The two entry points a caller of the library reaches for first, from C.
     //!
-    //! [`client`] dials an origin, [`server`] binds ports and accepts
-    //! connections, and [`common`] holds what the two configure in common.
+    //! [`client`] dials an origin, and [`server`] binds ports and accepts
+    //! connections.
     //!
     //! Each module wraps its namesake in [`crate::api`].
 
-    pub mod common;
     pub mod client;
     pub mod server;
 }
@@ -66,9 +67,9 @@ pub mod helpers {
     pub mod base64;
     pub mod sha1;
     pub mod huffman;
+    pub mod fields;
     pub mod hpack;
     pub mod qpack;
-    pub mod hsts;
 }
 
 pub use errors::Status;
@@ -189,6 +190,14 @@ pub unsafe fn borrow<'a>(data: *const u8, len: usize) -> Option<&'a [u8]> {
 pub unsafe fn borrow_text<'a>(data: *const u8, len: usize) -> Option<&'a str> {
     std::str::from_utf8(unsafe { borrow(data, len) }?).ok()
 }
+
+/// A raw pointer wrapped so a spawned task may carry it.
+///
+/// The C caller already promised, by handing the pointer to a server that
+/// reaches it from many threads, that this is sound.
+pub struct SendPtr<T: ?Sized>(pub *mut T);
+
+unsafe impl<T: ?Sized> Send for SendPtr<T> {}
 
 /// The runtime the blocking calls in this module drive.
 ///

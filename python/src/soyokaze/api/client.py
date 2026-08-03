@@ -14,7 +14,7 @@ from ..ffi import library
 from ..models import Message, Method, Role, Version
 from ..runtime import default_runtime
 from ..websocket import WebSocketConnection
-from .common import Limits
+from ..models import Limits
 
 class ClientLimits:
     """The limits a client applies on top of the per-message :class:`Limits`."""
@@ -35,11 +35,12 @@ class ClientConfig:
     on, cookies kept, HSTS remembered, and the platform trust store.
     """
 
-    def __init__(self, versions=None, limits=None, secure=True, roots=None, ech=None, cookies=True, hsts=True):
+    def __init__(self, versions=None, limits=None, secure=True, roots=None, tls=None, ech=None, cookies=True, hsts=True):
         self.versions = versions
         self.limits = limits
         self.secure = secure
         self.roots = roots
+        self.tls = tls
         self.ech = ech
         self.cookies = cookies
         self.hsts = hsts
@@ -73,6 +74,11 @@ class ClientConfig:
             keepalive.extend((slices, array))
             struct.roots = array
             struct.root_count = len(slices)
+
+        if self.tls is not None:
+            tls = self.tls.build()
+            keepalive.append(tls)
+            struct.tls = ctypes.pointer(tls)
 
         if self.ech is not None:
             entries = []
@@ -141,7 +147,7 @@ class Connection:
         raise_for(library.soyokaze_connection_receive(self.runtime.handle, self.handle, ctypes.byref(out), ctypes.byref(error)), error)
         return Message(handle=out)
 
-    def open_websocket(self, authority, target):
+    def open_websocket(self, authority, target, limits=None):
         """Opens a WebSocket and takes the connection over.
 
         The connection is consumed whether the handshake succeeds or not.
@@ -154,7 +160,7 @@ class Connection:
         out = ctypes.c_void_p()
         error = error_out()
         authority, target = ffi.encoded(authority), ffi.encoded(target)
-        raise_for(library.soyokaze_connection_open_websocket(self.runtime.handle, handle, authority, len(authority), target, len(target), ctypes.byref(out), ctypes.byref(error)), error)
+        raise_for(library.soyokaze_connection_open_websocket(self.runtime.handle, handle, authority, len(authority), target, len(target), ctypes.byref(limits) if limits is not None else None, ctypes.byref(out), ctypes.byref(error)), error)
         return WebSocketConnection(out)
 
     def close(self):

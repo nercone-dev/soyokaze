@@ -3,15 +3,15 @@
 //! [`Cookie`] and [`SetCookie`] are the two sides of the exchange — what a
 //! client sends and what a server sets — and [`CookieJar`] is the client-side
 //! store that turns one into the other across requests, exactly as
-//! [`crate::headers`] arranges them. The jar reads the clock itself, so the
+//! [`crate::cookies`] arranges them. The jar reads the clock itself, so the
 //! caller never passes a timestamp.
 
 use std::time::Instant;
 
-use crate::ffi::api::common::Limits;
+use crate::ffi::models::Limits;
 use crate::ffi::errors::{ErrorHandle, Status};
 use crate::ffi::{borrow_text, Buffer, Slice};
-use crate::headers::{Cookie, CookieJar, SameSite, SetCookie};
+use crate::cookies::{Cookie, CookieJar, SameSite, SetCookie};
 use crate::models::Url;
 
 /// Builds an empty `Cookie` field: no pairs yet.

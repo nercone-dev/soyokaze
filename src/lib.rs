@@ -8,22 +8,32 @@
 //!
 //! # Layers
 //!
-//! The crate is arranged in three layers, each usable on its own:
+//! The crate is arranged in layers, each usable on its own, and each module
+//! standing alone as a library for exactly its own concern:
 //!
-//! - [`api`] holds the entry points: [`Client`] dials an origin, [`Server`]
-//!   binds ports and accepts connections, and [`api::common`] holds what the
-//!   two configure in common. The BoringSSL contexts both of them negotiate
-//!   with are built in [`tls`].
+//! - [`helpers`] holds the codecs the versions share — [`helpers::huffman`],
+//!   [`helpers::hpack`] for HTTP/2 and [`helpers::qpack`] for HTTP/3, over
+//!   the shared vocabulary in [`helpers::fields`] — plus the small pieces
+//!   ([`helpers::base64`], [`helpers::sha1`], [`helpers::sync`]) everything
+//!   else leans on. Nothing here knows about connections or transports.
+//! - [`models`] is the vocabulary: [`Message`], [`Headers`], [`Version`],
+//!   [`Port`], [`Limits`]. [`tls`] holds the TLS side of it — [`Security`]
+//!   and the BoringSSL contexts — and [`cookies`], [`hsts`], [`responses`]
+//!   and [`finalizer`] each hold one message-level concern.
 //! - [`protocol`] holds one connection type per version — [`protocol::h1`],
 //!   [`protocol::h2`] and [`protocol::h3`] — implementing the traits in
-//!   [`protocol::base`] over the shared vocabulary in [`protocol::common`],
-//!   with [`protocol::handler`] bridging each transport into a connection the
-//!   same way. A higher layer drives a lower one exactly the way an outside
-//!   caller would.
-//! - [`helpers`] holds the codecs the versions share: [`helpers::huffman`],
-//!   [`helpers::hpack`] for HTTP/2 and [`helpers::qpack`] for HTTP/3, plus the
-//!   small pieces ([`helpers::base64`], [`helpers::sha1`]) the WebSocket
-//!   handshake needs.
+//!   [`protocol::base`] over the shared vocabulary in [`protocol::common`].
+//!   Each binary version keeps its wire format in a module of its own
+//!   ([`protocol::h2::frames`], [`protocol::h3::frames`]), which encodes and
+//!   decodes frames and knows nothing of connections, exactly as
+//!   [`helpers::hpack`] and [`helpers::qpack`] do for field compression.
+//!   [`protocol::quic`] is the seam QUIC is consumed through, the transport
+//!   counterpart of [`protocol::base::Transport`], and [`protocol::handler`]
+//!   bridges each transport into a connection the same way. A higher layer
+//!   drives a lower one exactly the way an outside caller would.
+//! - [`api`] holds the entry points: [`Client`] dials an origin, [`Server`]
+//!   binds ports and accepts connections, [`api::gate`] admits them, and
+//!   [`api::cluster`] runs the server across worker threads.
 //!
 //! # Symmetry
 //!
@@ -33,7 +43,10 @@
 //! connections are drop-in replacements for one another wherever the protocol
 //! itself does not force a difference. Prefer naming the base type
 //! ([`protocol::base::Connection`], [`AnyConnection`]) over a concrete
-//! version wherever a choice exists.
+//! version wherever a choice exists. Nothing keys on a version where the
+//! transport is the real question: a port carries whichever versions run over
+//! its transport, per [`Port::carries`], so a new version slots in without
+//! touching the routing.
 //!
 //! # Getting started
 //!
@@ -71,7 +84,8 @@
 pub mod ffi;
 pub mod models;
 pub mod errors;
-pub mod headers;
+pub mod cookies;
+pub mod hsts;
 pub mod responses;
 pub mod finalizer;
 pub mod websocket;
@@ -82,22 +96,27 @@ pub mod api {
     //!
     //! [`client`] dials an origin, [`server`] binds ports and accepts
     //! connections, and [`common`] holds what the two configure in common.
+    //! [`gate`] is the server's admission control, and [`cluster`] runs it
+    //! across worker threads.
 
     pub mod common;
     pub mod client;
     pub mod server;
+    pub mod gate;
+    pub mod cluster;
 }
 
 pub mod protocol {
     //! One connection type per HTTP version, over a shared vocabulary.
     //!
     //! [`common`] holds what every version shares, [`base`] holds what a
-    //! connection is before any version makes it concrete, [`handler`] bridges
-    //! each transport into a connection, and [`h1`], [`h2`] and [`h3`] each
-    //! implement one version.
+    //! connection is before any version makes it concrete, [`quic`] is the
+    //! seam QUIC is consumed through, [`handler`] bridges each transport into
+    //! a connection, and [`h1`], [`h2`] and [`h3`] each implement one version.
 
     pub mod common;
     pub mod base;
+    pub mod quic;
     pub mod handler;
     pub mod h1;
     pub mod h2;
@@ -105,18 +124,19 @@ pub mod protocol {
 
     pub use base::{AnyConnection, Connection, Stream, Transport};
     pub use handler::{Incoming, Negotiation};
-    pub use h1::H1Connection;
-    pub use h2::H2Connection;
-    pub use h3::H3Connection;
+    pub use quic::{QuicDialer, QuicListener, QuicTransport};
+    pub use h1::{H1Connection, H1Limits};
+    pub use h2::{H2Connection, H2Limits};
+    pub use h3::{H3Connection, H3Limits};
 }
 
 pub mod helpers {
     //! The codecs and utilities the protocol implementations share.
     //!
-    //! [`huffman`], [`hpack`] and [`qpack`] are the field compression formats;
-    //! [`base64`] and [`sha1`] are what the WebSocket handshake needs;
-    //! [`text`], [`scan`] and [`sync`] are small pieces the parsers lean on;
-    //! and [`hsts`] holds the Strict-Transport-Security policy types.
+    //! [`huffman`], [`hpack`] and [`qpack`] are the field compression formats,
+    //! over the shared vocabulary in [`fields`]; [`base64`] and [`sha1`] are
+    //! what the WebSocket handshake needs; and [`text`], [`scan`] and [`sync`]
+    //! are small pieces the parsers lean on.
 
     pub mod base64;
     pub mod scan;
@@ -124,19 +144,21 @@ pub mod helpers {
     pub mod sha1;
     pub mod sync;
     pub mod huffman;
+    pub mod fields;
     pub mod hpack;
     pub mod qpack;
-    pub mod hsts;
 }
 
 pub use errors::Error;
-pub use models::{Body, ConnectionID, HeaderCase, Headers, Message, Method, Port, Role, StreamID, Url, Version};
-pub use headers::{Cookie, CookieJar, SameSite, SetCookie};
-pub use finalizer::{http_date, DateCache};
-pub use api::common::{Limits, VERSIONS};
+pub use models::{Alpn, Body, ConnectionID, HeaderCase, Headers, Limits, Message, Method, Port, Role, StreamID, TransportKind, Url, Version};
+pub use cookies::{Cookie, CookieJar, CookieLimits, SameSite, SetCookie};
+pub use finalizer::{DateCache, RequestFinalizer, ResponseFinalizer};
+pub use api::common::VERSIONS;
 pub use api::client::{Client, ClientConfig, ClientLimits};
-pub use api::server::{cores, Cluster, Gate, Handler, Permit, RawSocket, Server, ServerConfig, ServerLimits};
-pub use tls::{EchConfig, EchConfigList, EchKeys, EchStatus, Format, Identity};
-pub use helpers::hsts::{HstsPolicy, HstsStore};
+pub use api::server::{Handler, RawSocket, Server, ServerConfig, ServerLimits};
+pub use api::gate::{Gate, Permit};
+pub use api::cluster::{cores, Cluster};
+pub use tls::{EchConfig, EchConfigList, EchKeys, EchStatus, Format, Identity, Security, TLSCipher, TLSGroup, TLSVersion};
+pub use hsts::{HstsLimits, HstsPolicy, HstsStore};
 pub use helpers::text::Text;
-pub use websocket::WebSocketConnection;
+pub use websocket::{WebSocketConnection, WebSocketLimits};

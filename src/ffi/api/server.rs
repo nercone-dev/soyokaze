@@ -9,12 +9,15 @@
 
 use bytes::Bytes;
 
-use crate::api::server::{Cluster, Handler, Server, ServerHandle};
-use crate::ffi::api::client::parse_versions;
-use crate::ffi::api::common::Limits;
+use crate::api::cluster::Cluster;
+use crate::api::server::{Handler, Server, ServerHandle};
+use crate::ffi::models::parse_versions;
+use crate::ffi::SendPtr;
+use crate::ffi::models::Limits;
 use crate::ffi::errors::{ErrorHandle, Status};
-use crate::ffi::helpers::hsts::HstsPolicy;
+use crate::ffi::hsts::HstsPolicy;
 use crate::ffi::models::Port;
+use crate::ffi::tls::TlsConfig;
 use crate::ffi::websocket::WebSocket;
 use crate::ffi::{borrow, Runtime, Slice};
 use crate::models::{Body, Message, Version};
@@ -42,13 +45,6 @@ pub type OnRequest = extern "C" fn(context: *mut std::ffi::c_void, request: *mut
 /// the connection lives.
 pub type OnWebSocket = extern "C" fn(context: *mut std::ffi::c_void, socket: *mut WebSocket);
 
-/// A raw pointer wrapped so a spawned task may carry it.
-///
-/// The C caller already promised, by handing the pointer to a server that
-/// reaches it from many threads, that this is sound.
-pub struct SendPtr<T: ?Sized>(pub *mut T);
-
-unsafe impl<T: ?Sized> Send for SendPtr<T> {}
 
 /// A [`Handler`] that answers each request through a C callback.
 ///
@@ -63,6 +59,8 @@ pub struct CallbackHandler {
     pub on_websocket: Option<OnWebSocket>,
     /// What the callbacks are given alongside their argument.
     pub context: *mut std::ffi::c_void,
+    /// The ceilings an accepted WebSocket holds itself to.
+    pub limits: crate::websocket::WebSocketLimits,
 }
 
 unsafe impl Send for CallbackHandler {}
@@ -101,18 +99,18 @@ impl Handler for CallbackHandler {
                 break;
             };
 
-            if self.on_websocket.is_some() && crate::websocket::upgrade_requested(&request) {
-                if crate::websocket::verify_upgrade(&request).is_err() {
-                    if connection.send(crate::api::server::upgrade_required(&request, version)).await.is_err() {
-                        break;
+            if self.on_websocket.is_some() && crate::websocket::Handshake::requested(&request) {
+                match crate::websocket::Handshake::answer(connection, &request, self.limits).await {
+                    crate::websocket::Answer::Accepted(socket) => {
+                        self.on_websocket(socket).await;
+                        return;
                     }
-                    continue;
+                    crate::websocket::Answer::Refused(kept) => {
+                        connection = kept;
+                        continue;
+                    }
+                    crate::websocket::Answer::Failed => return,
                 }
-
-                if let Ok(socket) = connection.accept_websocket(&request).await {
-                    self.on_websocket(socket).await;
-                }
-                return;
             }
 
             if connection.send(self.answer(request, version).await).await.is_err() {
@@ -171,6 +169,8 @@ pub struct ServerLimits {
     /// The limits each connection holds itself to.
     pub message: Limits,
 
+    /// The listen backlog for a TCP socket.
+    pub backlog: u32,
     /// The number of connections that may be open at once. Zero is unbounded.
     pub max_connections: u32,
     /// The number of connections one address may have open. Zero is unbounded.
@@ -181,6 +181,8 @@ pub struct ServerLimits {
     pub rate_count: usize,
     /// The number of addresses whose connection history is remembered.
     pub max_connection_history: usize,
+    /// The stack size for a worker thread.
+    pub worker_stack_size: usize,
 }
 
 impl ServerLimits {
@@ -204,10 +206,12 @@ impl ServerLimits {
 
         crate::api::server::ServerLimits {
             message: self.message.parse(),
+            backlog: self.backlog,
             max_connections: self.max_connections,
             max_connections_per_ip: self.max_connections_per_ip,
             max_connection_rate: rate,
             max_connection_history: self.max_connection_history,
+            worker_stack_size: self.worker_stack_size,
         }
     }
 }
@@ -221,11 +225,13 @@ pub extern "C" fn soyokaze_server_limits_default() -> ServerLimits {
 
     ServerLimits {
         message: Limits::build(&limits.message),
+        backlog: limits.backlog,
         max_connections: limits.max_connections,
         max_connections_per_ip: limits.max_connections_per_ip,
         max_connection_rate: std::ptr::null(),
         rate_count: 0,
         max_connection_history: limits.max_connection_history,
+        worker_stack_size: limits.worker_stack_size,
     }
 }
 
@@ -235,7 +241,7 @@ pub extern "C" fn soyokaze_server_limits_default() -> ServerLimits {
 /// Useful as the worker count for [`soyokaze_server_run`].
 #[unsafe(no_mangle)]
 pub extern "C" fn soyokaze_cores() -> u32 {
-    crate::api::server::cores() as u32
+    crate::api::cluster::cores() as u32
 }
 
 /// How a [`Server`] is configured.
@@ -269,6 +275,10 @@ pub struct ServerConfig {
     /// The private key to serve, as DER or PEM, when `identity` is null.
     pub key: Slice,
 
+    /// The TLS details every context is built with. Null takes every default,
+    /// as `soyokaze_tls_config_default` hands them out.
+    pub tls: *const TlsConfig,
+
     /// The keys to offer Encrypted Client Hello with, from
     /// `soyokaze_ech_keys_generate` or `soyokaze_ech_keys_new`.
     pub ech: *const EchKeys,
@@ -289,6 +299,7 @@ impl ServerConfig {
         identity: std::ptr::null(),
         certificate: Slice::ABSENT,
         key: Slice::ABSENT,
+        tls: std::ptr::null(),
         ech: std::ptr::null(),
         hsts: std::ptr::null(),
         reuseport: true,
@@ -322,6 +333,10 @@ impl ServerConfig {
             unsafe { borrow(self.key.data, self.key.len) },
         ) {
             config.identity = Some(Identity::new(vec![certificate.to_vec()], key.to_vec()));
+        }
+
+        if let Some(tls) = unsafe { self.tls.as_ref() } {
+            config.tls = unsafe { tls.parse() }?;
         }
 
         if let Some(ech) = unsafe { self.ech.as_ref() } {
@@ -419,7 +434,7 @@ pub unsafe extern "C" fn soyokaze_server_serve(runtime: *mut Runtime, server: *c
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 
-    let handler = CallbackHandler { on_request, on_websocket, context };
+    let handler = CallbackHandler { on_request, on_websocket, context, limits: server.config.limits.message.into() };
 
     match runtime.0.block_on(server.serve(handler, &bound)) {
         Ok(handle) => {
@@ -518,11 +533,11 @@ pub unsafe extern "C" fn soyokaze_server_run(server: *const Server, on_request: 
     };
 
     let workers = match workers {
-        0 => crate::api::server::cores(),
+        0 => crate::api::cluster::cores(),
         count => count as usize,
     };
 
-    let handler = CallbackHandler { on_request, on_websocket, context };
+    let handler = CallbackHandler { on_request, on_websocket, context, limits: server.config.limits.message.into() };
 
     match server.run(handler, &bound, workers) {
         Ok(cluster) => {

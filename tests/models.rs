@@ -2,8 +2,7 @@ use std::str::FromStr;
 
 use bytes::Bytes;
 
-use soyokaze::models::{Body, HeaderCase, Headers, Message, Method, Role, Url, Version};
-use soyokaze::responses::content_type;
+use soyokaze::models::{Body, HeaderCase, Headers, Message, Method, Port, Role, Url, Version};
 use soyokaze::{Error, SetCookie};
 
 #[test]
@@ -242,13 +241,13 @@ fn a_redirect_names_its_target() {
 
 #[test]
 fn content_types_come_from_the_extension() {
-    assert_eq!(content_type("/index.html"), "text/html");
-    assert_eq!(content_type("/style.CSS"), "text/css");
-    assert_eq!(content_type("/pkg/app.wasm"), "application/wasm");
-    assert_eq!(content_type("/photo.jpeg"), "image/jpeg");
-    assert_eq!(content_type("/README"), "application/octet-stream");
-    assert_eq!(content_type("/v1.0/README"), "application/octet-stream");
-    assert_eq!(content_type(""), "application/octet-stream");
+    assert_eq!(Message::content_type("/index.html"), "text/html");
+    assert_eq!(Message::content_type("/style.CSS"), "text/css");
+    assert_eq!(Message::content_type("/pkg/app.wasm"), "application/wasm");
+    assert_eq!(Message::content_type("/photo.jpeg"), "image/jpeg");
+    assert_eq!(Message::content_type("/README"), "application/octet-stream");
+    assert_eq!(Message::content_type("/v1.0/README"), "application/octet-stream");
+    assert_eq!(Message::content_type(""), "application/octet-stream");
 }
 
 #[test]
@@ -277,4 +276,85 @@ fn a_cookie_that_cannot_be_serialised_is_refused() {
 
     assert!(response.set_cookie(&SetCookie::new("bad name", "value")).is_err());
     assert!(response.set_cookie(&SetCookie::new("name", "with;semicolon")).is_err());
+}
+
+#[test]
+fn a_port_carries_exactly_the_versions_of_its_transport() {
+    use soyokaze::models::{Port, TransportKind, Version};
+
+    for port in [Port::TCP(443), Port::UDS("/tmp/sock".into())] {
+        assert_eq!(port.transport(), TransportKind::Stream);
+        assert!(port.carries(Version::V1_0) && port.carries(Version::V1_1) && port.carries(Version::V2_0));
+        assert!(!port.carries(Version::V3_0), "{port:?} must not carry a QUIC version");
+    }
+
+    let quic = Port::QUIC(443);
+    assert_eq!(quic.transport(), TransportKind::Quic);
+    assert!(quic.carries(Version::V3_0));
+    assert!(!quic.carries(Version::V1_1) && !quic.carries(Version::V2_0));
+}
+
+#[test]
+fn a_version_names_the_transport_it_runs_over() {
+    use soyokaze::models::{TransportKind, Version};
+
+    assert_eq!(Version::V1_0.transport(), TransportKind::Stream);
+    assert_eq!(Version::V1_1.transport(), TransportKind::Stream);
+    assert_eq!(Version::V2_0.transport(), TransportKind::Stream);
+    assert_eq!(Version::V3_0.transport(), TransportKind::Quic);
+}
+
+#[test]
+fn a_port_offers_only_what_its_transport_carries() {
+    let versions = [Version::V3_0, Version::V2_0, Version::V1_1, Version::V1_0];
+
+    assert_eq!(
+        Port::TCP(443).offers(&versions),
+        vec![Version::V2_0, Version::V1_1, Version::V1_0],
+        "a TCP port offers every stream version, in the order it was configured",
+    );
+    assert_eq!(
+        Port::UDS("/tmp/soyokaze.sock".to_owned()).offers(&versions),
+        vec![Version::V2_0, Version::V1_1, Version::V1_0],
+        "a Unix socket carries the same transport as TCP, so it offers the same versions",
+    );
+
+    // A QUIC endpoint settles its ALPN when it is stood up, before any
+    // connection arrives, so it has to offer the one version it will run
+    // rather than offer several and turn away whichever a peer picks.
+    assert_eq!(Port::QUIC(443).offers(&versions), vec![Version::V3_0], "a QUIC port offers exactly the version it will run");
+    assert!(Port::QUIC(443).offers(&[Version::V1_1, Version::V2_0]).is_empty(), "a QUIC port carries no stream version");
+    assert!(Port::TCP(80).offers(&[Version::V3_0]).is_empty(), "a stream port carries no QUIC version");
+
+    for offered in [Port::TCP(443).offers(&versions), Port::QUIC(443).offers(&versions)] {
+        for version in &offered {
+            assert!(
+                versions.contains(version),
+                "a port must never offer a version it was not configured with",
+            );
+        }
+    }
+}
+
+#[test]
+fn an_authority_is_written_the_same_way_from_parts_as_from_a_url() {
+    // RFC 9110 §4.2: the port is elided when it is the scheme's own, and an
+    // IPv6 literal wears the brackets it had in the URL.
+    let cases = [
+        ("https", "example.test", 443, "example.test"),
+        ("https", "example.test", 8443, "example.test:8443"),
+        ("http", "example.test", 80, "example.test"),
+        ("http", "example.test", 8080, "example.test:8080"),
+        ("wss", "example.test", 443, "example.test"),
+        ("https", "::1", 443, "[::1]"),
+        ("https", "::1", 8443, "[::1]:8443"),
+    ];
+
+    for (scheme, host, port, expected) in cases {
+        assert_eq!(Url::authority_of(scheme, host, port), expected, "{scheme}://{host}:{port} produced the wrong authority");
+
+        let url = Url::parse(&format!("{scheme}://{}:{port}/", if host.contains(':') { format!("[{host}]") } else { host.to_owned() }))
+            .expect("the URL did not parse");
+        assert_eq!(url.authority(), expected, "a parsed URL and its parts must agree on the authority");
+    }
 }

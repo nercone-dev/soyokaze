@@ -1,6 +1,7 @@
 mod support;
 
-use soyokaze::helpers::hpack::{self, Decoder, Encoder, HeaderField};
+use soyokaze::helpers::fields::{self, HeaderField};
+use soyokaze::helpers::hpack::{Decoder, Encoder};
 use support::{opaque, Group};
 
 fn field(name: &str, value: &str) -> HeaderField {
@@ -73,30 +74,30 @@ fn main() {
         group.throughput(name, block.len(), || decoder.decode(opaque(&block)));
     }
 
-    let mut group = Group::new("hpack primitives");
-    group.bench("encode_integer (fits the prefix)", || {
+    let mut group = Group::new("fields primitives");
+    group.bench("Integer::encode (fits the prefix)", || {
         let mut out = Vec::new();
-        hpack::encode_integer(&mut out, opaque(10), 5, 0);
+        fields::Integer::encode(&mut out, opaque(10), 5, 0);
         out
     });
-    group.bench("encode_integer (continuation)", || {
+    group.bench("Integer::encode (continuation)", || {
         let mut out = Vec::new();
-        hpack::encode_integer(&mut out, opaque(1337), 5, 0);
+        fields::Integer::encode(&mut out, opaque(1337), 5, 0);
         out
     });
-    group.bench("decode_integer (fits the prefix)", || hpack::decode_integer(opaque(&[10]), 5));
-    group.bench("decode_integer (continuation)", || hpack::decode_integer(opaque(&[31, 154, 10]), 5));
+    group.bench("Integer::decode (fits the prefix)", || fields::Integer::decode(opaque(&[10]), 5));
+    group.bench("Integer::decode (continuation)", || fields::Integer::decode(opaque(&[31, 154, 10]), 5));
 
     let value = b"www.example.com";
-    group.throughput("encode_string (huffman)", value.len(), || {
+    group.throughput("StringLiteral::encode (huffman)", value.len(), || {
         let mut out = Vec::new();
-        hpack::encode_string(&mut out, opaque(value), true);
+        fields::StringLiteral::encode(&mut out, opaque(value), 7, 0x00, true);
         out
     });
 
     let mut encoded = Vec::new();
-    hpack::encode_string(&mut encoded, value, true);
-    group.throughput("decode_string (huffman)", value.len(), || hpack::decode_string(opaque(&encoded)));
+    fields::StringLiteral::encode(&mut encoded, value, 7, 0x00, true);
+    group.throughput("StringLiteral::decode (huffman)", value.len(), || fields::StringLiteral::decode(opaque(&encoded), 7));
 
     let mut group = Group::new("hpack::Decoder::decode (rejected)");
     group.bench("index that names nothing", || Decoder::new().decode(opaque(&[0xbe])));

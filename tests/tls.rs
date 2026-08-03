@@ -2,7 +2,8 @@ use bytes::Bytes;
 
 use soyokaze::tls;
 use soyokaze::helpers::base64;
-use soyokaze::models::{Body, ConnectionID, Message, Method, Port, Security, Version};
+use soyokaze::models::{Body, ConnectionID, Message, Method, Port, Version};
+use soyokaze::tls::Security;
 use soyokaze::protocol::base::{AnyConnection, Connection};
 use soyokaze::{Client, ClientConfig, Format, Handler, Identity, Server, ServerConfig};
 
@@ -166,7 +167,7 @@ fn a_format_is_told_from_the_first_byte_that_is_not_whitespace() {
 fn pem_is_recognised_when_something_precedes_its_armour() {
     let described = format!("Subject: CN=soyokaze.test\nIssuer: CN=soyokaze.test\n\n{LEAF}");
     assert_eq!(Format::of(described.as_bytes()), Format::Pem);
-    assert_eq!(tls::certificates(described.as_bytes()).expect("described PEM did not parse").len(), 1);
+    assert_eq!(tls::Format::certificates(described.as_bytes()).expect("described PEM did not parse").len(), 1);
 
     let indented = format!("\n\n\t{LEAF}");
     assert_eq!(Format::of(indented.as_bytes()), Format::Pem);
@@ -174,8 +175,8 @@ fn pem_is_recognised_when_something_precedes_its_armour() {
 
 #[test]
 fn a_certificate_reads_the_same_from_der_and_from_pem() {
-    let from_der = tls::certificates(&der(LEAF)).expect("the DER certificate did not parse");
-    let from_pem = tls::certificates(LEAF.as_bytes()).expect("the PEM certificate did not parse");
+    let from_der = tls::Format::certificates(&der(LEAF)).expect("the DER certificate did not parse");
+    let from_pem = tls::Format::certificates(LEAF.as_bytes()).expect("the PEM certificate did not parse");
 
     assert_eq!(chain_der(&from_der).len(), 1, "one DER blob carries exactly one certificate");
     assert_eq!(chain_der(&from_der), chain_der(&from_pem));
@@ -186,7 +187,7 @@ fn a_pem_bundle_carries_every_certificate_in_the_order_written() {
     let issued: Vec<Issued> = ["leaf.test", "intermediate.test", "root.test"].map(issue).into_iter().collect();
     let bundle: String = issued.iter().map(|one| one.certificate_pem.as_str()).collect();
 
-    let parsed = tls::certificates(bundle.as_bytes()).expect("the bundle did not parse");
+    let parsed = tls::Format::certificates(bundle.as_bytes()).expect("the bundle did not parse");
     let expected: Vec<Vec<u8>> = issued.iter().map(|one| one.certificate_der.clone()).collect();
 
     assert_eq!(chain_der(&parsed), expected);
@@ -195,22 +196,22 @@ fn a_pem_bundle_carries_every_certificate_in_the_order_written() {
 #[test]
 fn a_pem_blob_holding_a_key_beside_its_chain_reads_as_the_chain() {
     let together = format!("{EC_SEC1}{LEAF}");
-    let parsed = tls::certificates(together.as_bytes()).expect("the combined file did not parse");
+    let parsed = tls::Format::certificates(together.as_bytes()).expect("the combined file did not parse");
 
     assert_eq!(chain_der(&parsed), vec![der(LEAF)]);
 }
 
 #[test]
 fn a_pem_blob_with_no_certificate_is_refused() {
-    assert!(tls::certificates(EC_SEC1.as_bytes()).is_err(), "a key alone is not a chain");
-    assert!(tls::certificates(b"not a certificate").is_err());
-    assert!(tls::certificates(b"").is_err());
+    assert!(tls::Format::certificates(EC_SEC1.as_bytes()).is_err(), "a key alone is not a chain");
+    assert!(tls::Format::certificates(b"not a certificate").is_err());
+    assert!(tls::Format::certificates(b"").is_err());
 }
 
 #[test]
 fn a_der_blob_that_is_not_a_certificate_is_refused() {
-    assert!(tls::certificates(&der(EC_SEC1)).is_err(), "a key is not a certificate");
-    assert!(tls::certificates(&[Format::SEQUENCE, 0x01, 0x00]).is_err());
+    assert!(tls::Format::certificates(&der(EC_SEC1)).is_err(), "a key is not a certificate");
+    assert!(tls::Format::certificates(&[Format::SEQUENCE, 0x01, 0x00]).is_err());
 }
 
 #[test]
@@ -229,8 +230,8 @@ fn a_chain_may_be_split_across_blobs_in_any_mixture_of_formats() {
 
     let expected = vec![leaf.certificate_der, intermediate.certificate_der, root.certificate_der];
 
-    assert_eq!(chain_der(&tls::certificate_list(&mixed).expect("the mixed chain did not parse")), expected);
-    assert_eq!(chain_der(&tls::certificate_list(&apiece).expect("the split chain did not parse")), expected);
+    assert_eq!(chain_der(&tls::Format::certificate_list(&mixed).expect("the mixed chain did not parse")), expected);
+    assert_eq!(chain_der(&tls::Format::certificate_list(&apiece).expect("the split chain did not parse")), expected);
 }
 
 #[test]
@@ -238,8 +239,8 @@ fn a_key_reads_the_same_from_der_and_from_pem() {
     let pkcs8 = issue("localhost");
 
     for (pem, der) in [(pkcs8.key_pem.as_str(), pkcs8.key_der.clone()), (RSA_PKCS1, der(RSA_PKCS1)), (EC_SEC1, der(EC_SEC1))] {
-        let from_der = tls::private_key(&der).expect("the DER key did not parse");
-        let from_pem = tls::private_key(pem.as_bytes()).expect("the PEM key did not parse");
+        let from_der = tls::Format::private_key(&der).expect("the DER key did not parse");
+        let from_pem = tls::Format::private_key(pem.as_bytes()).expect("the PEM key did not parse");
 
         assert_eq!(
             from_der.public_key_to_der().expect("the DER key did not re-encode"),
@@ -253,11 +254,11 @@ fn a_key_reads_the_same_from_der_and_from_pem() {
 fn one_file_holding_a_certificate_and_its_key_serves_as_both() {
     let combined = format!("{LEAF}{EC_SEC1}");
 
-    let chain = tls::certificates(combined.as_bytes()).expect("the chain did not parse");
+    let chain = tls::Format::certificates(combined.as_bytes()).expect("the chain did not parse");
     assert_eq!(chain_der(&chain), vec![der(LEAF)]);
 
-    let key = tls::private_key(combined.as_bytes()).expect("the key did not parse");
-    let expected = tls::private_key(EC_SEC1.as_bytes()).expect("the reference key did not parse");
+    let key = tls::Format::private_key(combined.as_bytes()).expect("the key did not parse");
+    let expected = tls::Format::private_key(EC_SEC1.as_bytes()).expect("the reference key did not parse");
     assert_eq!(
         key.public_key_to_der().expect("the combined key did not re-encode"),
         expected.public_key_to_der().expect("the reference key did not re-encode"),
@@ -266,15 +267,15 @@ fn one_file_holding_a_certificate_and_its_key_serves_as_both() {
 
 #[test]
 fn an_encrypted_key_is_refused_rather_than_guessed_at() {
-    assert!(tls::private_key(EC_PKCS8_ENCRYPTED.as_bytes()).is_err());
-    assert!(tls::private_key(&der(EC_PKCS8_ENCRYPTED)).is_err());
+    assert!(tls::Format::private_key(EC_PKCS8_ENCRYPTED.as_bytes()).is_err());
+    assert!(tls::Format::private_key(&der(EC_PKCS8_ENCRYPTED)).is_err());
 }
 
 #[test]
 fn a_blob_that_is_not_a_key_is_refused() {
-    assert!(tls::private_key(LEAF.as_bytes()).is_err(), "a certificate is not a key");
-    assert!(tls::private_key(&der(LEAF)).is_err());
-    assert!(tls::private_key(b"").is_err());
+    assert!(tls::Format::private_key(LEAF.as_bytes()).is_err(), "a certificate is not a key");
+    assert!(tls::Format::private_key(&der(LEAF)).is_err());
+    assert!(tls::Format::private_key(b"").is_err());
 }
 
 #[test]
@@ -286,7 +287,7 @@ fn a_pkcs12_archive_gives_back_the_certificate_and_key_it_carries() {
     assert_eq!(chain_der(&chain), vec![der(LEAF)], "the leaf did not come back");
 
     let key = identity.private_key().expect("the key did not parse");
-    let expected = tls::private_key(EC_SEC1.as_bytes()).expect("the reference key did not parse");
+    let expected = tls::Format::private_key(EC_SEC1.as_bytes()).expect("the reference key did not parse");
     assert_eq!(
         key.public_key_to_der().expect("the archived key did not re-encode"),
         expected.public_key_to_der().expect("the reference key did not re-encode"),
@@ -405,20 +406,20 @@ fn a_message_over_tls_carries_what_the_handshake_settled() {
         let identity = Identity::new(vec![issued.certificate_pem.into_bytes()], issued.key_pem.into_bytes());
         let response = exchange(identity, vec![issued.certificate_der], version, Port::TCP(0));
 
-        assert!(response.tls, "{version}: a message over TLS must say so");
-        assert!(response.secure, "{version}: a message over TLS is a secure one");
-        assert!(!response.quic, "{version}: TLS over TCP is not QUIC");
-        assert_eq!(response.quic_version, None, "{version}: there is no QUIC version without QUIC");
+        assert!(response.security.tls, "{version}: a message over TLS must say so");
+        assert!(response.security.secure, "{version}: a message over TLS is a secure one");
+        assert!(!response.security.quic, "{version}: TLS over TCP is not QUIC");
+        assert_eq!(response.security.quic_version, None, "{version}: there is no QUIC version without QUIC");
 
         assert_eq!(
-            response.tls_version.map(|version| version.0),
+            response.security.tls_version.map(|version| version.0),
             Some(TLS_1_3),
             "{version}: the negotiated TLS version must be reported as its wire code",
         );
-        assert!(response.tls_cipher.is_some(), "{version}: the negotiated cipher suite must be reported");
-        assert!(response.tls_group.is_some(), "{version}: the negotiated named group must be reported");
+        assert!(response.security.tls_cipher.is_some(), "{version}: the negotiated cipher suite must be reported");
+        assert!(response.security.tls_group.is_some(), "{version}: the negotiated named group must be reported");
 
-        assert!(!response.early_data, "{version}: nothing was sent as early data");
+        assert!(!response.security.early_data, "{version}: nothing was sent as early data");
     }
 }
 
@@ -428,13 +429,13 @@ fn a_message_over_quic_carries_the_quic_version_and_the_tls_it_mandates() {
     let identity = Identity::new(vec![issued.certificate_pem.clone().into_bytes()], issued.key_pem.into_bytes());
     let response = exchange(identity, vec![issued.certificate_pem.into_bytes()], Version::V3_0, Port::QUIC(0));
 
-    assert!(response.quic, "a message over QUIC must say so");
-    assert!(response.secure, "QUIC is secure by construction");
-    assert_eq!(response.quic_version, Some(quiche::PROTOCOL_VERSION), "the negotiated QUIC version must be reported");
+    assert!(response.security.quic, "a message over QUIC must say so");
+    assert!(response.security.secure, "QUIC is secure by construction");
+    assert_eq!(response.security.quic_version, Some(quiche::PROTOCOL_VERSION), "the negotiated QUIC version must be reported");
 
     // RFC 9001 §4.2: QUIC version 1 admits no TLS older than 1.3.
-    assert!(response.tls, "QUIC carries TLS within it");
-    assert_eq!(response.tls_version.map(|version| version.0), Some(TLS_1_3));
+    assert!(response.security.tls, "QUIC carries TLS within it");
+    assert_eq!(response.security.tls_version.map(|version| version.0), Some(TLS_1_3));
 }
 
 #[test]
@@ -460,14 +461,14 @@ fn a_message_over_plaintext_carries_nothing_underneath() {
 
     cluster.close(Some(1.0));
 
-    assert!(!response.tls, "there is no TLS under a plaintext connection");
-    assert!(!response.secure);
-    assert!(!response.quic);
-    assert_eq!(response.tls_version, None);
-    assert_eq!(response.tls_group, None);
-    assert_eq!(response.tls_cipher, None);
-    assert_eq!(response.quic_version, None);
-    assert!(!response.early_data);
+    assert!(!response.security.tls, "there is no TLS under a plaintext connection");
+    assert!(!response.security.secure);
+    assert!(!response.security.quic);
+    assert_eq!(response.security.tls_version, None);
+    assert_eq!(response.security.tls_group, None);
+    assert_eq!(response.security.tls_cipher, None);
+    assert_eq!(response.security.quic_version, None);
+    assert!(!response.security.early_data);
 }
 
 #[test]
@@ -503,30 +504,270 @@ fn a_connection_reports_the_same_facts_it_stamps_on_its_messages() {
     cluster.close(Some(1.0));
 
     let mut stamped = Message::response(0, Version::V1_1);
-    security.apply(&mut stamped);
+    stamped.security = security;
 
-    assert_eq!(stamped.tls, response.tls);
-    assert_eq!(stamped.secure, response.secure);
-    assert_eq!(stamped.tls_version, response.tls_version);
-    assert_eq!(stamped.tls_group, response.tls_group);
-    assert_eq!(stamped.tls_cipher, response.tls_cipher);
-    assert_eq!(stamped.quic, response.quic);
-    assert_eq!(stamped.quic_version, response.quic_version);
-    assert_eq!(stamped.early_data, response.early_data);
+    assert_eq!(stamped.security.tls, response.security.tls);
+    assert_eq!(stamped.security.secure, response.security.secure);
+    assert_eq!(stamped.security.tls_version, response.security.tls_version);
+    assert_eq!(stamped.security.tls_group, response.security.tls_group);
+    assert_eq!(stamped.security.tls_cipher, response.security.tls_cipher);
+    assert_eq!(stamped.security.quic, response.security.quic);
+    assert_eq!(stamped.security.quic_version, response.security.quic_version);
+    assert_eq!(stamped.security.early_data, response.security.early_data);
 }
 
 #[test]
 fn a_plaintext_transport_is_what_the_default_security_stands_for() {
     let mut message = Message::response(200, Version::V1_1);
-    message.tls = true;
-    message.secure = true;
-    message.quic = true;
+    message.security.tls = true;
+    message.security.secure = true;
+    message.security.quic = true;
 
-    Security::default().apply(&mut message);
+    message.security = Security::default();
 
-    assert!(!message.tls, "the default stands for nothing underneath, and says so");
-    assert!(!message.secure);
-    assert!(!message.quic);
+    assert!(!message.security.tls, "the default stands for nothing underneath, and says so");
+    assert!(!message.security.secure);
+    assert!(!message.security.quic);
+}
+
+/// As [`exchange`], but with each side's TLS details, and with a failed
+/// handshake returned rather than unwrapped.
+fn tls_exchange(
+    server_tls: tls::TlsConfig,
+    client_tls: tls::TlsConfig,
+    version: Version,
+    port: Port,
+) -> Result<Message, soyokaze::protocol::common::Error> {
+    let issued = issue("localhost");
+    let identity = Identity::new(vec![issued.certificate_pem.into_bytes()], issued.key_pem.into_bytes());
+    let roots = vec![issued.certificate_der];
+
+    let server = Server::new(ServerConfig {
+        versions: vec![version],
+        identity: Some(identity),
+        tls: server_tls,
+        ..ServerConfig::default()
+    });
+
+    let cluster = server.run(Echo, std::slice::from_ref(&port), 1).expect("the port did not open");
+    let address = cluster.address().expect("the cluster has no address");
+
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("no runtime");
+
+    let response = runtime.block_on(async move {
+        let client = Client::new(ClientConfig { versions: vec![version], roots: Some(roots), tls: client_tls, ..ClientConfig::default() });
+
+        let target = match port {
+            Port::QUIC(_) => Port::QUIC(address.port()),
+            _ => Port::TCP(address.port()),
+        };
+
+        let mut connection = client.connect("localhost", target).await?;
+        let request = Message::request(Method::GET, "/index.html", version);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), client.request(&mut connection, request))
+            .await
+            .expect("the server did not answer")?;
+
+        connection.close().await;
+        Ok(response)
+    });
+
+    cluster.close(Some(1.0));
+    response
+}
+
+/// RFC 8446 §4.2.7: the named group codes the handshake carries; secp384r1
+/// is 0x0018 and x25519 is 0x001D.
+const SECP384R1: u16 = 0x0018;
+const X25519: u16 = 0x001d;
+
+#[test]
+fn a_server_restricted_to_one_group_settles_the_handshake_on_it() {
+    let server_tls = tls::TlsConfig { groups: Some("P-384".into()), ..tls::TlsConfig::default() };
+
+    let response = tls_exchange(server_tls, tls::TlsConfig::default(), Version::V2_0, Port::TCP(0))
+        .expect("a group the client also supports must not fail the handshake");
+
+    assert_eq!(
+        response.security.tls_group.map(|group| group.0),
+        Some(SECP384R1),
+        "the group the server was restricted to is the only one the handshake can settle on",
+    );
+}
+
+#[test]
+fn a_client_preferring_one_group_settles_the_handshake_on_it() {
+    let client_tls = tls::TlsConfig { groups: Some("X25519".into()), ..tls::TlsConfig::default() };
+
+    let response = tls_exchange(tls::TlsConfig::default(), client_tls, Version::V2_0, Port::TCP(0))
+        .expect("a group the server also supports must not fail the handshake");
+
+    assert_eq!(response.security.tls_group.map(|group| group.0), Some(X25519));
+}
+
+#[test]
+fn a_restricted_group_reaches_a_quic_handshake_too() {
+    let p384 = tls::TlsConfig { groups: Some("P-384".into()), ..tls::TlsConfig::default() };
+    let x25519 = tls::TlsConfig { groups: Some("X25519".into()), ..tls::TlsConfig::default() };
+
+    let same = tls_exchange(p384.clone(), p384.clone(), Version::V3_0, Port::QUIC(0));
+    assert!(same.is_ok(), "one shared group must be enough to complete the handshake");
+
+    let disjoint = tls_exchange(p384, x25519, Version::V3_0, Port::QUIC(0));
+    assert!(disjoint.is_err(), "ends with no group in common must fail the handshake rather than pick one unoffered");
+}
+
+#[test]
+fn a_signature_algorithm_matching_the_key_completes_the_handshake() {
+    let server_tls = tls::TlsConfig { signature_algorithms: Some("ecdsa_secp256r1_sha256".into()), ..tls::TlsConfig::default() };
+
+    let response = tls_exchange(server_tls, tls::TlsConfig::default(), Version::V2_0, Port::TCP(0))
+        .expect("the algorithm the key signs with must not fail the handshake");
+
+    assert_eq!(response.status_code, Some(200));
+}
+
+#[test]
+fn a_signature_algorithm_the_key_cannot_sign_with_fails_the_handshake() {
+    let server_tls = tls::TlsConfig { signature_algorithms: Some("rsa_pss_rsae_sha256".into()), ..tls::TlsConfig::default() };
+
+    let result = tls_exchange(server_tls, tls::TlsConfig::default(), Version::V2_0, Port::TCP(0));
+
+    assert!(result.is_err(), "an ECDSA key cannot sign RSA-PSS, so the handshake must fail rather than mislead");
+}
+
+#[test]
+fn a_compressed_certificate_serves_tls() {
+    let compressed = tls::TlsConfig { certificate_compression: true, ..tls::TlsConfig::default() };
+
+    let response = tls_exchange(compressed.clone(), compressed, Version::V2_0, Port::TCP(0))
+        .expect("RFC 8879 compression must not fail a handshake both sides support");
+
+    assert_eq!(response.status_code, Some(200));
+}
+
+#[test]
+fn a_compressing_server_sends_a_certificate_the_client_must_inflate() {
+    use boring::ssl::{CertificateCompressionAlgorithm, CertificateCompressor, SslConnector, SslMethod, SslVerifyMode};
+
+    static INFLATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    struct CountingZlib;
+
+    impl CertificateCompressor for CountingZlib {
+        const ALGORITHM: CertificateCompressionAlgorithm = CertificateCompressionAlgorithm::ZLIB;
+        const CAN_COMPRESS: bool = false;
+        const CAN_DECOMPRESS: bool = true;
+
+        fn decompress<W: std::io::Write>(&self, input: &[u8], output: &mut W) -> std::io::Result<()> {
+            INFLATED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tls::ZlibCertificateCompressor.decompress(input, output)
+        }
+    }
+
+    let issued = issue("localhost");
+    let identity = Identity::new(vec![issued.certificate_pem.into_bytes()], issued.key_pem.into_bytes());
+
+    let server = Server::new(ServerConfig {
+        versions: vec![Version::V1_1],
+        identity: Some(identity),
+        tls: tls::TlsConfig { certificate_compression: true, ..tls::TlsConfig::default() },
+        ..ServerConfig::default()
+    });
+
+    let cluster = server.run(Echo, &[Port::TCP(0)], 1).expect("the port did not open");
+    let port = cluster.address().expect("the cluster has no address").port();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("no runtime");
+
+    runtime.block_on(async move {
+        let mut builder = SslConnector::builder(SslMethod::tls()).expect("no connector");
+        builder.add_certificate_compression_algorithm(CountingZlib).expect("the algorithm was refused");
+        builder.set_verify(SslVerifyMode::NONE);
+
+        let transport = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.expect("the port refused a connection");
+        let config = builder.build().configure().expect("no configuration");
+
+        tokio_boring::connect(config, "localhost", transport).await.expect("a compressed certificate must still complete the handshake");
+    });
+
+    cluster.close(Some(1.0));
+
+    assert!(
+        INFLATED.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "RFC 8879 §4: a server holding a compress-capable algorithm the client advertised must send CompressedCertificate",
+    );
+}
+
+#[test]
+fn a_compressing_server_still_serves_a_client_that_does_not_join_in() {
+    let server_tls = tls::TlsConfig { certificate_compression: true, ..tls::TlsConfig::default() };
+
+    let response = tls_exchange(server_tls, tls::TlsConfig::default(), Version::V2_0, Port::TCP(0))
+        .expect("a client without the extension must be served plain certificates");
+
+    assert_eq!(response.status_code, Some(200));
+}
+
+#[test]
+fn tickets_off_and_server_preference_still_complete_a_handshake() {
+    let server_tls = tls::TlsConfig { session_tickets: false, prefer_server_ciphers: true, ..tls::TlsConfig::default() };
+
+    let response = tls_exchange(server_tls, tls::TlsConfig::default(), Version::V2_0, Port::TCP(0))
+        .expect("declining tickets changes resumption, not the handshake");
+
+    assert_eq!(response.status_code, Some(200));
+}
+
+#[test]
+fn zlib_certificate_compression_round_trips() {
+    use boring::ssl::CertificateCompressor;
+
+    let input: Vec<u8> = (0..4096u32).flat_map(|n| n.to_be_bytes()).collect();
+
+    let mut compressed = Vec::new();
+    tls::ZlibCertificateCompressor.compress(&input, &mut compressed).expect("compression failed");
+
+    assert_eq!(compressed.first().map(|byte| byte & 0x0f), Some(8), "the output must be zlib, not raw deflate or gzip");
+
+    let mut decompressed = Vec::new();
+    tls::ZlibCertificateCompressor.decompress(&compressed, &mut decompressed).expect("decompression failed");
+
+    assert_eq!(decompressed, input, "what was compressed must come back exactly");
+}
+
+#[test]
+fn an_unusable_tls_list_is_refused_when_the_context_is_built() {
+    let issued = issue("localhost");
+    let identity = Identity::new(vec![issued.certificate_pem.into_bytes()], issued.key_pem.into_bytes());
+    let versions = [Version::V2_0];
+
+    let bad_ciphers = tls::TlsConfig { ciphers: Some("NO-SUCH-CIPHER".into()), ..tls::TlsConfig::default() };
+    let bad_groups = tls::TlsConfig { groups: Some("NoSuchGroup".into()), ..tls::TlsConfig::default() };
+    let bad_algorithms = tls::TlsConfig { signature_algorithms: Some("no_such_algorithm".into()), ..tls::TlsConfig::default() };
+
+    for unusable in [&bad_ciphers, &bad_groups, &bad_algorithms] {
+        assert!(
+            unusable.server(&identity, &versions, None).is_err(),
+            "a list naming nothing usable must surface when the context is built, not at some later handshake",
+        );
+        assert!(unusable.client(&[], &versions).is_err());
+    }
+}
+
+#[test]
+fn a_cipher_list_the_profile_recognises_is_accepted() {
+    let issued = issue("localhost");
+    let identity = Identity::new(vec![issued.certificate_pem.into_bytes()], issued.key_pem.into_bytes());
+
+    let tls = tls::TlsConfig {
+        ciphers: Some("ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305".into()),
+        ..tls::TlsConfig::default()
+    };
+
+    assert!(tls.server(&identity, &[Version::V2_0], None).is_ok());
+    assert!(tls.client(&[], &[Version::V2_0]).is_ok());
 }
 
 #[test]
@@ -551,7 +792,7 @@ fn a_pkcs12_identity_serves_tls() {
         let id = ConnectionID(Bytes::from_static(b"test"));
 
         let mut connection = client
-            .connect_stream("soyokaze.test", Box::new(transport), id)
+            .connect_stream("soyokaze.test", Box::new(transport), id, "soyokaze.test")
             .await
             .expect("the archived identity did not complete a handshake");
 

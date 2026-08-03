@@ -18,11 +18,10 @@
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use crate::api::common::Limits;
 use crate::helpers::{base64, sha1};
-use crate::models::{ConnectionID, Headers, Message, Method, Role, Version};
+use crate::models::{ConnectionID, Headers, Limits, Message, Method, Role, Version};
 use crate::protocol::base::{AnyConnection, Connection, Transport};
-use crate::protocol::common::{self, Buffer, Error};
+use crate::protocol::common::{Buffer, Error};
 
 /// The fixed string a server hashes with the client's nonce to prove it read
 /// the handshake.
@@ -171,6 +170,18 @@ pub struct Frame {
 }
 
 impl Frame {
+    /// Fills `out` with cryptographically secure random octets.
+    ///
+    /// Masking keys and handshake nonces both come from here, so the one
+    /// place that needs a source of randomness is this module.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Tls`] when BoringSSL cannot reach a source of randomness.
+    pub fn random(out: &mut [u8]) -> Result<(), Error> {
+        boring::rand::rand_bytes(out).map_err(|_| Error::Tls("BoringSSL has no source of randomness".into()))
+    }
+
     /// A complete, unmasked frame.
     ///
     /// The mask is filled in by [`WebSocketConnection::send`] according to the
@@ -261,13 +272,13 @@ impl Frame {
 
         let masked = data[1] & 0x80 != 0;
         let (mut consumed, length) = match data[1] & 0x7f {
-            126 => match octets::<2>(data, 2) {
+            126 => match Self::octets::<2>(data, 2) {
                 Some(octets) => (4, u16::from_be_bytes(octets) as u64),
                 None => return Ok(None),
             },
 
             127 => {
-                let Some(octets) = octets::<8>(data, 2) else {
+                let Some(octets) = Self::octets::<8>(data, 2) else {
                     return Ok(None);
                 };
 
@@ -292,7 +303,7 @@ impl Frame {
         }
 
         let mask = if masked {
-            let Some(mask) = octets::<4>(data, consumed) else {
+            let Some(mask) = Self::octets::<4>(data, consumed) else {
                 return Ok(None);
             };
 
@@ -317,232 +328,324 @@ impl Frame {
 
         Ok(Some((end, Self { fin, opcode, mask, payload })))
     }
-}
 
-/// Reads `N` octets at `offset`, or `None` when they are not all there.
-pub fn octets<const N: usize>(data: &[u8], offset: usize) -> Option<[u8; N]> {
-    let end = offset.checked_add(N)?;
-    data.get(offset..end).and_then(|slice| <[u8; N]>::try_from(slice).ok())
-}
-
-/// The `Sec-WebSocket-Accept` value for a client's `Sec-WebSocket-Key`.
-///
-/// The base64 of the SHA-1 of the key concatenated with [`GUID`]. This is not
-/// a security mechanism — it only shows the peer read the request and is
-/// speaking WebSocket rather than something that stumbled onto the port.
-pub fn accept_key(key: &str) -> String {
-    base64::encode(&sha1::sha1(format!("{key}{GUID}").as_bytes()))
-}
-
-/// A fresh `Sec-WebSocket-Key`: sixteen random octets, base64 encoded.
-///
-/// # Errors
-///
-/// Returns [`Error::Tls`] when no randomness is available.
-pub fn nonce() -> Result<String, Error> {
-    let mut key = [0u8; 16];
-    common::random(&mut key)?;
-    Ok(base64::encode(&key))
-}
-
-/// A fresh masking key.
-///
-/// It has to be unpredictable: masking exists so that a client cannot be
-/// tricked into putting attacker-chosen octets on the wire verbatim, which a
-/// guessable key would undo.
-///
-/// # Errors
-///
-/// Returns [`Error::Tls`] when no randomness is available.
-pub fn masking_key() -> Result<[u8; 4], Error> {
-    let mut key = [0u8; 4];
-    common::random(&mut key)?;
-    Ok(key)
-}
-
-/// The HTTP/1.1 upgrade request that opens a WebSocket.
-pub fn handshake_request(host: &str, target: &str, key: &str) -> Message {
-    let mut headers = Headers::new();
-    headers.append("host", host);
-    headers.append("upgrade", PROTOCOL);
-    headers.append("connection", "Upgrade");
-    headers.append("sec-websocket-key", key);
-    headers.append("sec-websocket-version", VERSION);
-
-    let mut request = Message::request(Method::GET, target, Version::V1_1);
-    request.headers = Some(headers);
-    request
-}
-
-/// The `101 Switching Protocols` that accepts an HTTP/1.1 upgrade.
-pub fn handshake_response(key: &str) -> Message {
-    let mut headers = Headers::new();
-    headers.append("upgrade", PROTOCOL);
-    headers.append("connection", "Upgrade");
-    headers.append("sec-websocket-accept", accept_key(key));
-
-    let mut response = Message::response(101, Version::V1_1);
-    response.headers = Some(headers);
-    response
-}
-
-/// Checks an HTTP/1.1 upgrade request and returns its `Sec-WebSocket-Key`.
-///
-/// # Errors
-///
-/// Returns [`Error::Protocol`] when the request has no fields, is not a `GET`,
-/// does not ask for a WebSocket upgrade, offers a version other than
-/// [`VERSION`], or carries a key that is not sixteen base64 encoded octets.
-pub fn verify_request(request: &Message) -> Result<String, Error> {
-    let headers = request.headers.as_ref().ok_or_else(|| Error::Protocol("the request has no fields".into()))?;
-
-    if request.method != Some(Method::GET) {
-        return Err(Error::Protocol("a WebSocket handshake is a GET".into()));
+    /// Reads `N` octets at `offset`, or `None` when they are not all there.
+    pub fn octets<const N: usize>(data: &[u8], offset: usize) -> Option<[u8; N]> {
+        let end = offset.checked_add(N)?;
+        data.get(offset..end).and_then(|slice| <[u8; N]>::try_from(slice).ok())
     }
 
-    if !token_present(headers, "upgrade", PROTOCOL) || !token_present(headers, "connection", "upgrade") {
-        return Err(Error::Protocol("the request does not ask for an upgrade to WebSocket".into()));
+    /// A fresh masking key.
+    ///
+    /// It has to be unpredictable: masking exists so that a client cannot be
+    /// tricked into putting attacker-chosen octets on the wire verbatim, which
+    /// a guessable key would undo.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Tls`] when no randomness is available.
+    pub fn masking_key() -> Result<[u8; 4], Error> {
+        let mut key = [0u8; 4];
+        Frame::random(&mut key)?;
+        Ok(key)
     }
-
-    if headers.get("sec-websocket-version") != Some(VERSION) {
-        return Err(Error::Protocol("the request does not offer WebSocket version 13".into()));
-    }
-
-    let key = headers
-        .get("sec-websocket-key")
-        .ok_or_else(|| Error::Protocol("the request carries no Sec-WebSocket-Key".into()))?;
-
-    if base64::decode(key).map(|key| key.len()) != Ok(16) {
-        return Err(Error::Protocol("Sec-WebSocket-Key is not sixteen base64 encoded octets".into()));
-    }
-
-    Ok(key.to_owned())
 }
 
-/// Checks the server's answer to an HTTP/1.1 upgrade.
+/// The HTTP/1.1 `Upgrade` handshake.
 ///
-/// # Errors
+/// The client offers a nonce and the server answers with the accept key
+/// derived from it, which is what shows the peer read the request rather than
+/// having stumbled onto the port.
 ///
-/// Returns [`Error::Protocol`] when the response has no fields, is not `101`,
-/// does not confirm the upgrade, or carries a `Sec-WebSocket-Accept` that does
-/// not match the nonce that was sent.
-pub fn verify_response(response: &Message, key: &str) -> Result<(), Error> {
-    let headers = response.headers.as_ref().ok_or_else(|| Error::Protocol("the response has no fields".into()))?;
+/// RFC 6455 §1.7 requires HTTP/1.1 or later: HTTP/1.0 has no `Upgrade` to
+/// build on, so [`Handshake`] turns it away rather than trying this on it.
+pub struct Upgrade;
 
-    if response.status_code != Some(101) {
-        return Err(Error::Protocol(format!("the server answered {:?} rather than 101", response.status_code)));
+impl Upgrade {
+    /// The `Sec-WebSocket-Accept` value for a client's `Sec-WebSocket-Key`.
+    ///
+    /// The base64 of the SHA-1 of the key concatenated with [`GUID`]. This is
+    /// not a security mechanism — it only shows the peer read the request and
+    /// is speaking WebSocket rather than something that stumbled onto the port.
+    pub fn accept_key(key: &str) -> String {
+        base64::encode(&sha1::sha1(format!("{key}{GUID}").as_bytes()))
     }
 
-    if !token_present(headers, "upgrade", PROTOCOL) || !token_present(headers, "connection", "upgrade") {
-        return Err(Error::Protocol("the response does not confirm the upgrade".into()));
+    /// A fresh `Sec-WebSocket-Key`: sixteen random octets, base64 encoded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Tls`] when no randomness is available.
+    pub fn nonce() -> Result<String, Error> {
+        let mut key = [0u8; 16];
+        Frame::random(&mut key)?;
+        Ok(base64::encode(&key))
     }
 
-    if headers.get("sec-websocket-accept") != Some(accept_key(key).as_str()) {
-        return Err(Error::Protocol("Sec-WebSocket-Accept does not match the nonce".into()));
+    /// The upgrade request that opens a WebSocket.
+    pub fn request(host: &str, target: &str, key: &str, version: Version) -> Message {
+        let mut headers = Headers::new();
+        headers.append("host", host);
+        headers.append("upgrade", PROTOCOL);
+        headers.append("connection", "Upgrade");
+        headers.append("sec-websocket-key", key);
+        headers.append("sec-websocket-version", VERSION);
+
+        let mut request = Message::request(Method::GET, target, version);
+        request.headers = Some(headers);
+        request
     }
 
-    Ok(())
+    /// The `101 Switching Protocols` that accepts an upgrade.
+    pub fn response(key: &str, version: Version) -> Message {
+        let mut headers = Headers::new();
+        headers.append("upgrade", PROTOCOL);
+        headers.append("connection", "Upgrade");
+        headers.append("sec-websocket-accept", Self::accept_key(key));
+
+        let mut response = Message::response(101, version);
+        response.headers = Some(headers);
+        response
+    }
+
+    /// Checks an upgrade request and returns its `Sec-WebSocket-Key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when the request has no fields, is not a
+    /// `GET`, does not ask for a WebSocket upgrade, offers a version other than
+    /// [`VERSION`], or carries a key that is not sixteen base64 encoded octets.
+    pub fn verify_request(request: &Message) -> Result<String, Error> {
+        let headers = request.headers.as_ref().ok_or_else(|| Error::Protocol("the request has no fields".into()))?;
+
+        if request.method != Some(Method::GET) {
+            return Err(Error::Protocol("a WebSocket handshake is a GET".into()));
+        }
+
+        if !Handshake::token_present(headers, "upgrade", PROTOCOL)
+            || !Handshake::token_present(headers, "connection", "upgrade")
+        {
+            return Err(Error::Protocol("the request does not ask for an upgrade to WebSocket".into()));
+        }
+
+        if headers.get("sec-websocket-version") != Some(VERSION) {
+            return Err(Error::Protocol("the request does not offer WebSocket version 13".into()));
+        }
+
+        let key = headers
+            .get("sec-websocket-key")
+            .ok_or_else(|| Error::Protocol("the request carries no Sec-WebSocket-Key".into()))?;
+
+        if base64::decode(key).map(|key| key.len()) != Ok(16) {
+            return Err(Error::Protocol("Sec-WebSocket-Key is not sixteen base64 encoded octets".into()));
+        }
+
+        Ok(key.to_owned())
+    }
+
+    /// Checks the server's answer to an upgrade.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when the response has no fields, is not
+    /// `101`, does not confirm the upgrade, or carries a `Sec-WebSocket-Accept`
+    /// that does not match the nonce that was sent.
+    pub fn verify_response(response: &Message, key: &str) -> Result<(), Error> {
+        let headers = response.headers.as_ref().ok_or_else(|| Error::Protocol("the response has no fields".into()))?;
+
+        if response.status_code != Some(101) {
+            return Err(Error::Protocol(format!("the server answered {:?} rather than 101", response.status_code)));
+        }
+
+        if !Handshake::token_present(headers, "upgrade", PROTOCOL)
+            || !Handshake::token_present(headers, "connection", "upgrade")
+        {
+            return Err(Error::Protocol("the response does not confirm the upgrade".into()));
+        }
+
+        if headers.get("sec-websocket-accept") != Some(Self::accept_key(key).as_str()) {
+            return Err(Error::Protocol("Sec-WebSocket-Accept does not match the nonce".into()));
+        }
+
+        Ok(())
+    }
 }
 
-/// Whether a field carries a token, across repeats and comma-separated lists.
-///
-/// Matching ignores case, as these tokens are case-insensitive.
-pub fn token_present(headers: &Headers, name: &str, token: &str) -> bool {
-    headers
-        .get_all(name)
-        .flat_map(|value| value.split(','))
-        .any(|value| value.trim().eq_ignore_ascii_case(token))
-}
-
-/// The extended `CONNECT` that opens a WebSocket over HTTP/2 or HTTP/3.
+/// The extended `CONNECT` handshake, over HTTP/2 and HTTP/3.
 ///
 /// There is no nonce and no accept key: the stream is already authenticated by
 /// the connection it runs on, so the HTTP/1.1 proof of understanding is not
-/// needed.
-pub fn connect_request(authority: &str, target: &str, version: Version) -> Message {
-    let mut headers = Headers::new();
-    headers.append("host", authority);
-    headers.append(":protocol", PROTOCOL);
-    headers.append("sec-websocket-version", VERSION);
+/// needed. Otherwise this mirrors [`Upgrade`] method for method.
+pub struct Connect;
 
-    let mut request = Message::request(Method::CONNECT, target, version);
-    request.secure = true;
-    request.headers = Some(headers);
-    request
-}
+impl Connect {
+    /// The extended `CONNECT` that opens a WebSocket.
+    ///
+    /// Nothing is assumed about the transport: the `:scheme` the request is
+    /// framed with follows [`Message::security`], which the caller stamps from
+    /// the connection this is going out over, so an extended `CONNECT` over a
+    /// plaintext connection is not framed as though it were secure.
+    ///
+    /// [`Message::security`]: crate::models::Message::security
+    pub fn request(authority: &str, target: &str, version: Version) -> Message {
+        let mut headers = Headers::new();
+        headers.append("host", authority);
+        headers.append(":protocol", PROTOCOL);
+        headers.append("sec-websocket-version", VERSION);
 
-/// The `200 OK` that accepts an extended `CONNECT`.
-///
-/// The caller must set [`Message::stream_id`] to the request's before sending.
-///
-/// [`Message::stream_id`]: crate::models::Message::stream_id
-pub fn connect_response(version: Version) -> Message {
-    let mut response = Message::response(200, version);
-    response.headers = Some(Headers::new());
-    response
-}
-
-/// Checks an extended `CONNECT` request.
-///
-/// # Errors
-///
-/// Returns [`Error::Protocol`] when the request has no fields, is not a
-/// `CONNECT`, or does not name [`PROTOCOL`] in `:protocol`.
-pub fn verify_connect_request(request: &Message) -> Result<(), Error> {
-    let headers = request.headers.as_ref().ok_or_else(|| Error::Protocol("the request has no fields".into()))?;
-
-    if request.method != Some(Method::CONNECT) {
-        return Err(Error::Protocol("an extended CONNECT is a CONNECT".into()));
+        let mut request = Message::request(Method::CONNECT, target, version);
+        request.headers = Some(headers);
+        request
     }
 
-    if headers.get(":protocol") != Some(PROTOCOL) {
-        return Err(Error::Protocol("the request does not name the WebSocket protocol".into()));
+    /// The `200 OK` that accepts an extended `CONNECT`.
+    ///
+    /// The caller must set [`Message::stream_id`] to the request's before
+    /// sending.
+    ///
+    /// [`Message::stream_id`]: crate::models::Message::stream_id
+    pub fn response(version: Version) -> Message {
+        let mut response = Message::response(200, version);
+        response.headers = Some(Headers::new());
+        response
     }
 
-    Ok(())
-}
+    /// Checks an extended `CONNECT` request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when the request has no fields, is not a
+    /// `CONNECT`, or does not name [`PROTOCOL`] in `:protocol`.
+    pub fn verify_request(request: &Message) -> Result<(), Error> {
+        let headers = request.headers.as_ref().ok_or_else(|| Error::Protocol("the request has no fields".into()))?;
 
-/// Checks the server's answer to an extended `CONNECT`.
-///
-/// # Errors
-///
-/// Returns [`Error::Protocol`] for any status outside 2xx.
-pub fn verify_connect_response(response: &Message) -> Result<(), Error> {
-    match response.status_code {
-        Some(200..=299) => Ok(()),
-        status_code => Err(Error::Protocol(format!("the server answered {status_code:?} rather than 2xx"))),
-    }
-}
-
-/// Whether a request is asking for a WebSocket, whichever version it arrived on.
-///
-/// A cheap test meant for routing; it does not check that the handshake is
-/// well formed. Use [`verify_upgrade`] before accepting one.
-pub fn upgrade_requested(request: &Message) -> bool {
-    let Some(headers) = request.headers.as_ref() else {
-        return false;
-    };
-
-    match request.version.major() {
-        1 => {
-            request.method == Some(Method::GET)
-                && token_present(headers, "upgrade", PROTOCOL)
-                && token_present(headers, "connection", "upgrade")
+        if request.method != Some(Method::CONNECT) {
+            return Err(Error::Protocol("an extended CONNECT is a CONNECT".into()));
         }
-        _ => request.method == Some(Method::CONNECT) && headers.get(":protocol") == Some(PROTOCOL),
+
+        if headers.get(":protocol") != Some(PROTOCOL) {
+            return Err(Error::Protocol("the request does not name the WebSocket protocol".into()));
+        }
+
+        Ok(())
+    }
+
+    /// Checks the server's answer to an extended `CONNECT`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] for any status outside 2xx.
+    pub fn verify_response(response: &Message) -> Result<(), Error> {
+        match response.status_code {
+            Some(200..=299) => Ok(()),
+            status_code => Err(Error::Protocol(format!("the server answered {status_code:?} rather than 2xx"))),
+        }
     }
 }
 
-/// Checks a WebSocket handshake, whichever version it arrived on.
+/// The handshake, whichever version it arrives on.
 ///
-/// # Errors
-///
-/// As [`verify_request`] for HTTP/1.x, and [`verify_connect_request`] above it.
-pub fn verify_upgrade(request: &Message) -> Result<(), Error> {
-    match request.version.major() {
-        1 => verify_request(request).map(|_| ()),
-        _ => verify_connect_request(request),
+/// Dispatches to [`Upgrade`] for HTTP/1.x and to [`Connect`] above it, so a
+/// caller that does not care which one it got need not ask.
+pub struct Handshake;
+
+impl Handshake {
+    /// Whether a request is asking for a WebSocket.
+    ///
+    /// A cheap test meant for routing; it does not check that the handshake is
+    /// well formed. Use [`Handshake::verify`] before accepting one.
+    ///
+    /// The two ways in are enumerated rather than assumed: HTTP/1.1 asks with
+    /// the RFC 6455 §4.1 upgrade, and HTTP/2 and HTTP/3 with the extended
+    /// `CONNECT` of RFC 8441 and RFC 9220. HTTP/1.0 has neither, and is turned
+    /// away rather than being taken for HTTP/1.1. A version that bootstraps
+    /// WebSocket some third way has to be added here rather than falling into
+    /// either.
+    pub fn requested(request: &Message) -> bool {
+        let Some(headers) = request.headers.as_ref() else {
+            return false;
+        };
+
+        match request.version {
+            Version::V1_1 => {
+                request.method == Some(Method::GET)
+                    && Self::token_present(headers, "upgrade", PROTOCOL)
+                    && Self::token_present(headers, "connection", "upgrade")
+            }
+            Version::V2_0 | Version::V3_0 => request.method == Some(Method::CONNECT) && headers.get(":protocol") == Some(PROTOCOL),
+            Version::V1_0 => false,
+        }
     }
+
+    /// Checks a WebSocket handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] for a version that carries no WebSocket
+    /// handshake at all, and otherwise as [`Upgrade::verify_request`] for
+    /// HTTP/1.1 and [`Connect::verify_request`] above it.
+    pub fn verify(request: &Message) -> Result<(), Error> {
+        match request.version {
+            Version::V1_1 => Upgrade::verify_request(request).map(|_| ()),
+            Version::V2_0 | Version::V3_0 => Connect::verify_request(request),
+            Version::V1_0 => Err(Error::Protocol("WebSocket needs HTTP/1.1 or later".into())),
+        }
+    }
+
+    /// The `426 Upgrade Required` refusing a WebSocket handshake.
+    ///
+    /// [`Message::upgrade_required`] with what WebSocket owes on top: the
+    /// `Sec-WebSocket-Version` the client should retry with.
+    pub fn refusal(request: &Message, version: Version) -> Message {
+        let mut response = Message::upgrade_required(request, version, PROTOCOL);
+        response.headers.get_or_insert_with(Headers::new).append("sec-websocket-version", VERSION);
+        response
+    }
+
+    /// Answers a WebSocket handshake on a server connection.
+    ///
+    /// A handshake that checks out upgrades the connection into the returned
+    /// socket; one that does not is answered with [`Handshake::refusal`] and
+    /// the connection is handed back to keep serving.
+    pub async fn answer(connection: AnyConnection, request: &Message, limits: impl Into<WebSocketLimits>) -> Answer {
+        let mut connection = connection;
+
+        if Self::verify(request).is_err() {
+            let refusal = Self::refusal(request, connection.version());
+            return match connection.send(refusal).await {
+                Ok(()) => Answer::Refused(connection),
+                Err(_) => Answer::Failed,
+            };
+        }
+
+        match connection.accept_websocket(request, limits).await {
+            Ok(socket) => Answer::Accepted(socket),
+            Err(_) => Answer::Failed,
+        }
+    }
+
+    /// Whether a field carries a token, across repeats and comma-separated
+    /// lists.
+    ///
+    /// Matching ignores case, as these tokens are case-insensitive.
+    pub fn token_present(headers: &Headers, name: &str, token: &str) -> bool {
+        headers
+            .get_all(name)
+            .flat_map(|value| value.split(','))
+            .any(|value| value.trim().eq_ignore_ascii_case(token))
+    }
+}
+
+/// What answering a WebSocket handshake left behind.
+#[allow(clippy::large_enum_variant)]
+pub enum Answer {
+    /// The upgrade was accepted; the connection has become this socket.
+    Accepted(WebSocketConnection<Box<dyn Transport>>),
+    /// The handshake did not check out; the refusal was sent and the
+    /// connection keeps serving.
+    Refused(AnyConnection),
+    /// The connection failed while answering, and is gone.
+    Failed,
 }
 
 impl AnyConnection {
@@ -562,44 +665,38 @@ impl AnyConnection {
     /// Returns [`Error::Protocol`] when the handshake does not check out or
     /// the request names no stream, and otherwise as
     /// [`Connection::send`].
-    pub async fn accept_websocket(self, request: &Message) -> Result<WebSocketConnection<Box<dyn Transport>>, Error> {
+    pub async fn accept_websocket(self, request: &Message, limits: impl Into<WebSocketLimits>) -> Result<WebSocketConnection<Box<dyn Transport>>, Error> {
         let id = self.id();
+        let limits = limits.into();
+        let mut connection = self;
 
-        match self {
-            Self::H1(mut connection) => {
-                let key = verify_request(request)?;
-                connection.send(handshake_response(&key)).await?;
-
-                let limits = *connection.limits();
-                let (transport, buffer) = connection.upgrade();
-                Ok(WebSocketConnection::resume(transport, Role::Origin, id, limits, buffer))
+        let stream_id = match connection.version() {
+            Version::V1_1 => {
+                let key = Upgrade::verify_request(request)?;
+                connection.send(Upgrade::response(&key, connection.version())).await?;
+                None
             }
 
-            Self::H2(mut connection) => {
-                verify_connect_request(request)?;
+            Version::V2_0 | Version::V3_0 => {
+                Connect::verify_request(request)?;
                 let stream_id = request.stream_id.ok_or_else(|| Error::Protocol("the request names no stream".into()))?;
 
-                let mut response = connect_response(Version::V2_0);
+                let mut response = Connect::response(connection.version());
                 response.stream_id = Some(stream_id);
                 connection.send(response).await?;
 
-                let limits = *connection.limits();
-                Ok(WebSocketConnection::new(Box::new(connection.tunnel(stream_id)), Role::Origin, id, limits))
+                Some(stream_id)
             }
 
-            Self::H3(mut connection) => {
-                verify_connect_request(request)?;
-                let stream_id = request.stream_id.ok_or_else(|| Error::Protocol("the request names no stream".into()))?;
+            Version::V1_0 => return Err(Error::Protocol("WebSocket needs HTTP/1.1 or later".into())),
+        };
 
-                let mut response = connect_response(Version::V3_0);
-                response.stream_id = Some(stream_id);
-                connection.send(response).await?;
+        let (transport, buffered) = connection.into_transport(stream_id)?;
 
-                let limits = *connection.limits();
-                let stream = connection.tunnel(stream_id)?;
-                Ok(WebSocketConnection::new(Box::new(stream), Role::Origin, id, limits))
-            }
-        }
+        Ok(match buffered {
+            Some(buffer) => WebSocketConnection::resume(transport, Role::Origin, id, limits, buffer),
+            None => WebSocketConnection::new(transport, Role::Origin, id, limits),
+        })
     }
 
     /// Opens a WebSocket and takes the connection over.
@@ -613,44 +710,84 @@ impl AnyConnection {
     /// or names no stream, [`Error::Tls`] when no randomness is available for
     /// the nonce, and otherwise as [`Connection::send`] and
     /// [`Connection::receive`].
-    pub async fn open_websocket(self, authority: &str, target: &str) -> Result<WebSocketConnection<Box<dyn Transport>>, Error> {
+    pub async fn open_websocket(self, authority: &str, target: &str, limits: impl Into<WebSocketLimits>) -> Result<WebSocketConnection<Box<dyn Transport>>, Error> {
         let id = self.id();
+        let limits = limits.into();
+        let mut connection = self;
 
-        match self {
-            Self::H1(mut connection) => {
-                let key = nonce()?;
-                connection.send(handshake_request(authority, target, &key)).await?;
-
-                let response = connection.receive().await?;
-                verify_response(&response, &key)?;
-
-                let limits = *connection.limits();
-                let (transport, buffer) = connection.upgrade();
-                Ok(WebSocketConnection::resume(transport, Role::UserAgent, id, limits, buffer))
-            }
-
-            Self::H2(mut connection) => {
-                connection.send(connect_request(authority, target, Version::V2_0)).await?;
+        let stream_id = match connection.version() {
+            Version::V1_1 => {
+                let key = Upgrade::nonce()?;
+                connection.send(Upgrade::request(authority, target, &key, connection.version())).await?;
 
                 let response = connection.receive().await?;
-                verify_connect_response(&response)?;
-                let stream_id = response.stream_id.ok_or_else(|| Error::Protocol("the response names no stream".into()))?;
-
-                let limits = *connection.limits();
-                Ok(WebSocketConnection::new(Box::new(connection.tunnel(stream_id)), Role::UserAgent, id, limits))
+                Upgrade::verify_response(&response, &key)?;
+                None
             }
 
-            Self::H3(mut connection) => {
-                connection.send(connect_request(authority, target, Version::V3_0)).await?;
+            Version::V2_0 | Version::V3_0 => {
+                let mut request = Connect::request(authority, target, connection.version());
+                request.security = connection.security();
+                connection.send(request).await?;
 
                 let response = connection.receive().await?;
-                verify_connect_response(&response)?;
-                let stream_id = response.stream_id.ok_or_else(|| Error::Protocol("the response names no stream".into()))?;
+                Connect::verify_response(&response)?;
 
-                let limits = *connection.limits();
-                let stream = connection.tunnel(stream_id)?;
-                Ok(WebSocketConnection::new(Box::new(stream), Role::UserAgent, id, limits))
+                Some(response.stream_id.ok_or_else(|| Error::Protocol("the response names no stream".into()))?)
             }
+
+            Version::V1_0 => return Err(Error::Protocol("WebSocket needs HTTP/1.1 or later".into())),
+        };
+
+        let (transport, buffered) = connection.into_transport(stream_id)?;
+
+        Ok(match buffered {
+            Some(buffer) => WebSocketConnection::resume(transport, Role::UserAgent, id, limits, buffer),
+            None => WebSocketConnection::new(transport, Role::UserAgent, id, limits),
+        })
+    }
+}
+
+/// The ceilings a [`WebSocketConnection`] keeps itself under.
+///
+/// The socket's own, so this module reads as the WebSocket library it is:
+/// RFC 6455 framing has nothing to say about QPACK tables or HTTP/2 windows,
+/// and none of them appear here. [`Limits`] converts into one for a caller
+/// configuring everything at once.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WebSocketLimits {
+    /// In bytes, the largest message that may be reassembled.
+    pub max_message_size: u64,
+    /// The number of continuation frames allowed in one message.
+    pub ws_max_fragments: u16,
+    /// In seconds, how long a close waits for the peer to echo it back.
+    pub ws_linger_timeout: f64,
+    /// In seconds, how long one read may wait for more octets.
+    pub read_timeout: f64,
+    /// In seconds, how long one write may wait for the peer.
+    pub write_timeout: f64,
+    /// In bytes, how much room each read from the transport is given.
+    pub read_chunk_size: u64,
+    /// In bytes, the buffer size above which an idle socket gives memory back.
+    pub idle_capacity: u64,
+}
+
+impl Default for WebSocketLimits {
+    fn default() -> Self {
+        Limits::default().into()
+    }
+}
+
+impl From<Limits> for WebSocketLimits {
+    fn from(limits: Limits) -> Self {
+        Self {
+            max_message_size: limits.max_message_size,
+            ws_max_fragments: limits.ws_max_fragments,
+            ws_linger_timeout: limits.ws_linger_timeout,
+            read_timeout: limits.read_timeout,
+            write_timeout: limits.write_timeout,
+            read_chunk_size: limits.read_chunk_size,
+            idle_capacity: limits.idle_capacity,
         }
     }
 }
@@ -668,7 +805,7 @@ pub struct WebSocketConnection<T> {
     transport: T,
     role: Role,
     id: ConnectionID,
-    limits: Limits,
+    limits: WebSocketLimits,
     buffer: Buffer,
     fragments: Option<(Opcode, BytesMut)>,
     fragment_count: usize,
@@ -681,7 +818,7 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     /// A connection over a transport nothing has been read from yet.
-    pub fn new(transport: T, role: Role, id: ConnectionID, limits: Limits) -> Self {
+    pub fn new(transport: T, role: Role, id: ConnectionID, limits: impl Into<WebSocketLimits>) -> Self {
         Self::resume(transport, role, id, limits, Buffer::new())
     }
 
@@ -689,7 +826,12 @@ where
     ///
     /// This is what an HTTP/1.1 upgrade needs: whatever the peer sent
     /// immediately after the handshake is already buffered.
-    pub fn resume(transport: T, role: Role, id: ConnectionID, limits: Limits, buffer: Buffer) -> Self {
+    pub fn resume(transport: T, role: Role, id: ConnectionID, limits: impl Into<WebSocketLimits>, buffer: Buffer) -> Self {
+        let limits = limits.into();
+
+        let mut buffer = buffer;
+        buffer.set_chunk_size(limits.read_chunk_size as usize);
+
         Self {
             transport,
             role,
@@ -714,8 +856,8 @@ where
     }
 
     /// The limits this connection holds itself to.
-    pub fn limits(&self) -> &Limits {
-        &self.limits
+    pub fn limits(&self) -> WebSocketLimits {
+        self.limits
     }
 
     /// Whether the closing handshake has begun.
@@ -733,7 +875,7 @@ where
     /// Returns [`Error::Tls`] when no randomness is available for the mask,
     /// and [`Error::Io`] when the transport fails.
     pub async fn send(&mut self, mut frame: Frame) -> Result<(), Error> {
-        frame.mask = if self.role.is_client() { Some(masking_key()?) } else { None };
+        frame.mask = if self.role.is_client() { Some(Frame::masking_key()?) } else { None };
 
         let mut out = std::mem::take(&mut self.scratch);
         out.clear();

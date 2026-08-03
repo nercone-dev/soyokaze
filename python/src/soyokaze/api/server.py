@@ -18,7 +18,7 @@ from ..ffi import library
 from ..models import Message, Version, ports_argument
 from ..runtime import default_runtime
 from ..websocket import WebSocketConnection
-from .common import Limits
+from ..models import Limits
 
 def cores():
     """How many threads the machine can run at once, or 1 if that cannot be found."""
@@ -32,13 +32,15 @@ class ServerLimits:
     ``(period_seconds, count)`` pairs, every one of which must be satisfied.
     """
 
-    def __init__(self, message=None, max_connections=None, max_connections_per_ip=None, max_connection_rate=None, max_connection_history=None):
+    def __init__(self, message=None, backlog=None, max_connections=None, max_connections_per_ip=None, max_connection_rate=None, max_connection_history=None, worker_stack_size=None):
         defaults = library.soyokaze_server_limits_default()
         self.message = message if message is not None else Limits()
+        self.backlog = backlog if backlog is not None else defaults.backlog
         self.max_connections = max_connections if max_connections is not None else defaults.max_connections
         self.max_connections_per_ip = max_connections_per_ip if max_connections_per_ip is not None else defaults.max_connections_per_ip
         self.max_connection_rate = max_connection_rate if max_connection_rate is not None else []
         self.max_connection_history = max_connection_history if max_connection_history is not None else defaults.max_connection_history
+        self.worker_stack_size = worker_stack_size if worker_stack_size is not None else defaults.worker_stack_size
 
     def build(self):
         """The ``soyokaze_server_limits_t`` this stands for.
@@ -47,9 +49,11 @@ class ServerLimits:
         """
         struct = ffi.ServerLimits()
         struct.message = self.message.build()
+        struct.backlog = self.backlog
         struct.max_connections = self.max_connections
         struct.max_connections_per_ip = self.max_connections_per_ip
         struct.max_connection_history = self.max_connection_history
+        struct.worker_stack_size = self.worker_stack_size
 
         if self.max_connection_rate:
             rates = (ffi.Rate * len(self.max_connection_rate))(*[ffi.Rate(period, count) for period, count in self.max_connection_rate])
@@ -66,21 +70,24 @@ class ServerConfig:
     admission limits, ``SO_REUSEPORT`` on, and no identity, which leaves a
     TCP port in plaintext and a QUIC port unservable.
 
-    ``identity`` is an :class:`Identity`, ``ech`` an :class:`EchKeys`, and
-    ``hsts`` an :class:`HstsPolicy`; ``certificate`` and ``key`` are the
-    blob shorthand for an identity of one chain entry.
+    ``identity`` is an :class:`Identity`, ``tls`` a :class:`TlsConfig`,
+    ``ech`` an :class:`EchKeys`, and ``hsts`` an :class:`HstsPolicy`;
+    ``certificate`` and ``key`` are the blob shorthand for an identity of one
+    chain entry.
 
     :class:`Identity`: soyokaze.tls.Identity
+    :class:`TlsConfig`: soyokaze.tls.TlsConfig
     :class:`EchKeys`: soyokaze.tls.EchKeys
-    :class:`HstsPolicy`: soyokaze.helpers.hsts.HstsPolicy
+    :class:`HstsPolicy`: soyokaze.hsts.HstsPolicy
     """
 
-    def __init__(self, versions=None, limits=None, identity=None, certificate=None, key=None, ech=None, hsts=None, reuseport=True):
+    def __init__(self, versions=None, limits=None, identity=None, certificate=None, key=None, tls=None, ech=None, hsts=None, reuseport=True):
         self.versions = versions
         self.limits = limits
         self.identity = identity
         self.certificate = certificate
         self.key = key
+        self.tls = tls
         self.ech = ech
         self.hsts = hsts
         self.reuseport = reuseport
@@ -118,6 +125,11 @@ class ServerConfig:
             key = ffi.slice_of(ffi.encoded(self.key))
             keepalive.append(key)
             struct.key = key
+
+        if self.tls is not None:
+            tls = self.tls.build()
+            keepalive.append(tls)
+            struct.tls = ctypes.pointer(tls)
 
         if self.ech is not None:
             struct.ech = self.ech.handle

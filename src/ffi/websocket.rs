@@ -53,8 +53,8 @@ pub unsafe extern "C" fn soyokaze_websocket_free(socket: *mut WebSocket) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_websocket_role(socket: *const WebSocket) -> u32 {
     match unsafe { socket.as_ref() } {
-        Some(socket) => crate::ffi::api::client::role(socket.connection.role()),
-        None => crate::ffi::api::client::role(Role::UserAgent),
+        Some(socket) => crate::ffi::models::role(socket.connection.role()),
+        None => crate::ffi::models::role(Role::UserAgent),
     }
 }
 

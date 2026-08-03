@@ -1,8 +1,9 @@
-"""TLS identities and Encrypted Client Hello.
+"""TLS identities, context details and Encrypted Client Hello.
 
-:class:`Identity` is what a server serves, :class:`EchKeys` is what it offers
-ECH with, and :class:`EchConfigList` is what a client reads back out of what
-a server published — the same three parts as the crate's ``tls`` module.
+:class:`Identity` is what a server serves, :class:`TlsConfig` is how either
+side's context is tuned, :class:`EchKeys` is what a server offers ECH with,
+and :class:`EchConfigList` is what a client reads back out of what a server
+published — the same parts as the crate's ``tls`` module.
 """
 
 import ctypes
@@ -10,6 +11,50 @@ import ctypes
 from . import ffi
 from .errors import InvalidError, error_out, raise_for
 from .ffi import library
+
+class TlsConfig:
+    """The TLS details a context is built with, beyond its identity and roots.
+
+    Every field has a working default, so ``TlsConfig()`` changes nothing
+    about how a context would otherwise behave. Each string is an OpenSSL
+    list, entries separated by ``:`` and most preferred first; ``None`` keeps
+    that field's default. BoringSSL keeps its built-in order for the TLS 1.3
+    suites, so ``ciphers`` restricts and orders TLS 1.2.
+    """
+
+    def __init__(self, ciphers=None, groups=None, signature_algorithms=None,
+                 prefer_server_ciphers=False, session_tickets=True, early_data=False,
+                 certificate_compression=False):
+        self.ciphers = ciphers
+        self.groups = groups
+        self.signature_algorithms = signature_algorithms
+        self.prefer_server_ciphers = prefer_server_ciphers
+        self.session_tickets = session_tickets
+        self.early_data = early_data
+        self.certificate_compression = certificate_compression
+
+    def build(self):
+        """The ``soyokaze_tls_config_t`` this stands for.
+
+        The struct keeps everything it points at alive on itself.
+        """
+        struct = library.soyokaze_tls_config_default()
+        keepalive = []
+
+        for name in ("ciphers", "groups", "signature_algorithms"):
+            value = getattr(self, name)
+            if value is not None:
+                view = ffi.slice_of(ffi.encoded(value))
+                keepalive.append(view)
+                setattr(struct, name, view)
+
+        struct.prefer_server_ciphers = self.prefer_server_ciphers
+        struct.session_tickets = self.session_tickets
+        struct.early_data = self.early_data
+        struct.certificate_compression = self.certificate_compression
+
+        struct.keepalive = keepalive
+        return struct
 
 class Identity:
     """A certificate chain and the private key that goes with it.

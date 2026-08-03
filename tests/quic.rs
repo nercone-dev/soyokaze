@@ -2,7 +2,7 @@ use bytes::Bytes;
 
 use soyokaze::models::{Body, ConnectionID, Message, Method, Port, Version};
 use soyokaze::protocol::base::{AnyConnection, Connection};
-use soyokaze::protocol::h3;
+use soyokaze::models::Limits;
 use soyokaze::websocket::{CloseCode, Opcode};
 use soyokaze::{Client, ClientConfig, Handler, Identity, Server, ServerConfig};
 
@@ -67,7 +67,7 @@ fn many_requests_share_one_quic_connection() {
 
         let id = ConnectionID(Bytes::from_static(b"test"));
         let mut connection = client
-            .connect_quic("localhost", port, id)
+            .connect_quic("localhost", port, id, "localhost")
             .await
             .expect("the client could not reach the server over QUIC");
 
@@ -104,7 +104,7 @@ impl Handler for Tunnel {
             return;
         };
 
-        let Ok(mut socket) = connection.accept_websocket(&request).await else {
+        let Ok(mut socket) = connection.accept_websocket(&request, soyokaze::Limits::default()).await else {
             return;
         };
 
@@ -118,7 +118,7 @@ impl Handler for Tunnel {
 
 #[test]
 fn a_websocket_over_quic_survives_more_writes_than_it_can_buffer() {
-    const MESSAGES: usize = h3::TUNNEL_BACKLOG * 8;
+    let messages = Limits::default().tunnel_backlog as usize * 8;
 
     let certificate = certificate();
 
@@ -142,19 +142,19 @@ fn a_websocket_over_quic_survives_more_writes_than_it_can_buffer() {
 
         let id = ConnectionID(Bytes::from_static(b"test"));
         let connection = client
-            .connect_quic("localhost", port, id)
+            .connect_quic("localhost", port, id, "localhost")
             .await
             .expect("the client could not reach the server over QUIC");
 
         let mut socket = connection
-            .open_websocket("localhost", "/chat")
+            .open_websocket("localhost", "/chat", soyokaze::Limits::default())
             .await
             .expect("the tunnel did not open");
 
         let payload = vec![b'x'; 4096];
         let mut echoed = 0;
 
-        for index in 0..MESSAGES {
+        for index in 0..messages {
             let sending = socket.send_message(Opcode::Binary, payload.clone());
             tokio::time::timeout(std::time::Duration::from_secs(10), sending)
                 .await
@@ -177,5 +177,5 @@ fn a_websocket_over_quic_survives_more_writes_than_it_can_buffer() {
     });
 
     cluster.close(Some(1.0));
-    assert_eq!(echoed, MESSAGES, "the tunnel stopped carrying messages part way through");
+    assert_eq!(echoed, messages, "the tunnel stopped carrying messages part way through");
 }

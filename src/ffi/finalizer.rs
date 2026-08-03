@@ -11,5 +11,5 @@ use crate::ffi::Buffer;
 /// Always 29 octets: `Sun, 06 Nov 1994 08:49:37 GMT`.
 #[unsafe(no_mangle)]
 pub extern "C" fn soyokaze_http_date(unix_seconds: u64) -> Buffer {
-    Buffer::new(crate::finalizer::http_date(unix_seconds).into_bytes())
+    Buffer::new(crate::finalizer::DateCache::format(unix_seconds).into_bytes())
 }

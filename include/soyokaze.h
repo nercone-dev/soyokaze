@@ -112,6 +112,9 @@ typedef struct {
     uint16_t max_header_count;
     uint32_t max_chunk_header_size;
 
+    uint64_t read_chunk_size; /* room each read is given, not a cap */
+    uint64_t idle_capacity;
+
     uint32_t max_pending_handshakes;
 
     double read_timeout;
@@ -119,15 +122,22 @@ typedef struct {
     double receive_timeout;
     double send_timeout;
 
+    uint64_t inline_body_size;
+
     uint32_t max_concurrent_streams;
     uint64_t max_connection_buffer_size;
     uint32_t max_premature_resets;
+    uint64_t max_encoder_table_size;
 
     uint32_t max_idle_frames;
+    uint64_t output_high_water;
 
     double qpack_block_timeout;
     uint32_t max_peer_uni_streams;
     uint32_t max_outstanding_sections;
+    uint32_t max_blocked_streams;
+    uint32_t tunnel_backlog;
+    uint32_t command_backlog;
 
     double ws_linger_timeout;
     uint16_t ws_max_fragments;
@@ -358,6 +368,23 @@ bool soyokaze_hsts_store_secure(const soyokaze_hsts_store_t *store,
 
 /* --------------------------------------------------------------------- tls */
 
+/* The TLS details a context is built with, beyond its identity and roots.
+ * Start from soyokaze_tls_config_default() and adjust. Each string is an
+ * OpenSSL list, entries separated by ':' and most preferred first; an absent
+ * slice keeps that field's default. BoringSSL keeps its built-in order for
+ * the TLS 1.3 suites, so `ciphers` restricts and orders TLS 1.2. */
+typedef struct {
+    soyokaze_slice_t ciphers;              /* TLS 1.2 and 1.3 in one list */
+    soyokaze_slice_t groups;               /* key exchange groups */
+    soyokaze_slice_t signature_algorithms; /* ecdsa_secp384r1_sha384 names */
+    bool prefer_server_ciphers;
+    bool session_tickets;
+    bool early_data;
+    bool certificate_compression;          /* RFC 8879 zlib */
+} soyokaze_tls_config_t;
+
+soyokaze_tls_config_t soyokaze_tls_config_default(void);
+
 soyokaze_identity_t *soyokaze_identity_new(const soyokaze_slice_t *certificates, size_t certificate_count,
                                            const uint8_t *key, size_t key_len);
 soyokaze_status_t soyokaze_identity_from_pkcs12(const uint8_t *data, size_t data_len,
@@ -415,6 +442,7 @@ typedef struct {
     bool hsts;
     const soyokaze_slice_t *roots; /* each DER or PEM; NULL keeps the platform store */
     size_t root_count;
+    const soyokaze_tls_config_t *tls; /* NULL takes every default */
     const soyokaze_ech_entry_t *ech;
     size_t ech_count;
 } soyokaze_client_config_t;
@@ -483,6 +511,7 @@ soyokaze_status_t soyokaze_connection_open_websocket(soyokaze_runtime_t *runtime
                                                      soyokaze_connection_t *connection,
                                                      const uint8_t *authority, size_t authority_len,
                                                      const uint8_t *target, size_t target_len,
+                                                     const soyokaze_limits_t *limits,
                                                      soyokaze_websocket_t **out,
                                                      soyokaze_error_t **error);
 void soyokaze_connection_close(soyokaze_runtime_t *runtime, soyokaze_connection_t *connection);
@@ -538,11 +567,13 @@ typedef struct {
  * soyokaze_server_limits_default() and adjust. */
 typedef struct {
     soyokaze_limits_t message;
+    uint32_t backlog;                /* the listen backlog for a TCP socket */
     uint32_t max_connections;        /* 0 is unbounded */
     uint32_t max_connections_per_ip; /* 0 is unbounded */
     const soyokaze_rate_t *max_connection_rate; /* NULL means none */
     size_t rate_count;
     size_t max_connection_history;
+    size_t worker_stack_size;        /* the stack size for a worker thread */
 } soyokaze_server_limits_t;
 
 soyokaze_server_limits_t soyokaze_server_limits_default(void);
@@ -558,6 +589,7 @@ typedef struct {
     const soyokaze_identity_t *identity;   /* takes precedence over certificate/key */
     soyokaze_slice_t certificate;          /* DER or PEM; absent serves TCP in plaintext */
     soyokaze_slice_t key;
+    const soyokaze_tls_config_t *tls;      /* NULL takes every default */
     const soyokaze_ech_keys_t *ech;
     const soyokaze_hsts_policy_t *hsts;
     bool reuseport;
@@ -624,13 +656,14 @@ soyokaze_buffer_t soyokaze_sha1(const uint8_t *data, size_t data_len);
 soyokaze_buffer_t soyokaze_huffman_encode(const uint8_t *data, size_t data_len);
 bool soyokaze_huffman_decode(const uint8_t *data, size_t data_len, soyokaze_buffer_t *out);
 
-/* One field going into an encoder. */
+/* Fields, the vocabulary HPACK and QPACK share. One field goes into an
+ * encoder as a soyokaze_field_t; a decoded section comes back out as a
+ * soyokaze_fields_t. */
 typedef struct {
     soyokaze_slice_t name;
     soyokaze_slice_t value;
 } soyokaze_field_t;
 
-/* A decoded field section. */
 void soyokaze_fields_free(soyokaze_fields_t *fields);
 size_t soyokaze_fields_count(const soyokaze_fields_t *fields);
 soyokaze_slice_t soyokaze_fields_name(const soyokaze_fields_t *fields, size_t index);
@@ -639,13 +672,14 @@ soyokaze_slice_t soyokaze_fields_value(const soyokaze_fields_t *fields, size_t i
 /* HPACK. An encoder and a decoder are stateful; feed blocks in order. */
 soyokaze_hpack_encoder_t *soyokaze_hpack_encoder_new(void);
 void soyokaze_hpack_encoder_free(soyokaze_hpack_encoder_t *encoder);
-bool soyokaze_hpack_encoder_set_dynamic_table_size(soyokaze_hpack_encoder_t *encoder, size_t max_size);
+bool soyokaze_hpack_encoder_set_max_capacity(soyokaze_hpack_encoder_t *encoder, size_t max_capacity);
+bool soyokaze_hpack_encoder_set_capacity_limit(soyokaze_hpack_encoder_t *encoder, size_t capacity_limit);
 soyokaze_buffer_t soyokaze_hpack_encode(soyokaze_hpack_encoder_t *encoder,
                                         const soyokaze_field_t *fields, size_t field_count);
 soyokaze_hpack_decoder_t *soyokaze_hpack_decoder_new(void);
 void soyokaze_hpack_decoder_free(soyokaze_hpack_decoder_t *decoder);
 bool soyokaze_hpack_decoder_set_max_decoded_size(soyokaze_hpack_decoder_t *decoder, size_t max_size);
-bool soyokaze_hpack_decoder_set_dynamic_table_size(soyokaze_hpack_decoder_t *decoder, size_t max_size);
+bool soyokaze_hpack_decoder_set_max_capacity(soyokaze_hpack_decoder_t *decoder, size_t max_capacity);
 soyokaze_status_t soyokaze_hpack_decode(soyokaze_hpack_decoder_t *decoder,
                                         const uint8_t *block, size_t block_len,
                                         soyokaze_fields_t **out,
@@ -654,10 +688,12 @@ soyokaze_status_t soyokaze_hpack_decode(soyokaze_hpack_decoder_t *decoder,
 /* QPACK. Instruction streams cross as raw octets, exactly as they travel. */
 soyokaze_qpack_encoder_t *soyokaze_qpack_encoder_new(void);
 void soyokaze_qpack_encoder_free(soyokaze_qpack_encoder_t *encoder);
-bool soyokaze_qpack_encoder_set_max_capacity(soyokaze_qpack_encoder_t *encoder, size_t max_capacity);
+bool soyokaze_qpack_encoder_set_max_capacity(soyokaze_qpack_encoder_t *encoder, size_t max_capacity,
+                                             soyokaze_buffer_t *instructions);
+bool soyokaze_qpack_encoder_set_capacity_limit(soyokaze_qpack_encoder_t *encoder, size_t capacity_limit,
+                                               soyokaze_buffer_t *instructions);
 bool soyokaze_qpack_encoder_set_max_outstanding_sections(soyokaze_qpack_encoder_t *encoder, size_t max_sections);
-bool soyokaze_qpack_encoder_set_capacity(soyokaze_qpack_encoder_t *encoder, size_t capacity,
-                                         soyokaze_buffer_t *instructions);
+bool soyokaze_qpack_encoder_set_max_instruction_size(soyokaze_qpack_encoder_t *encoder, size_t max_size);
 bool soyokaze_qpack_encode(soyokaze_qpack_encoder_t *encoder, uint64_t stream_id,
                            const soyokaze_field_t *fields, size_t field_count,
                            soyokaze_buffer_t *block, soyokaze_buffer_t *instructions);
@@ -669,6 +705,8 @@ soyokaze_qpack_decoder_t *soyokaze_qpack_decoder_new(void);
 void soyokaze_qpack_decoder_free(soyokaze_qpack_decoder_t *decoder);
 bool soyokaze_qpack_decoder_set_max_decoded_size(soyokaze_qpack_decoder_t *decoder, size_t max_size);
 bool soyokaze_qpack_decoder_set_max_capacity(soyokaze_qpack_decoder_t *decoder, size_t max_capacity);
+bool soyokaze_qpack_decoder_set_max_instruction_size(soyokaze_qpack_decoder_t *decoder, size_t max_size);
+bool soyokaze_qpack_decoder_set_max_blocked_streams(soyokaze_qpack_decoder_t *decoder, size_t max_streams);
 soyokaze_status_t soyokaze_qpack_decoder_on_encoder_instructions(soyokaze_qpack_decoder_t *decoder,
                                                                  const uint8_t *data, size_t data_len,
                                                                  soyokaze_buffer_t *instructions,

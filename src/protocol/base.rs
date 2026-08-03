@@ -11,7 +11,8 @@
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::errors::Error;
-use crate::models::{ConnectionID, Message, Role, Security, StreamID, Version};
+use crate::models::{ConnectionID, Message, Role, StreamID, Version};
+use crate::tls::Security;
 use crate::protocol::{h1::H1Connection, h2::H2Connection, h3::H3Connection};
 
 /// What every HTTP connection can do, whichever version it speaks.
@@ -43,10 +44,10 @@ pub trait Connection {
     /// What the transport underneath this connection turned out to be.
     ///
     /// Every message the connection receives is stamped with these, which is
-    /// where [`Message::tls`] and the fields beside it come from. A connection
-    /// over a plaintext transport reports [`Security::default`].
+    /// where [`Message::security`] comes from. A connection over a plaintext
+    /// transport reports [`Security::default`].
     ///
-    /// [`Message::tls`]: crate::models::Message::tls
+    /// [`Message::security`]: crate::models::Message::security
     fn security(&self) -> Security {
         Security::default()
     }
@@ -57,7 +58,7 @@ pub trait Connection {
     ///
     /// Any [`Error`]; [`Error::Timeout`] once [`Limits::send_timeout`] passes.
     ///
-    /// [`Limits::send_timeout`]: crate::api::common::Limits::send_timeout
+    /// [`Limits::send_timeout`]: crate::models::Limits::send_timeout
     async fn send(&mut self, message: Message) -> Result<(), Error>;
     /// Receives the next message.
     ///
@@ -66,7 +67,7 @@ pub trait Connection {
     /// Any [`Error`]; [`Error::Closed`] when the peer is done, and
     /// [`Error::Timeout`] once [`Limits::receive_timeout`] passes.
     ///
-    /// [`Limits::receive_timeout`]: crate::api::common::Limits::receive_timeout
+    /// [`Limits::receive_timeout`]: crate::models::Limits::receive_timeout
     async fn receive(&mut self) -> Result<Message, Error>;
 
     /// Shuts the connection down, telling the peer where that is possible.
@@ -114,6 +115,36 @@ pub enum AnyConnection {
 }
 
 impl AnyConnection {
+    /// Gives up the connection and hands back the byte stream underneath one
+    /// exchange, for a protocol that takes the connection over.
+    ///
+    /// This is the one operation whose shape genuinely differs by version, so
+    /// it is settled here rather than at every call site: HTTP/1.x gives up its
+    /// whole transport along with whatever it had already buffered, while
+    /// HTTP/2 and HTTP/3 give up one stream and have nothing buffered. A caller
+    /// gets a [`Transport`] and, where there is one, the octets that must be
+    /// replayed before reading from it.
+    ///
+    /// `stream_id` names the exchange, and is required by every version that
+    /// multiplexes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when a multiplexed version is given no
+    /// stream, and otherwise as the version's own tunnel.
+    pub fn into_transport(self, stream_id: Option<StreamID>) -> Result<(Box<dyn Transport>, Option<crate::protocol::common::Buffer>), Error> {
+        let named = || stream_id.ok_or_else(|| Error::Protocol("a multiplexed version needs the stream to tunnel".into()));
+
+        match self {
+            Self::H1(connection) => {
+                let (transport, buffer) = connection.upgrade();
+                Ok((transport, Some(buffer)))
+            }
+            Self::H2(connection) => Ok((Box::new(connection.tunnel(named()?)), None)),
+            Self::H3(mut connection) => Ok((Box::new(connection.tunnel(named()?)?), None)),
+        }
+    }
+
     /// Attaches what the TLS handshake settled, for a caller holding a
     /// connection that has already been negotiated.
     ///
@@ -129,68 +160,56 @@ impl AnyConnection {
     }
 }
 
+/// Forwards methods through whichever connection [`AnyConnection`] is holding.
+///
+/// The three versions are drop-in replacements for one another, so the enum
+/// does nothing but pick one and pass the call along. Written out by hand that
+/// is one arm per version per method — a table to edit in nine places to add a
+/// version, and where a single missed arm is a silent difference in behaviour
+/// between versions. Generated, a new version is the enum variant and the two
+/// arms below, and every method follows.
+///
+/// Dispatch stays static: this expands to the same match a hand-written
+/// forward would, so nothing is boxed and no future is allocated on the way
+/// through. That is why [`Connection`] is not made object-safe instead —
+/// `send` and `receive` are the hottest paths in the crate, and a
+/// `Pin<Box<dyn Future>>` per message is a cost the enum does not pay.
+macro_rules! forward {
+    (
+        $(fn $name:ident(&self) -> $ret:ty;)*
+        $(async fn $sent:ident(&mut self $(, $arg:ident: $ty:ty)*) $(-> $sent_ret:ty)?;)*
+    ) => {
+        $(
+            fn $name(&self) -> $ret {
+                match self {
+                    Self::H1(connection) => connection.$name(),
+                    Self::H2(connection) => connection.$name(),
+                    Self::H3(connection) => connection.$name(),
+                }
+            }
+        )*
+        $(
+            async fn $sent(&mut self $(, $arg: $ty)*) $(-> $sent_ret)? {
+                match self {
+                    Self::H1(connection) => connection.$sent($($arg),*).await,
+                    Self::H2(connection) => connection.$sent($($arg),*).await,
+                    Self::H3(connection) => connection.$sent($($arg),*).await,
+                }
+            }
+        )*
+    };
+}
+
 impl Connection for AnyConnection {
-    fn version(&self) -> Version {
-        match self {
-            Self::H1(connection) => connection.version(),
-            Self::H2(connection) => connection.version(),
-            Self::H3(connection) => connection.version(),
-        }
-    }
+    forward! {
+        fn version(&self) -> Version;
+        fn role(&self) -> Role;
+        fn id(&self) -> ConnectionID;
+        fn reusable(&self) -> bool;
+        fn security(&self) -> Security;
 
-    fn role(&self) -> Role {
-        match self {
-            Self::H1(connection) => connection.role(),
-            Self::H2(connection) => connection.role(),
-            Self::H3(connection) => connection.role(),
-        }
-    }
-
-    fn id(&self) -> ConnectionID {
-        match self {
-            Self::H1(connection) => connection.id(),
-            Self::H2(connection) => connection.id(),
-            Self::H3(connection) => connection.id(),
-        }
-    }
-
-    fn reusable(&self) -> bool {
-        match self {
-            Self::H1(connection) => connection.reusable(),
-            Self::H2(connection) => connection.reusable(),
-            Self::H3(connection) => connection.reusable(),
-        }
-    }
-
-    fn security(&self) -> Security {
-        match self {
-            Self::H1(connection) => connection.security(),
-            Self::H2(connection) => connection.security(),
-            Self::H3(connection) => connection.security(),
-        }
-    }
-
-    async fn send(&mut self, message: Message) -> Result<(), Error> {
-        match self {
-            Self::H1(connection) => connection.send(message).await,
-            Self::H2(connection) => connection.send(message).await,
-            Self::H3(connection) => connection.send(message).await,
-        }
-    }
-
-    async fn receive(&mut self) -> Result<Message, Error> {
-        match self {
-            Self::H1(connection) => connection.receive().await,
-            Self::H2(connection) => connection.receive().await,
-            Self::H3(connection) => connection.receive().await,
-        }
-    }
-
-    async fn close(&mut self) {
-        match self {
-            Self::H1(connection) => connection.close().await,
-            Self::H2(connection) => connection.close().await,
-            Self::H3(connection) => connection.close().await,
-        }
+        async fn send(&mut self, message: Message) -> Result<(), Error>;
+        async fn receive(&mut self) -> Result<Message, Error>;
+        async fn close(&mut self);
     }
 }

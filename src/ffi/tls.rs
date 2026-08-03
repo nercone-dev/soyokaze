@@ -1,12 +1,89 @@
-//! TLS identities and Encrypted Client Hello, from C.
+//! TLS identities, context details and Encrypted Client Hello, from C.
 //!
-//! [`Identity`] is what a server serves, [`EchKeys`] is what it offers ECH
-//! with, and [`EchConfigList`] is what a client reads back out of what a
-//! server published — the same three parts [`crate::tls`] arranges.
+//! [`Identity`] is what a server serves, [`TlsConfig`] is how either side's
+//! context is tuned, [`EchKeys`] is what a server offers ECH with, and
+//! [`EchConfigList`] is what a client reads back out of what a server
+//! published — the same parts [`crate::tls`] arranges.
 
 use crate::ffi::errors::{ErrorHandle, Status};
 use crate::ffi::{borrow, borrow_text, Buffer, Slice};
 use crate::tls::{EchConfigList, EchKeys, Identity};
+
+/// The TLS details a context is built with, beyond its identity and roots.
+///
+/// The C half of [`TlsConfig`], field for field. Each string is an OpenSSL
+/// list, entries separated by `:` and most preferred first; an absent slice
+/// keeps that field's default, the way [`TlsConfig::default`] would.
+///
+/// [`TlsConfig`]: crate::tls::TlsConfig
+/// [`TlsConfig::default`]: crate::tls::TlsConfig::default
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TlsConfig {
+    /// The cipher suites to allow, for TLS 1.2 and 1.3 in one list. BoringSSL
+    /// keeps its built-in order for the TLS 1.3 suites, so what this
+    /// restricts and orders is TLS 1.2.
+    pub ciphers: Slice,
+    /// The key exchange groups to offer, most preferred first.
+    pub groups: Slice,
+    /// The signature algorithms to accept, as `ecdsa_secp384r1_sha384` names.
+    pub signature_algorithms: Slice,
+    /// Whether the server's suite order wins over the client's.
+    pub prefer_server_ciphers: bool,
+    /// Whether sessions may resume over tickets.
+    pub session_tickets: bool,
+    /// Whether early data is allowed on a resumed session.
+    pub early_data: bool,
+    /// Whether certificates are compressed with zlib, as RFC 8879 describes.
+    pub certificate_compression: bool,
+}
+
+impl TlsConfig {
+    /// The [`TlsConfig`] this stands for.
+    ///
+    /// `None` when a string is not UTF-8.
+    ///
+    /// [`TlsConfig`]: crate::tls::TlsConfig
+    ///
+    /// # Safety
+    ///
+    /// Each slice must either be absent or point to its stated number of
+    /// readable octets.
+    pub unsafe fn parse(&self) -> Option<crate::tls::TlsConfig> {
+        let text = |slice: Slice| match slice.data.is_null() {
+            true => Some(None),
+            false => unsafe { borrow_text(slice.data, slice.len) }.map(|text| Some(text.to_owned())),
+        };
+
+        Some(crate::tls::TlsConfig {
+            ciphers: text(self.ciphers)?,
+            groups: text(self.groups)?,
+            signature_algorithms: text(self.signature_algorithms)?,
+            prefer_server_ciphers: self.prefer_server_ciphers,
+            session_tickets: self.session_tickets,
+            early_data: self.early_data,
+            certificate_compression: self.certificate_compression,
+        })
+    }
+}
+
+/// The default [`TlsConfig`], to be adjusted and passed back.
+///
+/// [`TlsConfig`]: crate::tls::TlsConfig
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_tls_config_default() -> TlsConfig {
+    let config = crate::tls::TlsConfig::default();
+
+    TlsConfig {
+        ciphers: Slice::ABSENT,
+        groups: Slice::ABSENT,
+        signature_algorithms: Slice::ABSENT,
+        prefer_server_ciphers: config.prefer_server_ciphers,
+        session_tickets: config.session_tickets,
+        early_data: config.early_data,
+        certificate_compression: config.certificate_compression,
+    }
+}
 
 /// An identity from a certificate chain and a private key.
 ///
@@ -274,4 +351,19 @@ pub unsafe extern "C" fn soyokaze_ech_config_maximum_name_length(list: *const Ec
     unsafe { list.as_ref() }
         .and_then(|list| list.configs.get(index))
         .map_or(-1, |config| config.maximum_name_length as i32)
+}
+
+/// One host's ECH configuration list.
+///
+/// A host of `*` applies wherever no exact entry matches, as
+/// [`ClientConfig::ech`] documents.
+///
+/// [`ClientConfig::ech`]: crate::api::client::ClientConfig::ech
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EchEntry {
+    /// The host the list applies to.
+    pub host: Slice,
+    /// The `ECHConfigList`, as `soyokaze_ech_keys_config_list` produces it.
+    pub config_list: Slice,
 }

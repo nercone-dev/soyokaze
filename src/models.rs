@@ -4,8 +4,6 @@
 //! carries its [`Headers`] and [`Body`] alongside the connection and transport
 //! facts a handler may want to see. What one connection may spend on the
 //! peer's behalf is bounded by [`Limits`].
-//!
-//! [`Limits`]: crate::api::common::Limits
 
 use std::fmt;
 use std::str::FromStr;
@@ -14,96 +12,27 @@ use bytes::Bytes;
 
 use crate::errors::Error;
 use crate::helpers::text::Text;
+use crate::tls::Security;
 
-/// A TLS protocol version, as the two-octet code that appears on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TLSVersion(pub u16);
-
-/// A TLS cipher suite, as the two-octet code that appears on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TLSCipher(pub u16);
-
-/// A TLS named group, as the two-octet code that appears on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TLSGroup(pub u16);
-
-/// What the transport underneath a connection turned out to be.
+/// The transport family a version runs over, and a port carries.
 ///
-/// Read off the handshake once, when the connection is assembled, and stamped
-/// onto every message that crosses it by [`Security::apply`] — which is how
-/// the matching fields on [`Message`] come to be filled in. A plaintext
-/// transport leaves every field at its default, so [`Security::default`] is
-/// exactly "nothing underneath".
-///
-/// [`tls::security`] reads one off a completed TLS handshake, and
-/// [`Security::quic`] builds the one a QUIC connection stands for.
-///
-/// [`tls::security`]: crate::tls::security
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Security {
-    /// Whether the transport was a secure one, as the `https` scheme and the
-    /// `:scheme` pseudo-header reflect it.
-    pub secure: bool,
-    /// Whether the request arrived in TLS early data, and so may be a replay.
-    pub early_data: bool,
-
-    /// Whether the transport underneath was TLS.
-    pub tls: bool,
-    /// The negotiated TLS version.
-    pub tls_version: Option<TLSVersion>,
-    /// The negotiated TLS named group.
-    pub tls_group: Option<TLSGroup>,
-    /// The negotiated TLS cipher suite.
-    pub tls_cipher: Option<TLSCipher>,
-
-    /// Whether the transport underneath was QUIC.
-    pub quic: bool,
-    /// The negotiated QUIC version.
-    pub quic_version: Option<u32>,
+/// Which HTTP versions a port can negotiate is exactly the question of
+/// whether the two agree here: [`Port::carries`] asks it, and nothing keys on
+/// a particular version number, so a future version is routed by what it runs
+/// over rather than by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportKind {
+    /// An ordered byte stream: TCP, or a Unix domain socket.
+    Stream,
+    /// QUIC, over UDP.
+    Quic,
 }
-
-impl Security {
-    /// What a QUIC connection of `version` stands for.
-    ///
-    /// QUIC is secure by construction and carries TLS 1.3 within it, so both
-    /// are set. The cipher suite and named group are left absent: the QUIC
-    /// stack does not hand its TLS session out to be read.
-    pub fn quic(version: u32) -> Self {
-        Self {
-            secure: true,
-            tls: true,
-            tls_version: Some(TLSVersion(TLS_1_3)),
-            quic: true,
-            quic_version: Some(version),
-            ..Self::default()
-        }
-    }
-
-    /// Stamps these facts onto a message crossing the connection.
-    pub fn apply(&self, message: &mut Message) {
-        message.secure = self.secure;
-        message.early_data = self.early_data;
-
-        message.tls = self.tls;
-        message.tls_version = self.tls_version;
-        message.tls_group = self.tls_group;
-        message.tls_cipher = self.tls_cipher;
-
-        message.quic = self.quic;
-        message.quic_version = self.quic_version;
-    }
-}
-
-/// The wire code for TLS 1.3, which is the version QUIC carries.
-///
-/// RFC 9001 admits nothing older underneath QUIC version 1.
-pub const TLS_1_3: u16 = 0x0304;
 
 /// Somewhere a server listens or a client dials.
 ///
 /// The variant picks the transport, which in turn bounds the HTTP versions
-/// that can be negotiated: [`Port::QUIC`] carries HTTP/3 and nothing else,
-/// while [`Port::TCP`] and [`Port::UDS`] carry HTTP/1.x and HTTP/2.
+/// that can be negotiated: a port carries exactly the versions whose
+/// [`Version::transport`] matches its own, which [`Port::carries`] answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Port {
     /// A Unix domain socket at the given filesystem path.
@@ -112,6 +41,39 @@ pub enum Port {
     TCP(u16),
     /// A UDP port carrying QUIC.
     QUIC(u16),
+}
+
+impl Port {
+    /// The transport family this port carries.
+    pub fn transport(&self) -> TransportKind {
+        match self {
+            Self::UDS(_) | Self::TCP(_) => TransportKind::Stream,
+            Self::QUIC(_) => TransportKind::Quic,
+        }
+    }
+
+    /// Whether this port can carry `version`, by transport family.
+    pub fn carries(&self, version: Version) -> bool {
+        self.transport() == version.transport()
+    }
+
+    /// The versions this port offers, from those it was configured with.
+    ///
+    /// A port offers what it [`Port::carries`], in the order given. A QUIC
+    /// port keeps only the most preferred of them: QUIC settles its ALPN when
+    /// the endpoint is stood up, before any connection arrives, so such a port
+    /// has to offer the one version it will actually run rather than offer
+    /// several and then turn away whichever a peer picks. A stream transport
+    /// negotiates per connection, so it offers them all.
+    pub fn offers(&self, versions: &[Version]) -> Vec<Version> {
+        let mut offered: Vec<Version> = versions.iter().copied().filter(|version| self.carries(*version)).collect();
+
+        if self.transport() == TransportKind::Quic {
+            offered.truncate(1);
+        }
+
+        offered
+    }
 }
 
 /// An absolute URL, split into the parts a request needs.
@@ -150,14 +112,22 @@ impl Url {
     /// An IPv6 host is bracketed, and the port is omitted when it is the one
     /// the scheme implies.
     pub fn authority(&self) -> String {
-        let bracketed = self.host.contains(':');
-        let default = self.port == Self::default_port(&self.scheme);
+        Self::authority_of(&self.scheme, &self.host, self.port)
+    }
+
+    /// [`Url::authority`] for parts that are not held in a [`Url`].
+    ///
+    /// A caller that dialled a host and a port directly, rather than parsing a
+    /// URL, still owes its requests the same authority.
+    pub fn authority_of(scheme: &str, host: &str, port: u16) -> String {
+        let bracketed = host.contains(':');
+        let default = port == Self::default_port(scheme);
 
         match (bracketed, default) {
-            (true, true) => format!("[{}]", self.host),
-            (true, false) => format!("[{}]:{}", self.host, self.port),
-            (false, true) => self.host.clone(),
-            (false, false) => format!("{}:{}", self.host, self.port),
+            (true, true) => format!("[{host}]"),
+            (true, false) => format!("[{host}]:{port}"),
+            (false, true) => host.to_owned(),
+            (false, false) => format!("{host}:{port}"),
         }
     }
 
@@ -253,6 +223,14 @@ impl Version {
         }
     }
 
+    /// The transport family this version runs over.
+    pub fn transport(&self) -> TransportKind {
+        match self {
+            Self::V1_0 | Self::V1_1 | Self::V2_0 => TransportKind::Stream,
+            Self::V3_0 => TransportKind::Quic,
+        }
+    }
+
     /// The version as it is written in an HTTP/1.x start line.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -266,12 +244,7 @@ impl Version {
 
 impl fmt::Display for Version {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::V1_0 => "HTTP/1.0",
-            Self::V1_1 => "HTTP/1.1",
-            Self::V2_0 => "HTTP/2",
-            Self::V3_0 => "HTTP/3",
-        })
+        f.write_str(self.as_str())
     }
 }
 
@@ -286,6 +259,85 @@ impl FromStr for Version {
             "HTTP/3" => Ok(Self::V3_0),
             _ => Err(()),
         }
+    }
+}
+
+/// ALPN: what versions are offered, and what the handshake settled on.
+///
+/// The mapping between a [`Version`] and its protocol identifier lives on
+/// [`Version::alpn`] and [`Version::from_alpn`]; what is here is the list
+/// handling around it — offering several, and reading back the choice.
+pub struct Alpn;
+
+impl Alpn {
+    /// The ALPN protocol identifiers for a list of versions, one per entry.
+    pub fn list(versions: &[Version]) -> Vec<Vec<u8>> {
+        versions.iter().map(|version| version.alpn().as_bytes().to_vec()).collect()
+    }
+
+    /// [`Alpn::list`] in wire form: each length-prefixed, run together.
+    pub fn wire(versions: &[Version]) -> Vec<u8> {
+        let mut out = Vec::new();
+
+        for version in versions {
+            let protocol = version.alpn().as_bytes();
+            out.push(protocol.len() as u8);
+            out.extend_from_slice(protocol);
+        }
+
+        out
+    }
+
+    /// Picks a protocol from what a client offered.
+    ///
+    /// The server's preference wins: `offered` is walked in order and the first
+    /// entry the client also lists is chosen. `None` when nothing overlaps,
+    /// which must fail the handshake rather than fall back to something
+    /// unnegotiated.
+    pub fn select<'a>(offered: &[Vec<u8>], client: &'a [u8]) -> Option<&'a [u8]> {
+        for wanted in offered {
+            let mut index = 0;
+
+            while index < client.len() {
+                let length = client[index] as usize;
+                let end = index + 1 + length;
+
+                let Some(protocol) = client.get(index + 1..end) else {
+                    break;
+                };
+
+                if protocol == wanted.as_slice() {
+                    return Some(protocol);
+                }
+
+                index = end;
+            }
+        }
+
+        None
+    }
+
+    /// The version a completed handshake settled on.
+    ///
+    /// A peer that selected nothing falls back to HTTP/1.x, which predates
+    /// ALPN, and only when that was on offer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Version`] when the peer selected nothing and no HTTP/1.x
+    /// was offered, or selected something outside `versions`.
+    pub fn negotiated(alpn: Option<&[u8]>, versions: &[Version]) -> Result<Version, Error> {
+        let Some(alpn) = alpn else {
+            return versions
+                .iter()
+                .copied()
+                .find(|version| version.major() == 1)
+                .ok_or_else(|| Error::Version("the peer selected no protocol".into()));
+        };
+
+        Version::from_alpn(alpn)
+            .filter(|version| versions.contains(version))
+            .ok_or_else(|| Error::Version(format!("the peer selected {:?}", String::from_utf8_lossy(alpn))))
     }
 }
 
@@ -544,46 +596,6 @@ impl Body {
     }
 }
 
-/// `1 << index` when `matched`, and zero otherwise.
-#[inline]
-pub fn bit(matched: bool, index: u32) -> u32 {
-    (matched as u32) << index
-}
-
-/// The presence bit that stands for a well-known field name, or zero.
-///
-/// [`Headers`] keeps the bitwise or of these over every field it holds, which
-/// lets a lookup for one of these names rule itself out without walking the
-/// list. The name must already be lowercase. Names outside the set map to
-/// zero, and a zero always forces the full walk.
-#[inline]
-pub fn well_known(name: &str) -> u32 {
-    let octets = name.as_bytes();
-
-    let Some(first) = octets.first() else {
-        return 0;
-    };
-
-    match (octets.len(), first) {
-        (2, b't') => bit(name == "te", 0),
-        (4, b'h') => bit(name == "host", 1),
-        (4, b'd') => bit(name == "date", 2),
-        (6, b's') => bit(name == "server", 3),
-        (6, b'c') => bit(name == "cookie", 4),
-        (7, b'u') => bit(name == "upgrade", 5),
-        (8, b'l') => bit(name == "location", 6),
-        (10, b'c') => bit(name == "connection", 7),
-        (10, b'k') => bit(name == "keep-alive", 8),
-        (10, b's') => bit(name == "set-cookie", 9),
-        (12, b'c') => bit(name == "content-type", 10),
-        (14, b'c') => bit(name == "content-length", 11),
-        (16, b'p') => bit(name == "proxy-connection", 12),
-        (17, b't') => bit(name == "transfer-encoding", 13),
-        (25, b's') => bit(name == "strict-transport-security", 14),
-        _ => 0,
-    }
-}
-
 /// A field section: an ordered list of name and value pairs.
 ///
 /// Order is preserved, and a name may repeat — HTTP allows several fields with
@@ -598,6 +610,47 @@ pub struct Headers {
 }
 
 impl Headers {
+
+    /// `1 << index` when `matched`, and zero otherwise.
+    #[inline]
+    pub fn bit(matched: bool, index: u32) -> u32 {
+        (matched as u32) << index
+    }
+
+    /// The presence bit that stands for a well-known field name, or zero.
+    ///
+    /// [`Headers`] keeps the bitwise or of these over every field it holds,
+    /// which lets a lookup for one of these names rule itself out without
+    /// walking the list. The name must already be lowercase. Names outside the
+    /// set map to zero, and a zero always forces the full walk.
+    #[inline]
+    pub fn well_known(name: &str) -> u32 {
+        let octets = name.as_bytes();
+
+        let Some(first) = octets.first() else {
+            return 0;
+        };
+
+        match (octets.len(), first) {
+            (2, b't') => Self::bit(name == "te", 0),
+            (4, b'h') => Self::bit(name == "host", 1),
+            (4, b'd') => Self::bit(name == "date", 2),
+            (6, b's') => Self::bit(name == "server", 3),
+            (6, b'c') => Self::bit(name == "cookie", 4),
+            (7, b'u') => Self::bit(name == "upgrade", 5),
+            (8, b'l') => Self::bit(name == "location", 6),
+            (10, b'c') => Self::bit(name == "connection", 7),
+            (10, b'k') => Self::bit(name == "keep-alive", 8),
+            (10, b's') => Self::bit(name == "set-cookie", 9),
+            (12, b'c') => Self::bit(name == "content-type", 10),
+            (14, b'c') => Self::bit(name == "content-length", 11),
+            (16, b'p') => Self::bit(name == "proxy-connection", 12),
+            (17, b't') => Self::bit(name == "transfer-encoding", 13),
+            (25, b's') => Self::bit(name == "strict-transport-security", 14),
+            _ => 0,
+        }
+    }
+
     /// An empty section.
     pub fn new() -> Self {
         Self { fields: Vec::new(), present: 0 }
@@ -641,7 +694,7 @@ impl Headers {
     /// the caller still has to walk the list.
     #[inline]
     pub fn absent(&self, name: &str) -> bool {
-        let bit = well_known(name);
+        let bit = Self::well_known(name);
         bit != 0 && self.present & bit == 0
     }
 
@@ -676,7 +729,7 @@ impl Headers {
         let mut name = name.into();
         name.make_ascii_lowercase();
 
-        self.present |= well_known(&name);
+        self.present |= Self::well_known(&name);
         self.fields.push((name, value.into()));
     }
 
@@ -689,7 +742,7 @@ impl Headers {
         let name = name.into();
         debug_assert!(!name.bytes().any(|byte| byte.is_ascii_uppercase()), "{name:?} is not lowercase");
 
-        self.present |= well_known(&name);
+        self.present |= Self::well_known(&name);
         self.fields.push((name, value.into()));
     }
 
@@ -704,7 +757,7 @@ impl Headers {
             self.fields.retain(|(stored, _)| *stored != name);
         }
 
-        self.present |= well_known(&name);
+        self.present |= Self::well_known(&name);
         self.fields.push((name, value.into()));
     }
 
@@ -721,7 +774,7 @@ impl Headers {
             return false;
         }
 
-        self.present = self.fields.iter().fold(0, |present, (stored, _)| present | well_known(stored));
+        self.present = self.fields.iter().fold(0, |present, (stored, _)| present | Self::well_known(stored));
         true
     }
 
@@ -787,13 +840,12 @@ pub struct Message {
     /// The connection this message arrived on.
     pub connection_id: Option<ConnectionID>,
 
-    /// Whether the message was carried over a secure transport.
+    /// What the transport the message crossed turned out to be.
     ///
-    /// This is what the `https` scheme and the `:scheme` pseudo-header reflect,
-    /// and what decides whether a server attaches an HSTS policy.
-    pub secure: bool,
-    /// Whether the request arrived in TLS early data, and so may be a replay.
-    pub early_data: bool,
+    /// Stamped on by whichever connection received it, by [`Security::apply`].
+    /// A message the caller built has crossed nothing, so everything here
+    /// reads as absent on one until it does.
+    pub security: Security,
 
     // Request
     /// The request method, set on requests only.
@@ -806,33 +858,20 @@ pub struct Message {
     // Response
     /// The status code, set on responses only.
     pub status_code: Option<u16>,
-
-    // TLS
-    //
-    // These and the QUIC pair below describe the transport the message
-    // crossed, and are stamped on by whichever connection received it — see
-    // [`Security`], which is what carries them there. A message the caller
-    // built has crossed nothing, so they read as absent on one until it does.
-    /// Whether the transport underneath was TLS.
-    pub tls: bool,
-    /// The negotiated TLS version.
-    pub tls_version: Option<TLSVersion>,
-    /// The negotiated TLS named group.
-    pub tls_group: Option<TLSGroup>,
-    /// The negotiated TLS cipher suite.
-    ///
-    /// A QUIC connection leaves this and [`Message::tls_group`] absent: the
-    /// QUIC stack does not hand its TLS session out to be read.
-    pub tls_cipher: Option<TLSCipher>,
-
-    // QUIC
-    /// Whether the transport underneath was QUIC.
-    pub quic: bool,
-    /// The negotiated QUIC version.
-    pub quic_version: Option<u32>,
 }
 
 impl Message {
+
+    /// Whether this message leaves its stream open as a tunnel.
+    ///
+    /// `method` is the method of the request the stream carries. A `CONNECT`
+    /// whose response succeeded is followed by tunnelled octets rather than by
+    /// the end of the stream, which is what HTTP/2 and HTTP/3 both have to
+    /// account for.
+    pub fn tunneling(&self, method: Option<Method>) -> bool {
+        method == Some(Method::CONNECT) && (self.is_request() || matches!(self.status_code, Some(200..=299)))
+    }
+
     /// An empty message with an empty field section and nothing else set.
     ///
     /// It is neither a request nor a response until a method or a status code
@@ -849,21 +888,12 @@ impl Message {
             stream_id: None,
             connection_id: None,
 
-            secure: false,
-            early_data: false,
+            security: Security::default(),
 
             method: None,
             target: None,
 
             status_code: None,
-
-            tls: false,
-            tls_version: None,
-            tls_group: None,
-            tls_cipher: None,
-
-            quic: false,
-            quic_version: None,
         }
     }
 
@@ -890,5 +920,156 @@ impl Message {
     /// Whether this is a 1xx response, which precedes the real one.
     pub fn is_informational(&self) -> bool {
         matches!(self.status_code, Some(100..=199))
+    }
+}
+
+/// What one connection is allowed to spend on the peer's behalf.
+///
+/// Every field is a ceiling: exceeding one produces [`Error::Limit`] and, for
+/// the counters that exist to blunt floods, tears the connection down. The
+/// defaults are meant to be usable as they stand for a public-facing server.
+///
+/// Timeouts are in seconds, and zero means wait forever.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Limits {
+    /// In bytes, the total size of the HTTP message allowed for reception.
+    pub max_message_size:      u64,
+    /// In bytes, the size of the HTTP message body allowed for reception.
+    pub max_message_body_size: u64,
+
+    /// In bytes, the request/status line ceiling.
+    pub max_startline_size:    u32,
+    /// In bytes, the whole header (or trailer) block.
+    pub max_headers_size:      u64,
+    /// The number of header fields allowed in one block.
+    pub max_header_count:      u16,
+    /// In bytes, the chunk-size line ceiling for chunked transfer encoding.
+    pub max_chunk_header_size: u32,
+
+    /// In bytes, how much room each read from a transport is given.
+    ///
+    /// Reads start at a fraction of this and ramp up to it as long as they
+    /// keep coming back full, so a small message costs a small read while a
+    /// large body reaches the full size. It sizes the read rather than capping
+    /// it: a read that finds spare room already in the buffer may return more.
+    /// See [`Buffer::set_chunk_size`].
+    ///
+    /// [`Buffer::set_chunk_size`]: crate::protocol::common::Buffer::set_chunk_size
+    pub read_chunk_size: u64,
+    /// In bytes, the buffer size above which an idle connection gives memory back.
+    pub idle_capacity: u64,
+
+    /// The number of connections a listener may negotiate at once (mitigates slow handshake floods).
+    pub max_pending_handshakes: u32,
+
+    /// In seconds, how long one read may wait for the peer to deliver more octets (0 waits forever).
+    pub read_timeout: f64,
+    /// In seconds, how long one write may wait for the peer to accept more octets (0 waits forever).
+    pub write_timeout: f64,
+    /// In seconds, how long one whole message may take to arrive once it has begun (0 waits forever).
+    pub receive_timeout: f64,
+    /// In seconds, how long one whole message may take to send (0 waits forever).
+    pub send_timeout: f64,
+
+    // HTTP/1
+    /// In bytes, the body size up to which the head and the body go out as one write.
+    ///
+    /// Below this, coalescing saves a syscall and a round trip; above it,
+    /// copying the body into the head buffer costs more than the extra write.
+    pub inline_body_size: u64,
+
+    // HTTP/2 and HTTP/3
+    /// The number of streams a peer may have open at once, per connection.
+    pub max_concurrent_streams:     u32,
+    /// In bytes, the unread message data one connection may hold across all of its streams.
+    pub max_connection_buffer_size: u64,
+    /// The number of streams a peer may reset before a response was sent, per connection (mitigates rapid reset floods).
+    pub max_premature_resets:       u32,
+
+    /// In bytes, the largest field compression encoder table this end will keep, whatever the peer allows.
+    ///
+    /// The HPACK table for HTTP/2 and the QPACK one for HTTP/3; both are this
+    /// end's own ceiling, held to whether or not the peer permits more.
+    pub max_encoder_table_size:     u64,
+
+    // HTTP/2
+    /// The number of frames a peer may send without advancing a stream, per connection (mitigates PING and SETTINGS floods).
+    pub max_idle_frames:            u32,
+    /// In bytes, the buffered output size at which a body write flushes rather than growing.
+    pub output_high_water:          u64,
+
+    // HTTP/3
+    /// In seconds, how long to wait for a blocking QPACK reference to resolve before failing the connection.
+    pub qpack_block_timeout:        f64,
+    /// The number of unidirectional streams a peer may open at once, per connection.
+    pub max_peer_uni_streams:       u32,
+    /// The number of unacknowledged QPACK field sections the encoder may track before it stops referencing the dynamic table.
+    pub max_outstanding_sections:   u32,
+    /// The number of streams that may wait QPACK-blocked at once, advertised as `SETTINGS_QPACK_BLOCKED_STREAMS`.
+    pub max_blocked_streams:        u32,
+    /// The number of reads or writes a tunnel will hold before it applies back pressure.
+    pub tunnel_backlog:             u32,
+    /// The number of commands or events queued between a connection handle and the worker driving it.
+    pub command_backlog:            u32,
+
+    // WebSocket
+    /// In seconds, how long a close waits for the peer to echo it back before the transport is shut down.
+    pub ws_linger_timeout: f64,
+    /// The number of continuation frames allowed in one message.
+    pub ws_max_fragments:  u16,
+
+    // Client state
+    /// The number of cookies one jar may hold across all origins.
+    pub max_cookies:            u32,
+    /// The number of cookies one jar may hold for a single domain.
+    pub max_cookies_per_domain: u16,
+    /// The number of hosts one HSTS store may remember.
+    pub max_hsts_entries:       u32,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_message_size: 64 * 1024 * 1024,
+            max_message_body_size: 64 * 1024 * 1024,
+
+            max_startline_size: 8 * 1024,
+            max_headers_size: 64 * 1024,
+            max_header_count: 100,
+            max_chunk_header_size: 128,
+
+            read_chunk_size: 16 * 1024,
+            idle_capacity: 64 * 1024,
+
+            max_pending_handshakes: 256,
+
+            read_timeout: 30.0,
+            write_timeout: 30.0,
+            receive_timeout: 300.0,
+            send_timeout: 1800.0,
+
+            inline_body_size: 64 * 1024,
+
+            max_concurrent_streams: 100,
+            max_connection_buffer_size: 64 * 1024 * 1024,
+            max_premature_resets: 1000,
+            max_encoder_table_size: 64 * 1024,
+            max_idle_frames: 1000,
+            output_high_water: 64 * 1024,
+
+            qpack_block_timeout: 5.0,
+            max_peer_uni_streams: 32,
+            max_outstanding_sections: 512,
+            max_blocked_streams: 16,
+            tunnel_backlog: 32,
+            command_backlog: 256,
+
+            ws_linger_timeout: 10.0,
+            ws_max_fragments: 4096,
+
+            max_cookies: 3000,
+            max_cookies_per_domain: 50,
+            max_hsts_entries: 4096,
+        }
     }
 }

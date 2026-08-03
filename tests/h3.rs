@@ -1,10 +1,11 @@
 use bytes::BytesMut;
 
-use soyokaze::helpers::hpack::HeaderField;
+use soyokaze::helpers::fields::HeaderField;
 use soyokaze::helpers::qpack::{self, DecoderInstruction, Encoder, EncoderInstruction};
-use soyokaze::api::common::Limits;
+use soyokaze::models::Limits;
 use soyokaze::models::{Body, ConnectionID, Headers, Message, Method, Role, StreamID, Version};
 use soyokaze::protocol::h3::{self, Frame, FrameType, H3Connection, H3Session, H3Worker, Settings, StreamKind};
+use soyokaze::protocol::quic;
 use soyokaze::Error;
 
 fn limits() -> Limits {
@@ -27,40 +28,40 @@ fn server() -> H3Session {
 #[test]
 fn varints_use_the_shortest_form_that_fits() {
     for (value, length) in [(0u64, 1usize), (63, 1), (64, 2), (16_383, 2), (16_384, 4), (1_073_741_823, 4), (1_073_741_824, 8)] {
-        assert_eq!(h3::varint_len(value), length, "{value} should take {length} octets");
+        assert_eq!(quic::Varint::len(value), length, "{value} should take {length} octets");
 
         let mut out = BytesMut::new();
-        h3::encode_varint(&mut out, value);
+        quic::Varint::encode(&mut out, value);
         assert_eq!(out.len(), length);
-        assert_eq!(h3::decode_varint(&out), (length, value));
+        assert_eq!(quic::Varint::decode(&out), (length, value));
     }
 }
 
 #[test]
 fn varints_match_the_specification_vectors() {
-    assert_eq!(h3::decode_varint(&[0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c]), (8, 151_288_809_941_952_652));
-    assert_eq!(h3::decode_varint(&[0x9d, 0x7f, 0x3e, 0x7d]), (4, 494_878_333));
-    assert_eq!(h3::decode_varint(&[0x7b, 0xbd]), (2, 15_293));
-    assert_eq!(h3::decode_varint(&[0x25]), (1, 37));
+    assert_eq!(quic::Varint::decode(&[0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c]), (8, 151_288_809_941_952_652));
+    assert_eq!(quic::Varint::decode(&[0x9d, 0x7f, 0x3e, 0x7d]), (4, 494_878_333));
+    assert_eq!(quic::Varint::decode(&[0x7b, 0xbd]), (2, 15_293));
+    assert_eq!(quic::Varint::decode(&[0x25]), (1, 37));
 }
 
 #[test]
 fn an_incomplete_varint_consumes_nothing() {
-    assert_eq!(h3::decode_varint(&[]), (0, 0));
-    assert_eq!(h3::decode_varint(&[0x40]), (0, 0), "a two-octet varint needs two octets");
-    assert_eq!(h3::decode_varint(&[0xc0, 0, 0, 0]), (0, 0), "an eight-octet varint needs eight octets");
+    assert_eq!(quic::Varint::decode(&[]), (0, 0));
+    assert_eq!(quic::Varint::decode(&[0x40]), (0, 0), "a two-octet varint needs two octets");
+    assert_eq!(quic::Varint::decode(&[0xc0, 0, 0, 0]), (0, 0), "an eight-octet varint needs eight octets");
 }
 
 #[test]
 fn the_largest_varint_round_trips() {
     let mut out = BytesMut::new();
-    h3::encode_varint(&mut out, h3::MAXIMUM_VARINT);
-    assert_eq!(h3::decode_varint(&out), (8, h3::MAXIMUM_VARINT));
+    quic::Varint::encode(&mut out, quic::Varint::MAXIMUM);
+    assert_eq!(quic::Varint::decode(&out), (8, quic::Varint::MAXIMUM));
 }
 
 fn parse_one(encoded: &[u8]) -> Option<Frame> {
     let mut buffer = BytesMut::from(encoded);
-    h3::parse_frame(&mut buffer).ok().flatten()
+    h3::Frame::parse(&mut buffer).ok().flatten()
 }
 
 #[test]
@@ -70,7 +71,7 @@ fn every_frame_round_trips() {
         Frame::Data(Vec::new().into()),
         Frame::Headers(vec![0x00, 0x00, 0xd1].into()),
         Frame::CancelPush { push_id: 7 },
-        Frame::Settings(vec![(h3::SETTINGS_QPACK_MAX_TABLE_CAPACITY, 4096), (h3::SETTINGS_QPACK_BLOCKED_STREAMS, 0)]),
+        Frame::Settings(vec![(h3::Settings::QPACK_MAX_TABLE_CAPACITY, 4096), (h3::Settings::QPACK_BLOCKED_STREAMS, 0)]),
         Frame::PushPromise { push_id: 1, block: vec![0xd1].into() },
         Frame::GoAway { id: 12 },
         Frame::MaxPushID { push_id: 100 },
@@ -100,7 +101,7 @@ fn a_frame_that_has_not_fully_arrived_is_left_in_the_buffer() {
 
     for partial in 0..encoded.len() {
         let mut buffer = BytesMut::from(&encoded[..partial]);
-        assert_eq!(h3::parse_frame(&mut buffer).ok().flatten(), None, "{partial} octets should not parse");
+        assert_eq!(h3::Frame::parse(&mut buffer).ok().flatten(), None, "{partial} octets should not parse");
         assert_eq!(buffer.len(), partial, "an incomplete frame must stay in the buffer");
     }
 }
@@ -109,22 +110,22 @@ fn a_frame_that_has_not_fully_arrived_is_left_in_the_buffer() {
 fn an_unknown_frame_type_is_skipped() {
     let mut buffer = BytesMut::new();
 
-    h3::encode_varint(&mut buffer, 0x21);
-    h3::encode_varint(&mut buffer, 3);
+    quic::Varint::encode(&mut buffer, 0x21);
+    quic::Varint::encode(&mut buffer, 3);
     buffer.extend_from_slice(b"abc");
     buffer.extend_from_slice(&Frame::Data(b"hello".to_vec().into()).encode());
 
-    assert_eq!(h3::parse_frame(&mut buffer).ok().flatten(), Some(Frame::Data(b"hello".to_vec().into())));
+    assert_eq!(h3::Frame::parse(&mut buffer).ok().flatten(), Some(Frame::Data(b"hello".to_vec().into())));
 }
 
 #[test]
 fn a_reserved_frame_type_is_refused() {
-    for code in h3::RESERVED_FRAME_TYPES {
+    for code in h3::FrameType::RESERVED {
         let mut buffer = BytesMut::new();
-        h3::encode_varint(&mut buffer, *code);
-        h3::encode_varint(&mut buffer, 0);
+        quic::Varint::encode(&mut buffer, *code);
+        quic::Varint::encode(&mut buffer, 0);
 
-        assert!(h3::parse_frame(&mut buffer).is_err(), "frame type {code:#x} should be refused");
+        assert!(h3::Frame::parse(&mut buffer).is_err(), "frame type {code:#x} should be refused");
     }
 }
 
@@ -143,10 +144,10 @@ fn refuses_a_frame_whose_payload_is_not_what_it_claims() {
 #[test]
 fn refuses_a_repeated_setting() {
     let mut payload = BytesMut::new();
-    h3::encode_varint(&mut payload, h3::SETTINGS_QPACK_BLOCKED_STREAMS);
-    h3::encode_varint(&mut payload, 0);
-    h3::encode_varint(&mut payload, h3::SETTINGS_QPACK_BLOCKED_STREAMS);
-    h3::encode_varint(&mut payload, 1);
+    quic::Varint::encode(&mut payload, h3::Settings::QPACK_BLOCKED_STREAMS);
+    quic::Varint::encode(&mut payload, 0);
+    quic::Varint::encode(&mut payload, h3::Settings::QPACK_BLOCKED_STREAMS);
+    quic::Varint::encode(&mut payload, 1);
 
     assert!(Frame::decode(FrameType::Settings, &payload).is_err());
 }
@@ -156,7 +157,7 @@ fn parsing_arbitrary_octets_never_panics() {
     for first in 0..=255u8 {
         for second in 0..=255u8 {
             let mut buffer = BytesMut::from(&[first, second, 0xff, 0x00][..]);
-            let _ = h3::parse_frame(&mut buffer);
+            let _ = h3::Frame::parse(&mut buffer);
         }
     }
 }
@@ -166,22 +167,22 @@ fn settings_carry_the_parameters_that_are_set() {
     let settings = Settings::default();
     let params = settings.parameters();
 
-    assert!(params.iter().any(|(id, _)| *id == h3::SETTINGS_QPACK_MAX_TABLE_CAPACITY));
-    assert!(!params.iter().any(|(id, _)| *id == h3::SETTINGS_MAX_FIELD_SECTION_SIZE));
+    assert!(params.iter().any(|(id, _)| *id == h3::Settings::QPACK_MAX_TABLE_CAPACITY));
+    assert!(!params.iter().any(|(id, _)| *id == h3::Settings::MAX_FIELD_SECTION_SIZE));
 
     let bounded = Settings { max_field_section_size: Some(65_536), ..settings };
-    assert!(bounded.parameters().iter().any(|(id, value)| (*id, *value) == (h3::SETTINGS_MAX_FIELD_SECTION_SIZE, 65_536)));
+    assert!(bounded.parameters().iter().any(|(id, value)| (*id, *value) == (h3::Settings::MAX_FIELD_SECTION_SIZE, 65_536)));
 }
 
 #[test]
 fn refuses_a_reserved_or_out_of_range_setting() {
     let mut settings = Settings::default();
 
-    for id in h3::RESERVED_SETTINGS {
+    for id in h3::Settings::RESERVED {
         assert!(settings.apply(*id, 0).is_err(), "setting {id:#x} should be refused");
     }
 
-    assert!(settings.apply(h3::SETTINGS_ENABLE_CONNECT_PROTOCOL, 2).is_err());
+    assert!(settings.apply(h3::Settings::ENABLE_CONNECT_PROTOCOL, 2).is_err());
 
     assert!(settings.apply(0x4242, 1).is_ok());
 }
@@ -203,8 +204,7 @@ fn section(encoder: &mut Encoder, stream_id: u64, fields: &[HeaderField]) -> (Ve
 
 fn permitted() -> Encoder {
     let mut encoder = Encoder::new();
-    encoder.set_max_capacity(qpack::ADVERTISED_TABLE_CAPACITY);
-    encoder.set_capacity(qpack::ADVERTISED_TABLE_CAPACITY);
+    encoder.set_max_capacity(qpack::Decoder::DEFAULT_MAX_CAPACITY);
     encoder
 }
 
@@ -231,7 +231,7 @@ fn a_request_arrives_on_a_request_stream() {
     assert_eq!(message.method, Some(Method::GET));
     assert_eq!(message.target.as_deref(), Some("/index.html"));
     assert_eq!(message.stream_id, Some(StreamID(0)));
-    assert!(message.quic && message.secure, "HTTP/3 always runs over a secure transport");
+    assert!(message.security.quic && message.security.secure, "HTTP/3 always runs over a secure transport");
 }
 
 #[test]
@@ -256,7 +256,7 @@ fn a_finished_exchange_leaves_nothing_behind() {
     }
 
     assert!(session.streams.is_empty(), "a connection that answered 64 requests still holds their streams");
-    assert!(session.blocked.is_empty(), "nothing was ever blocked");
+    assert!(session.blocked_since.is_empty(), "nothing was ever blocked");
 }
 
 #[test]
@@ -382,8 +382,8 @@ fn a_response_is_framed_for_its_stream() {
     assert!(fin, "an ordinary response ends its stream");
 
     let mut buffer = BytesMut::from(&bytes[..]);
-    assert!(matches!(h3::parse_frame(&mut buffer).ok().flatten(), Some(Frame::Headers(_))));
-    assert_eq!(h3::parse_frame(&mut buffer).ok().flatten(), Some(Frame::Data(b"hello".to_vec().into())));
+    assert!(matches!(h3::Frame::parse(&mut buffer).ok().flatten(), Some(Frame::Headers(_))));
+    assert_eq!(h3::Frame::parse(&mut buffer).ok().flatten(), Some(Frame::Data(b"hello".to_vec().into())));
 }
 
 #[test]
@@ -405,7 +405,7 @@ fn the_peers_settings_open_the_encoders_table() {
     let settings = Frame::Settings(Settings::default().parameters()).encode();
     session.on_control_bytes(&settings).expect("the peer settings were refused");
 
-    let update = EncoderInstruction::SetDynamicTableCapacity { capacity: qpack::ADVERTISED_TABLE_CAPACITY };
+    let update = EncoderInstruction::SetDynamicTableCapacity { capacity: qpack::Decoder::DEFAULT_MAX_CAPACITY };
     let queued = session.take_encoder_out();
     assert!(
         queued.starts_with(&update.encode()),
@@ -417,7 +417,7 @@ fn the_peers_settings_open_the_encoders_table() {
 fn settings_that_name_no_table_capacity_leave_the_encoder_shut() {
     let mut session = H3Session::new(Role::Origin, id(), limits());
 
-    let settings = Frame::Settings(vec![(h3::SETTINGS_QPACK_BLOCKED_STREAMS, 16)]).encode();
+    let settings = Frame::Settings(vec![(h3::Settings::QPACK_BLOCKED_STREAMS, 16)]).encode();
     session.on_control_bytes(&settings).expect("the peer settings were refused");
 
     assert!(session.take_encoder_out().is_empty(), "a silent peer permits no dynamic table");
@@ -474,7 +474,7 @@ fn refuses_a_stream_that_ends_with_no_field_section() {
     let mut session = server();
 
     let failure = session.on_stream_bytes(StreamID(0), &[], true);
-    assert!(matches!(failure, Err(Error::Stream { code, .. }) if code == h3::H3_REQUEST_INCOMPLETE));
+    assert!(matches!(failure, Err(Error::Stream { code, .. }) if code == h3::Code::REQUEST_INCOMPLETE));
 }
 
 #[test]
@@ -487,7 +487,7 @@ fn a_field_section_past_the_limit_resets_the_stream() {
     let block = Frame::Headers(vec![0u8; 128].into()).encode();
     let failure = session.on_stream_bytes(StreamID(0), &block, false);
 
-    assert!(matches!(failure, Err(Error::Stream { code, .. }) if code == h3::H3_EXCESSIVE_LOAD));
+    assert!(matches!(failure, Err(Error::Stream { code, .. }) if code == h3::Code::EXCESSIVE_LOAD));
 }
 
 #[test]
@@ -505,7 +505,7 @@ fn a_body_past_the_limit_resets_the_stream() {
     stream.extend_from_slice(&Frame::Data(vec![b'x'; 64].into()).encode());
 
     let failure = session.on_stream_bytes(StreamID(0), &stream, false);
-    assert!(matches!(failure, Err(Error::Stream { code, .. }) if code == h3::H3_EXCESSIVE_LOAD));
+    assert!(matches!(failure, Err(Error::Stream { code, .. }) if code == h3::Code::EXCESSIVE_LOAD));
 }
 
 #[test]
@@ -543,13 +543,13 @@ fn the_control_frame_advertises_the_local_settings() {
     let session = H3Session::new(Role::Origin, id(), limits());
 
     let mut buffer = BytesMut::from(&session.control_frame()[..]);
-    let frame = h3::parse_frame(&mut buffer).ok().flatten().expect("the control frame did not parse");
+    let frame = h3::Frame::parse(&mut buffer).ok().flatten().expect("the control frame did not parse");
 
     let Frame::Settings(params) = frame else {
         panic!("the control stream must open with SETTINGS");
     };
 
-    assert!(params.iter().any(|(id, _)| *id == h3::SETTINGS_QPACK_MAX_TABLE_CAPACITY));
+    assert!(params.iter().any(|(id, _)| *id == h3::Settings::QPACK_MAX_TABLE_CAPACITY));
 }
 
 #[test]
@@ -589,8 +589,46 @@ fn a_forgotten_stream_releases_its_qpack_sections() {
 }
 
 fn worker() -> H3Worker {
-    let (_connection, worker) = H3Connection::pair(server(), None);
+    let (_connection, worker) = H3Connection::pair(server());
     worker
+}
+
+/// A transport that takes every write and delivers nothing, for driving a
+/// worker without a QUIC connection underneath.
+struct NullTransport;
+
+impl quic::QuicTransport for NullTransport {
+    fn send(&mut self, _stream_id: u64, data: &[u8], _fin: bool) -> Result<quic::StreamWrite, Error> {
+        Ok(quic::StreamWrite::Sent(data.len()))
+    }
+
+    fn receive(&mut self, _stream_id: u64, _out: &mut [u8]) -> Result<quic::StreamRead, Error> {
+        Ok(quic::StreamRead::Done)
+    }
+
+    fn shutdown_read(&mut self, _stream_id: u64, _code: u64) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn shutdown_write(&mut self, _stream_id: u64, _code: u64) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn readable(&self) -> impl Iterator<Item = u64> {
+        std::iter::empty()
+    }
+
+    fn close(&mut self, _code: u64, _reason: &[u8]) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn application_protocol(&self) -> &[u8] {
+        b"h3"
+    }
+
+    fn version(&self) -> u32 {
+        1
+    }
 }
 
 #[test]
@@ -598,7 +636,7 @@ fn a_finished_unidirectional_stream_is_forgotten() {
     let mut worker = worker();
 
     for index in 0..1024u64 {
-        worker.feed_uni(index * 4 + 3, &[0x21], true).expect("a greased stream type was refused");
+        worker.feed_uni(&mut NullTransport, index * 4 + 3, &[0x21], true).expect("a greased stream type was refused");
     }
 
     assert!(worker.peer_uni.is_empty(), "{} finished streams are still remembered", worker.peer_uni.len());
@@ -612,7 +650,7 @@ fn open_unidirectional_streams_have_a_ceiling() {
 
     let mut refused = None;
     for index in 0..(ceiling as u64 + 8) {
-        if let Err(error) = worker.feed_uni(index * 4 + 3, &[0x21], false) {
+        if let Err(error) = worker.feed_uni(&mut NullTransport, index * 4 + 3, &[0x21], false) {
             refused = Some(error);
             break;
         }
@@ -627,10 +665,10 @@ fn a_stream_type_that_dribbles_in_is_never_buffered_beyond_a_varint() {
     let mut worker = worker();
 
     for _ in 0..64 {
-        worker.feed_uni(3, &[0xff], false).expect("a dribbled stream type was refused");
+        worker.feed_uni(&mut NullTransport, 3, &[0xff], false).expect("a dribbled stream type was refused");
 
         let held = worker.peer_uni.get(&3).map_or(0, |uni| uni.prefix.len());
-        assert!(held <= h3::MAX_VARINT_SIZE, "{held} octets are held while a stream type is awaited");
+        assert!(held <= quic::Varint::MAX_SIZE, "{held} octets are held while a stream type is awaited");
     }
 }
 
@@ -640,8 +678,8 @@ fn a_frame_that_never_completes_is_not_buffered_without_limit() {
     let mut session = H3Session::new(Role::Origin, id(), Limits { max_message_size: ceiling, ..limits() });
 
     let mut head = BytesMut::new();
-    h3::encode_varint(&mut head, FrameType::Data.code());
-    h3::encode_varint(&mut head, 1 << 30);
+    quic::Varint::encode(&mut head, FrameType::Data.code());
+    quic::Varint::encode(&mut head, 1 << 30);
     session.on_stream_bytes(StreamID(0), &head, false).expect("the frame head was refused");
 
     let chunk = vec![0u8; 512];
@@ -702,8 +740,8 @@ fn unread_data_is_bounded_across_every_stream_together() {
     session.on_control_bytes(&settings).expect("the peer settings were refused");
 
     let mut chunk = BytesMut::new();
-    h3::encode_varint(&mut chunk, FrameType::Data.code());
-    h3::encode_varint(&mut chunk, 1 << 20);
+    quic::Varint::encode(&mut chunk, FrameType::Data.code());
+    quic::Varint::encode(&mut chunk, 1 << 20);
     chunk.extend_from_slice(&[0u8; 512]);
 
     let mut streams = 0u64;
@@ -726,4 +764,45 @@ fn unread_data_is_bounded_across_every_stream_together() {
     }
 
     assert!(streams > 1, "the ceiling should be reached across several streams, not one");
+}
+
+#[test]
+fn the_encoder_table_is_held_to_this_ends_own_ceiling() {
+    // RFC 9204 §3.2.3: the encoder sets its capacity to at most what the peer
+    // permits. Limits::max_encoder_table_size is this end's own ceiling on top
+    // of that, and it must apply here exactly as it applies to HPACK.
+    let capped = Limits { max_encoder_table_size: 512, ..limits() };
+    let mut session = H3Session::new(Role::Origin, id(), capped);
+
+    let permitted = 64 * 1024;
+    let settings = Frame::Settings(vec![(h3::Settings::QPACK_MAX_TABLE_CAPACITY, permitted)]).encode();
+    session.on_control_bytes(&settings).expect("the peer settings were refused");
+
+    let update = EncoderInstruction::SetDynamicTableCapacity { capacity: 512 };
+    assert!(
+        session.take_encoder_out().starts_with(&update.encode()),
+        "the encoder announced a capacity above the one it was configured to keep",
+    );
+
+    // A peer that permits less than the ceiling still wins: the capacity is the
+    // smaller of the two, never the larger.
+    let mut modest = H3Session::new(Role::Origin, id(), capped);
+    let settings = Frame::Settings(vec![(h3::Settings::QPACK_MAX_TABLE_CAPACITY, 128)]).encode();
+    modest.on_control_bytes(&settings).expect("the peer settings were refused");
+
+    let update = EncoderInstruction::SetDynamicTableCapacity { capacity: 128 };
+    assert!(
+        modest.take_encoder_out().starts_with(&update.encode()),
+        "the encoder must not keep more than the peer permits",
+    );
+}
+
+#[test]
+fn a_connection_reports_the_settings_it_advertised() {
+    let session = H3Session::new(Role::Origin, id(), Limits { max_blocked_streams: 7, ..limits() });
+    let advertised = session.settings_local;
+    let (connection, _worker) = H3Connection::pair(session);
+
+    assert_eq!(*connection.settings_local(), advertised, "the handle must report what its session advertised");
+    assert_eq!(connection.settings_local().qpack_blocked_streams, 7, "the advertised blocked-stream ceiling did not follow the limits");
 }

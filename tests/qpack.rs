@@ -1,9 +1,5 @@
-use soyokaze::helpers::hpack::HeaderField;
-use soyokaze::helpers::qpack::{
-    self, Decoder, DecoderInstruction, DynamicTable, Encoder, EncoderInstruction, Error,
-    ADVERTISED_TABLE_CAPACITY,
-};
-use soyokaze::api::common::Limits;
+use soyokaze::helpers::fields::HeaderField;
+use soyokaze::helpers::qpack::{self, Decoder, DecoderInstruction, DynamicTable, Encoder, EncoderInstruction, Error};
 
 fn field(name: &str, value: &str) -> HeaderField {
     HeaderField::new(name, value)
@@ -13,8 +9,7 @@ fn paired() -> (Encoder, Decoder) {
     let mut encoder = Encoder::new();
     let mut decoder = Decoder::new();
 
-    encoder.set_max_capacity(ADVERTISED_TABLE_CAPACITY);
-    let update = encoder.set_capacity(ADVERTISED_TABLE_CAPACITY).expect("the table was not sized");
+    let update = encoder.set_max_capacity(Decoder::DEFAULT_MAX_CAPACITY).expect("the table was not sized");
     decoder.on_encoder_instruction(update).expect("the decoder refused the capacity update");
 
     (encoder, decoder)
@@ -32,7 +27,7 @@ fn exchange(encoder: &mut Encoder, decoder: &mut Decoder, instructions: Vec<Enco
 
 #[test]
 fn the_static_table_has_the_specified_shape() {
-    let table = qpack::static_table();
+    let table = qpack::StaticTable::entries();
 
     assert_eq!(table.len(), 99);
     assert_eq!(table[0], field(":authority", ""));
@@ -43,14 +38,14 @@ fn the_static_table_has_the_specified_shape() {
 
 #[test]
 fn finds_a_full_static_match_before_a_name_only_one() {
-    assert_eq!(qpack::find_static(&field(":method", "GET")), Some((17, true)));
-    assert_eq!(qpack::find_static(&field(":method", "BREW")), Some((15, false)));
-    assert_eq!(qpack::find_static(&field("x-nothing", "here")), None);
+    assert_eq!(qpack::StaticTable::find(&field(":method", "GET")), Some((17, true)));
+    assert_eq!(qpack::StaticTable::find(&field(":method", "BREW")), Some((15, false)));
+    assert_eq!(qpack::StaticTable::find(&field("x-nothing", "here")), None);
 }
 
 #[test]
 fn absolute_indices_count_up_from_the_first_insert() {
-    let mut table = DynamicTable::new(ADVERTISED_TABLE_CAPACITY);
+    let mut table = DynamicTable::new(Decoder::DEFAULT_MAX_CAPACITY);
 
     assert_eq!(table.insert(field("first", "1")), 0);
     assert_eq!(table.insert(field("second", "2")), 1);
@@ -63,7 +58,7 @@ fn absolute_indices_count_up_from_the_first_insert() {
 
 #[test]
 fn relative_and_post_base_indices_resolve_around_the_base() {
-    let mut table = DynamicTable::new(ADVERTISED_TABLE_CAPACITY);
+    let mut table = DynamicTable::new(Decoder::DEFAULT_MAX_CAPACITY);
     for index in 0..4 {
         table.insert(field(&format!("name-{index}"), "value"));
     }
@@ -102,7 +97,7 @@ fn an_entry_larger_than_the_capacity_does_not_fit() {
 
 #[test]
 fn setting_a_smaller_capacity_evicts() {
-    let mut table = DynamicTable::new(ADVERTISED_TABLE_CAPACITY);
+    let mut table = DynamicTable::new(Decoder::DEFAULT_MAX_CAPACITY);
     for index in 0..8 {
         table.insert(field(&format!("name-{index}"), "value"));
     }
@@ -114,23 +109,23 @@ fn setting_a_smaller_capacity_evicts() {
 
 #[test]
 fn a_section_that_needs_no_dynamic_entry_encodes_a_zero() {
-    assert_eq!(qpack::encode_insert_count(0, ADVERTISED_TABLE_CAPACITY), 0);
-    assert_eq!(qpack::decode_insert_count(0, 0, ADVERTISED_TABLE_CAPACITY), Ok(0));
+    assert_eq!(qpack::Prefix::encode_insert_count(0, Decoder::DEFAULT_MAX_CAPACITY), 0);
+    assert_eq!(qpack::Prefix::decode_insert_count(0, 0, Decoder::DEFAULT_MAX_CAPACITY), Ok(0));
 }
 
 #[test]
 fn the_wrapped_insert_count_recovers_inside_its_window() {
-    let capacity = ADVERTISED_TABLE_CAPACITY;
-    let entries = qpack::max_entries(capacity);
+    let capacity = Decoder::DEFAULT_MAX_CAPACITY;
+    let entries = qpack::Prefix::max_entries(capacity);
     assert_eq!(entries, 128);
 
     for inserted in [1u64, 5, 127, 128, 129, 255, 256, 1_000] {
         let floor = (inserted + entries).saturating_sub(2 * entries);
 
         for required in (floor + 1)..=inserted {
-            let encoded = qpack::encode_insert_count(required, capacity);
+            let encoded = qpack::Prefix::encode_insert_count(required, capacity);
             assert_eq!(
-                qpack::decode_insert_count(encoded, inserted, capacity),
+                qpack::Prefix::decode_insert_count(encoded, inserted, capacity),
                 Ok(required),
                 "required {required} with {inserted} inserted",
             );
@@ -140,11 +135,11 @@ fn the_wrapped_insert_count_recovers_inside_its_window() {
 
 #[test]
 fn refuses_an_insert_count_no_encoder_could_have_sent() {
-    let capacity = ADVERTISED_TABLE_CAPACITY;
-    let full_range = 2 * qpack::max_entries(capacity);
+    let capacity = Decoder::DEFAULT_MAX_CAPACITY;
+    let full_range = 2 * qpack::Prefix::max_entries(capacity);
 
-    assert_eq!(qpack::decode_insert_count(full_range + 1, 0, capacity), Err(Error::InvalidInsertCount));
-    assert_eq!(qpack::decode_insert_count(1, 0, capacity), Err(Error::InvalidInsertCount));
+    assert_eq!(qpack::Prefix::decode_insert_count(full_range + 1, 0, capacity), Err(Error::InvalidInsertCount));
+    assert_eq!(qpack::Prefix::decode_insert_count(1, 0, capacity), Err(Error::InvalidInsertCount));
 }
 
 #[test]
@@ -285,9 +280,8 @@ fn nothing_is_inserted_before_the_peer_permits_a_table() {
 #[test]
 fn a_peer_that_permits_nothing_keeps_the_table_shut() {
     let mut encoder = Encoder::new();
-    encoder.set_max_capacity(0);
 
-    assert_eq!(encoder.set_capacity(4096), None, "a capacity no peer permits must not be announced");
+    assert_eq!(encoder.set_max_capacity(0), None, "a capacity no peer permits must not be announced");
     assert_eq!(encoder.dynamic_table().capacity(), 0);
 
     let (_, instructions) = encoder.encode(0, &[field("x-custom", "value")]);
@@ -297,14 +291,13 @@ fn a_peer_that_permits_nothing_keeps_the_table_shut() {
 #[test]
 fn the_capacity_update_precedes_the_first_insert() {
     let mut encoder = Encoder::new();
-    encoder.set_max_capacity(512);
 
     assert_eq!(
-        encoder.set_capacity(4096),
+        encoder.set_max_capacity(512),
         Some(EncoderInstruction::SetDynamicTableCapacity { capacity: 512 }),
         "the capacity must be clamped to what the peer permits",
     );
-    assert_eq!(encoder.set_capacity(512), None, "an unchanged capacity says nothing");
+    assert_eq!(encoder.set_max_capacity(512), None, "an unchanged capacity says nothing");
 
     let (_, instructions) = encoder.encode(0, &[field("x-custom", "value")]);
     assert!(!instructions.is_empty(), "the encoder ignored the table the peer permitted");
@@ -454,7 +447,7 @@ fn a_decoder_that_never_acknowledges_cannot_grow_the_section_queue() {
     exchange(&mut encoder, &mut decoder, instructions);
     encoder.on_decoder_instruction(DecoderInstruction::SectionAcknowledgment { stream_id: 0 });
 
-    let ceiling = Limits::default().max_outstanding_sections as usize;
+    let ceiling = Encoder::DEFAULT_MAX_OUTSTANDING_SECTIONS;
 
     for stream in 1..(ceiling as u64 * 4) {
         let (_, instructions) = encoder.encode(stream * 4, &fields);
@@ -478,7 +471,7 @@ fn sections_beyond_the_queue_still_decode() {
     encoder.on_decoder_instruction(DecoderInstruction::SectionAcknowledgment { stream_id: 0 });
 
     let mut block = Vec::new();
-    for stream in 1..(Limits::default().max_outstanding_sections as u64 + 8) {
+    for stream in 1..(Encoder::DEFAULT_MAX_OUTSTANDING_SECTIONS as u64 + 8) {
         let (encoded, instructions) = encoder.encode(stream * 4, &fields);
         exchange(&mut encoder, &mut decoder, instructions);
         block = encoded;
@@ -502,4 +495,224 @@ fn a_cancelled_stream_releases_its_sections() {
 
     encoder.cancel(4);
     assert_eq!(encoder.outstanding(), 0, "a stream that is gone leaves no section behind");
+}
+
+#[test]
+fn a_blocked_stream_is_registered_until_its_insertions_arrive() {
+    let fields = vec![field("x-custom", "value")];
+
+    let (mut encoder, mut decoder) = paired();
+
+    let (_, instructions) = encoder.encode(0, &fields);
+    encoder.on_decoder_instruction(DecoderInstruction::InsertCountIncrement { increment: 1 });
+    let (block, _) = encoder.encode(4, &fields);
+
+    assert_eq!(decoder.decode(4, &block), Err(Error::Blocked));
+    assert_eq!(decoder.blocked(), 1);
+    assert!(decoder.unblocked().is_empty(), "nothing arrived, so nothing is unblocked");
+
+    let mut stream = Vec::new();
+    for instruction in &instructions {
+        instruction.encode_into(&mut stream);
+    }
+    decoder.on_encoder_stream(&stream).expect("the instructions did not apply");
+
+    assert_eq!(decoder.unblocked(), vec![4]);
+    let (decoded, acknowledgment) = decoder.decode(4, &block).expect("the unblocked section did not decode");
+    assert_eq!(decoded, fields);
+    assert_eq!(acknowledgment, Some(DecoderInstruction::SectionAcknowledgment { stream_id: 4 }));
+    assert_eq!(decoder.blocked(), 0, "a decoded section leaves the blocked set");
+}
+
+#[test]
+fn refuses_more_blocked_streams_than_were_advertised() {
+    let fields = vec![field("x-custom", "value")];
+
+    let (mut encoder, mut decoder) = paired();
+    decoder.set_max_blocked_streams(2);
+
+    let (_, _) = encoder.encode(0, &fields);
+    encoder.on_decoder_instruction(DecoderInstruction::InsertCountIncrement { increment: 1 });
+
+    let (block, _) = encoder.encode(4, &fields);
+    assert_eq!(decoder.decode(4, &block), Err(Error::Blocked));
+    assert_eq!(decoder.decode(8, &block), Err(Error::Blocked));
+
+    assert_eq!(decoder.decode(4, &block), Err(Error::Blocked), "a stream already blocked takes no new slot");
+    assert_eq!(decoder.decode(12, &block), Err(Error::TooManyBlockedStreams));
+
+    decoder.cancel(4);
+    assert_eq!(decoder.decode(12, &block), Err(Error::Blocked), "a cancelled stream frees its slot");
+}
+
+#[test]
+fn a_partial_instruction_waits_for_the_rest_of_the_stream() {
+    let mut decoder = Decoder::new();
+
+    let mut stream = Vec::new();
+    EncoderInstruction::SetDynamicTableCapacity { capacity: 128 }.encode_into(&mut stream);
+    EncoderInstruction::InsertWithLiteralName { name: b"x-custom".to_vec(), value: b"value".to_vec() }.encode_into(&mut stream);
+
+    let (head, tail) = stream.split_at(stream.len() - 4);
+    decoder.on_encoder_stream(head).expect("a partial instruction is not an error");
+    assert_eq!(decoder.dynamic_table().len(), 0, "a partial insert must not apply");
+
+    decoder.on_encoder_stream(tail).expect("the completed instruction did not apply");
+    assert_eq!(decoder.dynamic_table().len(), 1);
+
+    let answer = decoder.take_decoder_stream();
+    assert_eq!(DecoderInstruction::decode(&answer), Ok((answer.len(), DecoderInstruction::InsertCountIncrement { increment: 1 })));
+    assert!(decoder.take_decoder_stream().is_empty(), "taking the stream drains it");
+}
+
+#[test]
+fn refuses_an_instruction_that_grows_past_its_ceiling() {
+    let mut decoder = Decoder::new();
+    decoder.set_max_instruction_size(4);
+
+    let mut stream = Vec::new();
+    EncoderInstruction::InsertWithLiteralName { name: b"x-very-long-name".to_vec(), value: b"value".to_vec() }.encode_into(&mut stream);
+
+    assert_eq!(decoder.on_encoder_stream(&stream[..3]), Ok(()));
+    assert_eq!(decoder.on_encoder_stream(&stream[3..]), Err(Error::InstructionTooLarge));
+
+    let mut encoder = Encoder::new();
+    encoder.set_max_instruction_size(0);
+    assert_eq!(encoder.on_decoder_stream(&[0x80]), Err(Error::InstructionTooLarge));
+}
+
+#[test]
+fn acknowledgements_on_the_decoder_stream_free_the_encoder() {
+    let fields = vec![field("x-custom", "value")];
+
+    let (mut encoder, _) = paired();
+
+    let (_, _) = encoder.encode(0, &fields);
+    encoder.on_decoder_instruction(DecoderInstruction::InsertCountIncrement { increment: 1 });
+
+    let (_, _) = encoder.encode(4, &fields);
+    assert_eq!(encoder.outstanding(), 1);
+
+    let mut stream = Vec::new();
+    DecoderInstruction::SectionAcknowledgment { stream_id: 4 }.encode_into(&mut stream);
+    encoder.on_decoder_stream(&stream).expect("the acknowledgement did not apply");
+
+    assert_eq!(encoder.outstanding(), 0);
+    assert_eq!(encoder.known_received_count(), 1);
+}
+
+#[test]
+fn queued_instructions_ride_the_encoder_stream() {
+    let mut encoder = Encoder::new();
+
+    let update = encoder.set_max_capacity(4096).expect("the table was not sized");
+    encoder.queue(&[update]);
+
+    let stream = encoder.take_encoder_stream();
+    assert_eq!(EncoderInstruction::decode(&stream), Ok((stream.len(), EncoderInstruction::SetDynamicTableCapacity { capacity: 4096 })));
+    assert!(encoder.take_encoder_stream().is_empty(), "taking the stream drains it");
+}
+
+#[test]
+fn the_capacity_limit_caps_what_the_peer_permits() {
+    let mut encoder = Encoder::new();
+    encoder.set_capacity_limit(128);
+
+    assert_eq!(
+        encoder.set_max_capacity(4096),
+        Some(EncoderInstruction::SetDynamicTableCapacity { capacity: 128 }),
+        "the capacity must be clamped to the encoder's own limit",
+    );
+
+    assert_eq!(
+        encoder.set_capacity_limit(64),
+        Some(EncoderInstruction::SetDynamicTableCapacity { capacity: 64 }),
+        "shrinking the limit must be announced",
+    );
+    assert_eq!(encoder.set_capacity_limit(4096), None, "raising the limit grows nothing on its own");
+    assert_eq!(encoder.dynamic_table().capacity(), 64);
+}
+
+/// The side-channel buffers are the encoder's and the decoder's own.
+///
+/// RFC 9204 §4.2 gives each end an encoder stream and a decoder stream, and
+/// what is queued for them is state of the codec, not of whoever drives it. A
+/// caller sends the octets and hands the buffer back; it never reaches into the
+/// codec to do that itself.
+#[test]
+fn the_encoder_stream_can_be_read_without_draining_it() {
+    let mut encoder = Encoder::new();
+    let update = encoder.set_max_capacity(4096).expect("the table was not sized");
+    encoder.queue(&[update]);
+
+    let queued = encoder.encoder_stream().to_vec();
+    assert!(!queued.is_empty(), "a queued instruction must reach the stream");
+    assert_eq!(encoder.encoder_stream(), queued, "reading the stream must not drain it");
+    assert_eq!(encoder.take_encoder_stream(), queued, "taking it must yield what was read");
+    assert!(encoder.encoder_stream().is_empty(), "taking the stream drains it");
+}
+
+#[test]
+fn the_decoder_stream_can_be_read_without_draining_it() {
+    let mut decoder = Decoder::new();
+    decoder.queue(&[DecoderInstruction::SectionAcknowledgment { stream_id: 0 }]);
+
+    let queued = decoder.decoder_stream().to_vec();
+    assert!(!queued.is_empty(), "a queued instruction must reach the stream");
+    assert_eq!(decoder.decoder_stream(), queued, "reading the stream must not drain it");
+    assert_eq!(decoder.take_decoder_stream(), queued, "taking it must yield what was read");
+    assert!(decoder.decoder_stream().is_empty(), "taking the stream drains it");
+}
+
+#[test]
+fn a_reclaimed_encoder_buffer_is_reused_and_keeps_what_was_queued_meanwhile() {
+    let mut encoder = Encoder::new();
+    let update = encoder.set_max_capacity(4096).expect("the table was not sized");
+    encoder.queue(&[update]);
+
+    let taken = encoder.take_encoder_stream();
+    assert!(taken.capacity() > 0, "the taken buffer must carry its allocation");
+
+    // Something queued while the caller held the buffer must survive the reclaim.
+    encoder.queue(&[EncoderInstruction::Duplicate { index: 0 }]);
+    let meanwhile = encoder.encoder_stream().to_vec();
+    assert!(!meanwhile.is_empty(), "the second instruction must reach the stream");
+
+    encoder.reclaim_encoder_stream(taken);
+
+    assert_eq!(encoder.encoder_stream(), meanwhile, "a reclaim must not drop what was queued");
+}
+
+#[test]
+fn a_reclaimed_buffer_that_outgrew_the_idle_capacity_is_given_up() {
+    let mut encoder = Encoder::new();
+    encoder.set_idle_capacity(1024);
+
+    let grown = Vec::with_capacity(64 * 1024);
+    encoder.reclaim_encoder_stream(grown);
+
+    assert!(
+        encoder.take_encoder_stream().capacity() <= 1024,
+        "a buffer past the idle capacity must not stay attached to an idle encoder",
+    );
+
+    let mut decoder = Decoder::new();
+    decoder.set_idle_capacity(1024);
+    decoder.reclaim_decoder_stream(Vec::with_capacity(64 * 1024));
+
+    assert!(decoder.take_decoder_stream().capacity() <= 1024, "the decoder must give the memory back too");
+}
+
+/// The codecs stand alone, so their ceilings are their own.
+#[test]
+fn a_codec_carries_no_setting_that_is_not_qpack() {
+    let mut encoder = Encoder::new();
+    encoder.set_idle_capacity(2048);
+    encoder.set_max_outstanding_sections(4);
+    encoder.set_max_instruction_size(999);
+
+    // Nothing above is an HTTP/3 or QUIC setting, and the encoder needs none.
+    let update = encoder.set_max_capacity(4096).expect("the table was not sized");
+    encoder.queue(&[update]);
+    assert!(!encoder.encoder_stream().is_empty());
 }

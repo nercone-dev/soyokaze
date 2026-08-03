@@ -29,33 +29,33 @@ pub fn classifier(data: &[u8]) {
 }
 
 pub fn field_line(data: &[u8]) {
-    let Ok((name, value)) = h1::parse_field(data) else {
+    let Ok((name, value)) = h1::Field::parse_bytes(data) else {
         return;
     };
 
     assert!(!name.is_empty(), "an empty field name parsed out of {data:?}");
-    assert!(h1::is_token(&name), "field name {name:?} is not a token");
+    assert!(h1::Octets::is_token(&name), "field name {name:?} is not a token");
     assert!(!name.bytes().any(|byte| byte.is_ascii_uppercase()), "field name {name:?} was not lowercased");
-    assert!(h1::is_field_value(value.as_bytes()), "field value {value:?} carries a control character");
+    assert!(scan::is_field_value(value.as_bytes()), "field value {value:?} carries a control character");
 
-    let line = h1::write_header_line(&name, &value, soyokaze::HeaderCase::Lower)
+    let line = h1::Field::encode(&name, &value, soyokaze::HeaderCase::Lower)
         .expect("a parsed field line did not write back out");
 
     let written = line.strip_suffix("\r\n").expect("a written field line is not CRLF terminated");
-    let (again, value_again) = h1::parse_field(written.as_bytes()).expect("a written field line did not parse back");
+    let (again, value_again) = h1::Field::parse_bytes(written.as_bytes()).expect("a written field line did not parse back");
 
     assert_eq!(again, name, "a round trip changed the field name");
     assert_eq!(value_again, value, "a round trip changed the field value");
 }
 
 pub fn header_block(data: &[u8]) {
-    let Ok(headers) = h1::parse_header_block(data, 100) else {
+    let Ok(headers) = h1::Field::parse_block(data, 100) else {
         return;
     };
 
     let lines = data.split(|octet| *octet == b'\n').filter(|line| !line.is_empty());
     let parsed: Vec<_> = lines
-        .map(|line| h1::parse_field(&line[..line.len() - 1]).expect("a line of an accepted block did not parse"))
+        .map(|line| h1::Field::parse_bytes(&line[..line.len() - 1]).expect("a line of an accepted block did not parse"))
         .collect();
 
     assert_eq!(headers.len(), parsed.len(), "the block and its lines disagreed on how many fields there are");

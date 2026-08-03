@@ -1,52 +1,15 @@
-//! Cookies and connection persistence.
+//! Cookies.
 //!
 //! [`Cookie`] and [`SetCookie`] are the two sides of the exchange — what a
 //! client sends and what a server sets — and [`CookieJar`] is the client-side
 //! store that turns one into the other across requests.
-//!
-//! [`keep_alive`] answers the other question a field section decides: whether
-//! the connection survives this message.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::api::common::Limits;
 use crate::errors::Error;
 use crate::helpers::sync::lock;
-use crate::models::{Headers, Url, Version};
-
-/// Whether the connection survives this message.
-///
-/// A `close` token in `Connection` ends it whatever the version says.
-/// Otherwise HTTP/1.0 needs an explicit `keep-alive` to stay up, and every
-/// later version stays up by default.
-pub fn keep_alive(headers: Option<&Headers>, version: Version) -> bool {
-    let mut close = false;
-    let mut keep = false;
-
-    if let Some(headers) = headers {
-        for value in headers.get_all("connection") {
-            for token in value.split(',') {
-                let token = token.trim();
-
-                if token.eq_ignore_ascii_case("close") {
-                    close = true;
-                } else if token.eq_ignore_ascii_case("keep-alive") {
-                    keep = true;
-                }
-            }
-        }
-    }
-
-    if close {
-        return false;
-    }
-
-    match version {
-        Version::V1_0 => keep,
-        _ => true,
-    }
-}
+use crate::models::{Limits, Url};
 
 /// The `SameSite` attribute of a cookie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +51,11 @@ pub struct Cookie {
 }
 
 impl Cookie {
+
+    /// Whether an octet is a separator, and so cannot appear in a token.
+    pub fn is_separator(byte: u8) -> bool {
+        byte <= 0x20 || byte == 0x7f || b"()<>@,;:\\\"/[]?={}".contains(&byte)
+    }
     /// An empty set of pairs.
     pub fn new() -> Self {
         Self { pairs: Vec::new() }
@@ -142,7 +110,7 @@ pub struct SetCookie {
     pub max_age: Option<i64>,
     /// The `Domain` attribute; absent makes the cookie host-only.
     pub domain: Option<String>,
-    /// The `Path` attribute; absent defaults to [`default_path`] of the request target.
+    /// The `Path` attribute; absent defaults to [`StoredCookie::default_path`] of the request target.
     pub path: Option<String>,
     /// The `Secure` attribute, which confines the cookie to secure transports.
     pub secure: bool,
@@ -233,7 +201,7 @@ impl SetCookie {
     /// whitespace, a quote, a comma, a semicolon, a backslash, or anything
     /// outside printable ASCII.
     pub fn build(&self) -> Result<String, Error> {
-        if self.name.is_empty() || self.name.bytes().any(is_separator) {
+        if self.name.is_empty() || self.name.bytes().any(Cookie::is_separator) {
             return Err(Error::Protocol(format!("cookie name {:?} is not a token", self.name)));
         }
 
@@ -275,11 +243,6 @@ impl SetCookie {
     }
 }
 
-/// Whether an octet is a separator, and so cannot appear in a token.
-pub fn is_separator(byte: u8) -> bool {
-    byte <= 0x20 || byte == 0x7f || b"()<>@,;:\\\"/[]?={}".contains(&byte)
-}
-
 /// A cookie as a [`CookieJar`] holds it, with its attributes resolved.
 ///
 /// A stored cookie differs from the [`SetCookie`] it came from in that the
@@ -304,6 +267,31 @@ pub struct StoredCookie {
 }
 
 impl StoredCookie {
+
+    /// Whether a request target falls under a cookie's path.
+    ///
+    /// The two match when they are equal, or when the target continues past the
+    /// cookie path at a `/` boundary.
+    pub fn path_matches(target: &str, cookie_path: &str) -> bool {
+        let request_path = target.split(['?', '#']).next().unwrap_or("/");
+        if request_path == cookie_path {
+            return true;
+        }
+        if let Some(rest) = request_path.strip_prefix(cookie_path) {
+            return cookie_path.ends_with('/') || rest.starts_with('/');
+        }
+        false
+    }
+
+    /// The path a cookie takes when the server sets no `Path` attribute: the
+    /// request target up to, but not including, its last `/`.
+    pub fn default_path(target: &str) -> String {
+        let path = target.split(['?', '#']).next().unwrap_or("/");
+        match path.rfind('/') {
+            Some(0) | None => "/".to_owned(),
+            Some(index) => path[..index].to_owned(),
+        }
+    }
     /// Whether this cookie belongs on a request for `url` at `now`.
     ///
     /// The cookie has to be unexpired, allowed on the transport, and matched
@@ -324,32 +312,33 @@ impl StoredCookie {
             host == self.domain || host.ends_with(&format!(".{}", self.domain))
         };
 
-        domain_ok && path_matches(&url.target, &self.path)
+        domain_ok && Self::path_matches(&url.target, &self.path)
     }
 }
 
-/// Whether a request target falls under a cookie's path.
+/// The ceilings a [`CookieJar`] keeps itself under.
 ///
-/// The two match when they are equal, or when the target continues past the
-/// cookie path at a `/` boundary.
-pub fn path_matches(target: &str, cookie_path: &str) -> bool {
-    let request_path = target.split(['?', '#']).next().unwrap_or("/");
-    if request_path == cookie_path {
-        return true;
-    }
-    if let Some(rest) = request_path.strip_prefix(cookie_path) {
-        return cookie_path.ends_with('/') || rest.starts_with('/');
-    }
-    false
+/// A jar's own, so a jar can be built and reasoned about without the rest of
+/// the crate: nothing here is a protocol setting, and no protocol setting is
+/// here. [`Limits`] converts into one for a caller configuring everything at
+/// once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CookieLimits {
+    /// The number of cookies one jar may hold across all origins.
+    pub max_cookies: u32,
+    /// The number of cookies one jar may hold for a single domain.
+    pub max_cookies_per_domain: u16,
 }
 
-/// The path a cookie takes when the server sets no `Path` attribute: the
-/// request target up to, but not including, its last `/`.
-pub fn default_path(target: &str) -> String {
-    let path = target.split(['?', '#']).next().unwrap_or("/");
-    match path.rfind('/') {
-        Some(0) | None => "/".to_owned(),
-        Some(index) => path[..index].to_owned(),
+impl Default for CookieLimits {
+    fn default() -> Self {
+        Self { max_cookies: 3000, max_cookies_per_domain: 50 }
+    }
+}
+
+impl From<Limits> for CookieLimits {
+    fn from(limits: Limits) -> Self {
+        Self { max_cookies: limits.max_cookies, max_cookies_per_domain: limits.max_cookies_per_domain }
     }
 }
 
@@ -366,18 +355,35 @@ pub struct CookieJar {
     /// The cookies held, in the order they were stored.
     pub entries: Mutex<Vec<StoredCookie>>,
     /// The ceilings the jar keeps itself under.
-    pub limits: Limits,
+    pub limits: CookieLimits,
 }
 
 impl CookieJar {
+
+    /// Makes room for one more cookie in `domain`.
+    ///
+    /// Drops the oldest cookie for the domain when it is at
+    /// [`Limits::max_cookies_per_domain`], and then the oldest cookies overall
+    /// until the jar is under [`Limits::max_cookies`].
+    pub fn evict(entries: &mut Vec<StoredCookie>, domain: &str, limits: &CookieLimits) {
+        if entries.iter().filter(|stored| stored.domain == domain).count() >= limits.max_cookies_per_domain as usize
+            && let Some(oldest) = entries.iter().position(|stored| stored.domain == domain)
+        {
+            entries.remove(oldest);
+        }
+
+        while entries.len() >= limits.max_cookies as usize {
+            entries.remove(0);
+        }
+    }
     /// An empty jar with the default [`Limits`].
     pub fn new() -> Self {
-        Self { entries: Mutex::new(Vec::new()), limits: Limits::default() }
+        Self { entries: Mutex::new(Vec::new()), limits: CookieLimits::default() }
     }
 
     /// The same jar, bounded by `limits`.
-    pub fn with_limits(mut self, limits: Limits) -> Self {
-        self.limits = limits;
+    pub fn with_limits(mut self, limits: impl Into<CookieLimits>) -> Self {
+        self.limits = limits.into();
         self
     }
 
@@ -398,7 +404,7 @@ impl CookieJar {
                 Some(domain) => (domain.trim_start_matches('.').to_ascii_lowercase(), false),
                 None => (url.host.to_ascii_lowercase(), true),
             };
-            let path = cookie.path.clone().unwrap_or_else(|| default_path(&url.target));
+            let path = cookie.path.clone().unwrap_or_else(|| StoredCookie::default_path(&url.target));
 
             let expires = cookie
                 .max_age
@@ -412,7 +418,7 @@ impl CookieJar {
             }
 
             entries.retain(|stored| !stored.expires.is_some_and(|expiry| expiry <= now));
-            evict(&mut entries, &domain, &self.limits);
+            Self::evict(&mut entries, &domain, &self.limits);
 
             entries.push(StoredCookie {
                 name: cookie.name,
@@ -444,19 +450,3 @@ impl CookieJar {
     }
 }
 
-/// Makes room for one more cookie in `domain`.
-///
-/// Drops the oldest cookie for the domain when it is at
-/// [`Limits::max_cookies_per_domain`], and then the oldest cookies overall
-/// until the jar is under [`Limits::max_cookies`].
-pub fn evict(entries: &mut Vec<StoredCookie>, domain: &str, limits: &Limits) {
-    if entries.iter().filter(|stored| stored.domain == domain).count() >= limits.max_cookies_per_domain as usize
-        && let Some(oldest) = entries.iter().position(|stored| stored.domain == domain)
-    {
-        entries.remove(oldest);
-    }
-
-    while entries.len() >= limits.max_cookies as usize {
-        entries.remove(0);
-    }
-}

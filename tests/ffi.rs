@@ -16,7 +16,7 @@ use std::ptr;
 use soyokaze::ffi::api::client::{
     soyokaze_client_fetch, soyokaze_client_free, soyokaze_client_get, soyokaze_client_new, ClientConfig,
 };
-use soyokaze::ffi::api::common::soyokaze_limits_default;
+use soyokaze::ffi::models::soyokaze_limits_default;
 use soyokaze::ffi::errors::{
     soyokaze_error_free, soyokaze_error_message, soyokaze_error_status, soyokaze_status_message, ErrorHandle, Status,
 };
@@ -33,6 +33,7 @@ use soyokaze::ffi::api::server::{
     soyokaze_response_with_body, soyokaze_server_free, soyokaze_server_handle_close, soyokaze_server_handle_port,
     soyokaze_server_new, soyokaze_server_serve,
 };
+use soyokaze::ffi::tls::{soyokaze_tls_config_default, TlsConfig};
 use soyokaze::ffi::{
     soyokaze_buffer_free, soyokaze_runtime_free, soyokaze_runtime_new, soyokaze_version, Buffer, Runtime, Slice,
 };
@@ -424,6 +425,36 @@ fn a_client_takes_its_defaults_from_a_null_configuration() {
 }
 
 #[test]
+fn a_tls_config_defaults_to_changing_nothing() {
+    let defaults = soyokaze_tls_config_default();
+
+    assert!(defaults.ciphers.data.is_null(), "an absent list keeps the profile's ciphers");
+    assert!(defaults.groups.data.is_null());
+    assert!(defaults.signature_algorithms.data.is_null());
+    assert!(!defaults.prefer_server_ciphers);
+    assert!(defaults.session_tickets, "tickets are on unless turned off, as the crate documents");
+    assert!(!defaults.early_data);
+    assert!(!defaults.certificate_compression);
+}
+
+#[test]
+fn a_tls_config_is_read_into_a_client_and_text_that_is_not_utf8_is_refused() {
+    let (groups, groups_len) = text("X25519:P-256");
+    let tls = TlsConfig { groups: Slice { data: groups, len: groups_len }, ..soyokaze_tls_config_default() };
+    let config = ClientConfig { tls: &tls, ..ClientConfig::DEFAULT };
+
+    let client = unsafe { soyokaze_client_new(&config) };
+    assert!(!client.is_null(), "a UTF-8 list is taken as given");
+    unsafe { soyokaze_client_free(client) };
+
+    let bogus = [0xffu8, 0xfe];
+    let tls = TlsConfig { ciphers: Slice { data: bogus.as_ptr(), len: bogus.len() }, ..soyokaze_tls_config_default() };
+    let config = ClientConfig { tls: &tls, ..ClientConfig::DEFAULT };
+
+    assert!(unsafe { soyokaze_client_new(&config) }.is_null(), "a list that is not UTF-8 is refused rather than mangled");
+}
+
+#[test]
 fn a_call_without_a_runtime_is_refused() {
     let client = unsafe { soyokaze_client_new(ptr::null()) };
     let (url, url_len) = text("http://127.0.0.1:1/");
@@ -683,7 +714,7 @@ fn the_connection_facts_cross_as_the_wire_codes_the_handshake_settled() {
         soyokaze_message_early_data, soyokaze_message_quic, soyokaze_message_quic_version, soyokaze_message_secure,
         soyokaze_message_tls, soyokaze_message_tls_cipher, soyokaze_message_tls_group, soyokaze_message_tls_version,
     };
-    use soyokaze::models::{Security, TLSCipher, TLSGroup, TLSVersion};
+    use soyokaze::tls::{Security, TLSCipher, TLSGroup, TLSVersion};
 
     let security = Security {
         secure: true,
@@ -698,7 +729,7 @@ fn the_connection_facts_cross_as_the_wire_codes_the_handshake_settled() {
     };
 
     let message = soyokaze_message_response(200, Version::V1_1);
-    security.apply(unsafe { &mut *message });
+    unsafe { (*message).security = security };
 
     assert!(unsafe { soyokaze_message_secure(message) });
     assert!(unsafe { soyokaze_message_early_data(message) });
@@ -714,7 +745,7 @@ fn the_connection_facts_cross_as_the_wire_codes_the_handshake_settled() {
     // A QUIC connection reports itself, and the TLS 1.3 that RFC 9001 makes
     // the only version it can be carrying.
     let message = soyokaze_message_response(200, Version::V3_0);
-    Security::quic(1).apply(unsafe { &mut *message });
+    unsafe { (*message).security = Security::quic(Some(1)) };
 
     assert!(unsafe { soyokaze_message_quic(message) });
     assert_eq!(unsafe { soyokaze_message_quic_version(message) }, 1);
@@ -727,7 +758,7 @@ fn the_connection_facts_cross_as_the_wire_codes_the_handshake_settled() {
 
 #[test]
 fn every_role_crosses_as_the_number_the_header_gives_it() {
-    use soyokaze::ffi::api::client::role;
+    use soyokaze::ffi::models::role;
     use soyokaze::models::Role;
 
     assert_eq!(role(Role::UserAgent), 0);
@@ -786,7 +817,7 @@ fn each_response_constructor_sets_its_content_type() {
 
 #[test]
 fn a_cookie_field_parses_and_builds() {
-    use soyokaze::ffi::headers::{
+    use soyokaze::ffi::cookies::{
         soyokaze_cookie_append, soyokaze_cookie_build, soyokaze_cookie_count, soyokaze_cookie_free,
         soyokaze_cookie_get, soyokaze_cookie_name, soyokaze_cookie_parse, soyokaze_cookie_value,
     };
@@ -812,7 +843,7 @@ fn a_cookie_field_parses_and_builds() {
 
 #[test]
 fn a_setcookie_carries_every_attribute_across() {
-    use soyokaze::ffi::headers::{
+    use soyokaze::ffi::cookies::{
         soyokaze_setcookie_build, soyokaze_setcookie_domain, soyokaze_setcookie_free, soyokaze_setcookie_httponly,
         soyokaze_setcookie_max_age, soyokaze_setcookie_name, soyokaze_setcookie_parse, soyokaze_setcookie_path,
         soyokaze_setcookie_samesite, soyokaze_setcookie_secure, soyokaze_setcookie_set_max_age,
@@ -850,7 +881,7 @@ fn a_setcookie_carries_every_attribute_across() {
 
 #[test]
 fn a_setcookie_value_that_could_break_out_is_refused() {
-    use soyokaze::ffi::headers::{soyokaze_setcookie_build, soyokaze_setcookie_free, soyokaze_setcookie_new};
+    use soyokaze::ffi::cookies::{soyokaze_setcookie_build, soyokaze_setcookie_free, soyokaze_setcookie_new};
 
     let (name, name_len) = text("sid");
     let (value, value_len) = text("a;b");
@@ -867,7 +898,7 @@ fn a_setcookie_value_that_could_break_out_is_refused() {
 
 #[test]
 fn a_jar_returns_matching_cookies_and_a_zero_age_deletes() {
-    use soyokaze::ffi::headers::{
+    use soyokaze::ffi::cookies::{
         soyokaze_cookiejar_cookie, soyokaze_cookiejar_free, soyokaze_cookiejar_learn, soyokaze_cookiejar_new,
         soyokaze_cookiejar_prune,
     };
@@ -896,7 +927,7 @@ fn a_jar_returns_matching_cookies_and_a_zero_age_deletes() {
 
 #[test]
 fn an_hsts_policy_and_store_follow_rfc_6797() {
-    use soyokaze::ffi::helpers::hsts::{
+    use soyokaze::ffi::hsts::{
         soyokaze_hsts_policy_build, soyokaze_hsts_policy_parse, soyokaze_hsts_store_free, soyokaze_hsts_store_learn,
         soyokaze_hsts_store_new, soyokaze_hsts_store_secure, HstsPolicy,
     };
@@ -963,10 +994,12 @@ fn base64_sha1_and_huffman_match_their_rfcs() {
 
 #[test]
 fn hpack_round_trips_a_section_through_its_dynamic_tables() {
+    use soyokaze::ffi::helpers::fields::{
+        soyokaze_fields_count, soyokaze_fields_free, soyokaze_fields_name, soyokaze_fields_value, Field,
+    };
     use soyokaze::ffi::helpers::hpack::{
-        soyokaze_fields_count, soyokaze_fields_free, soyokaze_fields_name, soyokaze_fields_value,
         soyokaze_hpack_decode, soyokaze_hpack_decoder_free, soyokaze_hpack_decoder_new, soyokaze_hpack_encode,
-        soyokaze_hpack_encoder_free, soyokaze_hpack_encoder_new, Field,
+        soyokaze_hpack_encoder_free, soyokaze_hpack_encoder_new,
     };
 
     let encoder = soyokaze_hpack_encoder_new();
@@ -1008,22 +1041,21 @@ fn hpack_round_trips_a_section_through_its_dynamic_tables() {
 
 #[test]
 fn qpack_round_trips_with_its_instruction_streams() {
-    use soyokaze::ffi::helpers::hpack::{soyokaze_fields_count, soyokaze_fields_free, Field};
+    use soyokaze::ffi::helpers::fields::{soyokaze_fields_count, soyokaze_fields_free, Field};
     use soyokaze::ffi::helpers::qpack::{
         soyokaze_qpack_decode, soyokaze_qpack_decoder_free, soyokaze_qpack_decoder_new,
         soyokaze_qpack_decoder_on_encoder_instructions, soyokaze_qpack_decoder_set_max_capacity, soyokaze_qpack_encode,
         soyokaze_qpack_encoder_free, soyokaze_qpack_encoder_new, soyokaze_qpack_encoder_on_decoder_instructions,
-        soyokaze_qpack_encoder_set_capacity, soyokaze_qpack_encoder_set_max_capacity,
+        soyokaze_qpack_encoder_set_max_capacity,
     };
 
     let encoder = soyokaze_qpack_encoder_new();
     let decoder = soyokaze_qpack_decoder_new();
 
-    assert!(unsafe { soyokaze_qpack_encoder_set_max_capacity(encoder, 4096) });
     assert!(unsafe { soyokaze_qpack_decoder_set_max_capacity(decoder, 4096) });
 
     let mut setup = Buffer::EMPTY;
-    assert!(unsafe { soyokaze_qpack_encoder_set_capacity(encoder, 4096, &mut setup) });
+    assert!(unsafe { soyokaze_qpack_encoder_set_max_capacity(encoder, 4096, &mut setup) });
     let setup = take(setup);
     assert!(!setup.is_empty(), "announcing capacity rides the encoder stream");
 

@@ -12,19 +12,10 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::api::common::Limits;
 use crate::helpers::sync::lock;
 use crate::helpers::text::Text;
+use crate::models::Limits;
 
-/// Appends as much of `part` to `out` as fits, advancing `written`.
-///
-/// Truncates rather than growing or failing, which is what lets
-/// [`HstsPolicy::value`] build its field value on the stack.
-pub fn append(out: &mut [u8], written: &mut usize, part: &[u8]) {
-    let end = (*written + part.len()).min(out.len());
-    out[*written..end].copy_from_slice(&part[..end - *written]);
-    *written = end;
-}
 
 /// One `Strict-Transport-Security` policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +29,16 @@ pub struct HstsPolicy {
 }
 
 impl HstsPolicy {
+    /// Appends as much of `part` to `out` as fits, advancing `written`.
+    ///
+    /// Truncates rather than growing or failing, which is what lets
+    /// [`HstsPolicy::value`] build its field value on the stack.
+    pub fn append(out: &mut [u8], written: &mut usize, part: &[u8]) {
+        let end = (*written + part.len()).min(out.len());
+        out[*written..end].copy_from_slice(&part[..end - *written]);
+        *written = end;
+    }
+
     /// A policy lasting `max_age` seconds, covering this host alone.
     pub fn new(max_age: i64) -> Self {
         Self { max_age, include_subdomains: false, preload: false }
@@ -56,7 +57,7 @@ impl HstsPolicy {
         let mut out = [0u8; 64];
         let mut written = 0;
 
-        append(&mut out, &mut written, b"max-age=");
+        Self::append(&mut out, &mut written, b"max-age=");
 
         let mut digits = [0u8; 20];
         let mut index = digits.len();
@@ -72,14 +73,14 @@ impl HstsPolicy {
             }
         }
 
-        append(&mut out, &mut written, &digits[index..]);
+        Self::append(&mut out, &mut written, &digits[index..]);
 
         if self.include_subdomains {
-            append(&mut out, &mut written, b"; includeSubDomains");
+            Self::append(&mut out, &mut written, b"; includeSubDomains");
         }
 
         if self.preload {
-            append(&mut out, &mut written, b"; preload");
+            Self::append(&mut out, &mut written, b"; preload");
         }
 
         Text::from_ascii(&out[..written])
@@ -129,6 +130,29 @@ impl HstsPolicy {
     }
 }
 
+/// The ceilings an [`HstsStore`] keeps itself under.
+///
+/// The store's own, for the same reason [`CookieLimits`] is the jar's.
+///
+/// [`CookieLimits`]: crate::cookies::CookieLimits
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HstsLimits {
+    /// The number of hosts one store may remember.
+    pub max_hsts_entries: u32,
+}
+
+impl Default for HstsLimits {
+    fn default() -> Self {
+        Self { max_hsts_entries: 4096 }
+    }
+}
+
+impl From<Limits> for HstsLimits {
+    fn from(limits: Limits) -> Self {
+        Self { max_hsts_entries: limits.max_hsts_entries }
+    }
+}
+
 /// A client-side record of which hosts insist on TLS.
 ///
 /// The store is shared and internally locked, so a [`Client`] can consult the
@@ -141,18 +165,18 @@ pub struct HstsStore {
     /// Host to expiry and whether the policy covers subdomains.
     pub entries: Mutex<HashMap<String, (Instant, bool)>>,
     /// The ceilings the store keeps itself under.
-    pub limits: Limits,
+    pub limits: HstsLimits,
 }
 
 impl HstsStore {
     /// An empty store with the default [`Limits`].
     pub fn new() -> Self {
-        Self { entries: Mutex::new(HashMap::new()), limits: Limits::default() }
+        Self { entries: Mutex::new(HashMap::new()), limits: HstsLimits::default() }
     }
 
     /// The same store, bounded by `limits`.
-    pub fn with_limits(mut self, limits: Limits) -> Self {
-        self.limits = limits;
+    pub fn with_limits(mut self, limits: impl Into<HstsLimits>) -> Self {
+        self.limits = limits.into();
         self
     }
 

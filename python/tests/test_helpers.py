@@ -3,7 +3,8 @@
 import pytest
 
 import soyokaze
-from soyokaze.helpers import base64, hpack, hsts, huffman, qpack, sha1
+from soyokaze import hsts
+from soyokaze.helpers import base64, hpack, huffman, qpack, sha1
 
 def test_base64_round_trips_and_matches_rfc_4648():
     assert base64.encode(b"") == ""
@@ -56,10 +57,9 @@ def test_qpack_round_trips_through_the_dynamic_table():
     encoder = qpack.Encoder()
     decoder = qpack.Decoder()
 
-    encoder.set_max_capacity(4096)
     decoder.set_max_capacity(4096)
 
-    setup = encoder.set_capacity(4096)
+    setup = encoder.set_max_capacity(4096)
     assert setup != b"", "announcing capacity rides the encoder stream"
     assert decoder.on_encoder_instructions(setup) == b""
 

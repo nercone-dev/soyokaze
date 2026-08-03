@@ -10,8 +10,8 @@
 //! the QPACK insertions it depends on, so a stream can sit *blocked* until the
 //! encoder stream catches up, bounded by [`Limits::qpack_block_timeout`].
 //!
-//! The design differs from HTTP/1 and HTTP/2 in one respect: `tokio-quiche`
-//! drives the connection through [`ApplicationOverQuic`] callbacks rather than
+//! The design differs from HTTP/1 and HTTP/2 in one respect: the QUIC driver
+//! drives the connection through [`QuicApplication`] callbacks rather than
 //! letting this crate own the read loop. So the work is split in two —
 //! [`H3Worker`] runs inside those callbacks, and [`H3Connection`] is the
 //! handle a caller holds, talking to the worker over channels. Everything that
@@ -23,536 +23,94 @@
 use std::collections::VecDeque;
 
 use bytes::{Bytes, BytesMut};
-use tokio_quiche::quic::{HandshakeInfo, QuicheConnection};
-use tokio_quiche::{ApplicationOverQuic, BoxError, QuicResult};
 
-use crate::api::common::Limits;
-use crate::helpers::hpack::HeaderField;
-use crate::helpers::qpack::{self, Decoder, DecoderInstruction, Encoder, EncoderInstruction};
-use crate::models::{Body, ConnectionID, Headers, Message, Method, Role, Security, StreamID, Version};
-use crate::protocol::base::Connection;
-use crate::protocol::common::{self, Error};
-
-/// `SETTINGS_QPACK_MAX_TABLE_CAPACITY`: the QPACK dynamic table ceiling.
-pub const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
-/// `SETTINGS_MAX_FIELD_SECTION_SIZE`: the largest decoded field section.
-pub const SETTINGS_MAX_FIELD_SECTION_SIZE: u64 = 0x06;
-/// `SETTINGS_QPACK_BLOCKED_STREAMS`: how many streams may be blocked at once.
-pub const SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x07;
-/// `SETTINGS_ENABLE_CONNECT_PROTOCOL`: whether extended CONNECT is allowed.
-pub const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
-
-/// Frame types reserved so that an HTTP/2 frame cannot be mistaken for one.
+/// The ceilings an [`H3Connection`] holds itself to.
 ///
-/// A peer sending these is speaking the wrong protocol, and must be rejected
-/// rather than ignored.
-pub const RESERVED_FRAME_TYPES: &[u64] = &[0x02, 0x06, 0x08, 0x09];
-/// Settings reserved for the same reason, from HTTP/2's identifiers.
-pub const RESERVED_SETTINGS: &[u64] = &[0x00, 0x02, 0x03, 0x04, 0x05];
-
-/// `H3_NO_ERROR`: the connection or stream ended cleanly.
-pub const H3_NO_ERROR: u64 = 0x0100;
-/// `H3_GENERAL_PROTOCOL_ERROR`: a protocol violation with no better code.
-pub const H3_GENERAL_PROTOCOL_ERROR: u64 = 0x0101;
-/// `H3_INTERNAL_ERROR`: something failed on this end.
-pub const H3_INTERNAL_ERROR: u64 = 0x0102;
-/// `H3_STREAM_CREATION_ERROR`: a stream was opened that should not have been.
-pub const H3_STREAM_CREATION_ERROR: u64 = 0x0103;
-/// `H3_CLOSED_CRITICAL_STREAM`: a stream the connection depends on was closed.
-pub const H3_CLOSED_CRITICAL_STREAM: u64 = 0x0104;
-/// `H3_FRAME_UNEXPECTED`: a frame arrived where it does not belong.
-pub const H3_FRAME_UNEXPECTED: u64 = 0x0105;
-/// `H3_FRAME_ERROR`: a frame is malformed.
-pub const H3_FRAME_ERROR: u64 = 0x0106;
-/// `H3_EXCESSIVE_LOAD`: the peer is generating excessive load.
-pub const H3_EXCESSIVE_LOAD: u64 = 0x0107;
-/// `H3_ID_ERROR`: an identifier was used outside its permitted range.
-pub const H3_ID_ERROR: u64 = 0x0108;
-/// `H3_SETTINGS_ERROR`: the settings are invalid.
-pub const H3_SETTINGS_ERROR: u64 = 0x0109;
-/// `H3_MISSING_SETTINGS`: the control stream carried no SETTINGS first.
-pub const H3_MISSING_SETTINGS: u64 = 0x010a;
-/// `H3_REQUEST_REJECTED`: the request was declined before any processing.
-pub const H3_REQUEST_REJECTED: u64 = 0x010b;
-/// `H3_REQUEST_CANCELLED`: the request is no longer wanted.
-pub const H3_REQUEST_CANCELLED: u64 = 0x010c;
-/// `H3_REQUEST_INCOMPLETE`: the stream ended before the message did.
-pub const H3_REQUEST_INCOMPLETE: u64 = 0x010d;
-/// `H3_MESSAGE_ERROR`: the message is malformed.
-pub const H3_MESSAGE_ERROR: u64 = 0x010e;
-/// `H3_CONNECT_ERROR`: a tunnel failed.
-pub const H3_CONNECT_ERROR: u64 = 0x010f;
-/// `H3_VERSION_FALLBACK`: the peer should retry over an earlier version.
-pub const H3_VERSION_FALLBACK: u64 = 0x0110;
-
-/// `QPACK_DECOMPRESSION_FAILED`: a field section could not be decoded.
-pub const QPACK_DECOMPRESSION_FAILED: u64 = 0x0200;
-/// `QPACK_ENCODER_STREAM_ERROR`: the encoder stream is unusable.
-pub const QPACK_ENCODER_STREAM_ERROR: u64 = 0x0201;
-/// `QPACK_DECODER_STREAM_ERROR`: the decoder stream is unusable.
-pub const QPACK_DECODER_STREAM_ERROR: u64 = 0x0202;
-
-/// The largest value a QUIC variable-length integer can hold.
-pub const MAXIMUM_VARINT: u64 = (1 << 62) - 1;
-/// The largest a variable-length integer can be, in octets.
-pub const MAX_VARINT_SIZE: usize = 8;
-
-/// How many reads or writes a tunnel will hold before it applies back pressure.
-pub const TUNNEL_BACKLOG: usize = 32;
-
-/// How many octets a variable-length integer takes: 1, 2, 4 or 8.
-pub fn varint_len(value: u64) -> usize {
-    match value {
-        0..=0x3f => 1,
-        0x40..=0x3fff => 2,
-        0x4000..=0x3fff_ffff => 4,
-        _ => 8,
-    }
-}
-
-/// Appends a variable-length integer, in the shortest form that holds it.
+/// RFC 9114 framing and RFC 9204 QPACK, and nothing else. No HPACK table size
+/// and no HTTP/1.x line ceiling appears here.
 ///
-/// # Panics
-///
-/// A value above [`MAXIMUM_VARINT`] does not fit the encoding, and the two
-/// high bits that carry the length would overwrite it.
-pub fn encode_varint(out: &mut impl bytes::BufMut, value: u64) {
-    match varint_len(value) {
-        1 => out.put_u8(value as u8),
-        2 => out.put_slice(&(value as u16 | 0x4000).to_be_bytes()),
-        4 => out.put_slice(&(value as u32 | 0x8000_0000).to_be_bytes()),
-        _ => out.put_slice(&(value | 0xc000_0000_0000_0000).to_be_bytes()),
-    }
+/// [`Limits`] converts into one, so a caller configuring everything at once
+/// still passes the one struct and each connection takes its own share.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct H3Limits {
+    /// In bytes, the total size of a message allowed for reception.
+    pub max_message_size: u64,
+    /// In bytes, the message body size allowed for reception.
+    pub max_message_body_size: u64,
+    /// In bytes, the whole header (or trailer) block.
+    pub max_headers_size: u64,
+    /// The number of header fields allowed in one block.
+    pub max_header_count: u16,
+    /// The number of streams a peer may have open at once.
+    pub max_concurrent_streams: u32,
+    /// In bytes, the unread data one connection may hold across its streams.
+    pub max_connection_buffer_size: u64,
+    /// The number of streams a peer may reset before a response was sent.
+    pub max_premature_resets: u32,
+    /// In bytes, the largest QPACK encoder table this end will keep.
+    pub max_encoder_table_size: u64,
+    /// In seconds, how long to wait for a blocking QPACK reference to resolve.
+    pub qpack_block_timeout: f64,
+    /// The number of unidirectional streams a peer may open at once.
+    pub max_peer_uni_streams: u32,
+    /// The unacknowledged QPACK field sections the encoder may track.
+    pub max_outstanding_sections: u32,
+    /// The number of streams that may wait QPACK-blocked at once.
+    pub max_blocked_streams: u32,
+    /// The reads or writes a tunnel holds before it applies back pressure.
+    pub tunnel_backlog: u32,
+    /// The commands or events queued between a handle and its worker.
+    pub command_backlog: u32,
+    /// In bytes, the buffer size above which an idle connection gives memory back.
+    pub idle_capacity: u64,
+    /// In seconds, how long one whole message may take to arrive (0 waits forever).
+    pub receive_timeout: f64,
+    /// In seconds, how long one whole message may take to send (0 waits forever).
+    pub send_timeout: f64,
 }
 
-/// Reads a variable-length integer, returning how many octets it took.
-///
-/// A consumed count of zero means the integer has not fully arrived; the
-/// caller should wait for more of the stream.
-pub fn decode_varint(input: &[u8]) -> (usize, u64) {
-    let Some(first) = input.first() else {
-        return (0, 0);
-    };
-
-    let length = 1 << (first >> 6);
-    if input.len() < length {
-        return (0, 0);
-    }
-
-    let mut value = (first & 0x3f) as u64;
-    for octet in &input[1..length] {
-        value = value << 8 | *octet as u64;
-    }
-
-    (length, value)
-}
-
-/// The kind of an HTTP/3 frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameType {
-    /// `DATA`: message body octets.
-    Data,
-    /// `HEADERS`: a QPACK-compressed field section.
-    Headers,
-    /// `CANCEL_PUSH`: a promised push is no longer wanted.
-    CancelPush,
-    /// `SETTINGS`: connection parameters, on the control stream.
-    Settings,
-    /// `PUSH_PROMISE`: a promised stream; refused here, since push is disabled.
-    PushPromise,
-    /// `GOAWAY`: no further requests will be accepted.
-    GoAway,
-    /// `MAX_PUSH_ID`: how far push identifiers may go.
-    MaxPushID,
-}
-
-impl FrameType {
-    /// The type code that goes on the wire.
-    pub fn code(&self) -> u64 {
-        match self {
-            Self::Data => 0x00,
-            Self::Headers => 0x01,
-            Self::CancelPush => 0x03,
-            Self::Settings => 0x04,
-            Self::PushPromise => 0x05,
-            Self::GoAway => 0x07,
-            Self::MaxPushID => 0x0d,
-        }
-    }
-
-    /// The frame type a code names, or `None` for an unknown type.
-    ///
-    /// Unknown types are skipped rather than rejected, so extensions and
-    /// greasing do not break the connection. [`RESERVED_FRAME_TYPES`] are
-    /// caught before this and rejected.
-    pub fn from_code(code: u64) -> Option<Self> {
-        match code {
-            0x00 => Some(Self::Data),
-            0x01 => Some(Self::Headers),
-            0x03 => Some(Self::CancelPush),
-            0x04 => Some(Self::Settings),
-            0x05 => Some(Self::PushPromise),
-            0x07 => Some(Self::GoAway),
-            0x0d => Some(Self::MaxPushID),
-            _ => None,
-        }
-    }
-}
-
-/// One decoded HTTP/3 frame.
-///
-/// There is no stream identifier here: the stream is whichever one the frame
-/// arrived on, since QUIC keeps them apart.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Frame {
-    /// Message body octets.
-    Data(Bytes),
-    /// A QPACK-compressed field section.
-    Headers(Bytes),
-    /// A promised push is no longer wanted.
-    CancelPush {
-        /// The push being cancelled.
-        push_id: u64,
-    },
-    /// Connection parameters, as identifier and value pairs.
-    Settings(Vec<(u64, u64)>),
-    /// A promised stream. Refused here, since push is disabled.
-    PushPromise {
-        /// The push being promised.
-        push_id: u64,
-        /// The compressed field block of the promised request.
-        block: Bytes,
-    },
-    /// No further requests will be accepted.
-    GoAway {
-        /// The last request or push that may still be processed.
-        id: u64,
-    },
-    /// How far push identifiers may go.
-    MaxPushID {
-        /// The new ceiling.
-        push_id: u64,
-    },
-}
-
-impl Frame {
-    /// The frame's type.
-    pub fn kind(&self) -> FrameType {
-        match self {
-            Self::Data(_) => FrameType::Data,
-            Self::Headers(_) => FrameType::Headers,
-            Self::CancelPush { .. } => FrameType::CancelPush,
-            Self::Settings(_) => FrameType::Settings,
-            Self::PushPromise { .. } => FrameType::PushPromise,
-            Self::GoAway { .. } => FrameType::GoAway,
-            Self::MaxPushID { .. } => FrameType::MaxPushID,
-        }
-    }
-
-    /// Appends the payload, without the type and length that precede it.
-    pub fn write_payload(&self, out: &mut BytesMut) {
-        match self {
-            Self::Data(data) | Self::Headers(data) => out.extend_from_slice(data),
-
-            Self::CancelPush { push_id } | Self::MaxPushID { push_id } => encode_varint(out, *push_id),
-
-            Self::GoAway { id } => encode_varint(out, *id),
-
-            Self::Settings(params) => {
-                for (id, value) in params {
-                    encode_varint(out, *id);
-                    encode_varint(out, *value);
-                }
-            }
-
-            Self::PushPromise { push_id, block } => {
-                encode_varint(out, *push_id);
-                out.extend_from_slice(block);
-            }
-        }
-    }
-
-    /// How long the payload will be, worked out without writing it.
-    ///
-    /// The length precedes the payload on the wire, so it has to be known
-    /// first.
-    pub fn payload_len(&self) -> usize {
-        match self {
-            Self::Data(data) | Self::Headers(data) => data.len(),
-
-            Self::CancelPush { push_id } | Self::MaxPushID { push_id } => varint_len(*push_id),
-
-            Self::GoAway { id } => varint_len(*id),
-
-            Self::Settings(params) => {
-                params.iter().map(|(id, value)| varint_len(*id) + varint_len(*value)).sum()
-            }
-
-            Self::PushPromise { push_id, block } => varint_len(*push_id) + block.len(),
-        }
-    }
-
-    /// The payload on its own.
-    pub fn payload(&self) -> Vec<u8> {
-        let mut out = BytesMut::with_capacity(self.payload_len());
-        self.write_payload(&mut out);
-        out.into()
-    }
-
-    /// Appends the whole frame: type, length, payload.
-    ///
-    /// # Panics
-    ///
-    /// Debug builds assert that [`Frame::payload_len`] agreed with what
-    /// [`Frame::write_payload`] actually wrote; if they disagreed the length
-    /// on the wire would be wrong and the stream unreadable.
-    pub fn encode_into(&self, out: &mut BytesMut) {
-        let length = self.payload_len();
-
-        out.reserve(length + 2 * varint_len(MAXIMUM_VARINT));
-        encode_varint(out, self.kind().code());
-        encode_varint(out, length as u64);
-
-        let start = out.len();
-        self.write_payload(out);
-        debug_assert_eq!(out.len() - start, length, "payload_len disagreed with write_payload");
-    }
-
-    /// The whole frame as its own buffer.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = BytesMut::with_capacity(self.payload_len() + 2 * varint_len(MAXIMUM_VARINT));
-        self.encode_into(&mut out);
-        out.into()
-    }
-
-    /// Decodes a frame payload, copying it.
-    ///
-    /// # Errors
-    ///
-    /// As [`Frame::assemble`].
-    pub fn decode(kind: FrameType, payload: &[u8]) -> Result<Self, Error> {
-        Self::assemble(kind, payload, None)
-    }
-
-    /// [`Frame::decode`] over a shared buffer, so a body is referenced rather
-    /// than copied.
-    ///
-    /// # Errors
-    ///
-    /// As [`Frame::assemble`].
-    pub fn decode_shared(kind: FrameType, payload: &Bytes) -> Result<Self, Error> {
-        Self::assemble(kind, payload.as_ref(), Some(payload))
-    }
-
-    /// Decodes a frame payload, referencing `shared` where one is given.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Protocol`] when a payload that must be a single
-    /// variable-length integer is not, when SETTINGS ends inside a parameter
-    /// or repeats one, or when PUSH_PROMISE carries no push identifier.
-    pub fn assemble(kind: FrameType, payload: &[u8], shared: Option<&Bytes>) -> Result<Self, Error> {
-        let borrow = |slice: &[u8]| match shared {
-            Some(whole) => whole.slice_ref(slice),
-            None => Bytes::copy_from_slice(slice),
-        };
-
-        match kind {
-            FrameType::Data => Ok(Self::Data(borrow(payload))),
-            FrameType::Headers => Ok(Self::Headers(borrow(payload))),
-
-            FrameType::CancelPush => Ok(Self::CancelPush { push_id: only_varint(payload, "CANCEL_PUSH")? }),
-            FrameType::MaxPushID => Ok(Self::MaxPushID { push_id: only_varint(payload, "MAX_PUSH_ID")? }),
-            FrameType::GoAway => Ok(Self::GoAway { id: only_varint(payload, "GOAWAY")? }),
-
-            FrameType::Settings => {
-                let mut rest = payload;
-                let mut params = Vec::new();
-
-                while !rest.is_empty() {
-                    let (consumed, id) = decode_varint(rest);
-                    let (taken, value) = decode_varint(&rest[consumed..]);
-
-                    if consumed == 0 || taken == 0 {
-                        return Err(Error::Protocol("SETTINGS ends inside a parameter".into()));
-                    }
-
-                    if params.iter().any(|(other, _)| *other == id) {
-                        return Err(Error::Protocol(format!("setting {id:#x} is repeated")));
-                    }
-
-                    params.push((id, value));
-                    rest = &rest[consumed + taken..];
-                }
-
-                Ok(Self::Settings(params))
-            }
-
-            FrameType::PushPromise => {
-                let (consumed, push_id) = decode_varint(payload);
-                if consumed == 0 {
-                    return Err(Error::Protocol("PUSH_PROMISE has no push identifier".into()));
-                }
-
-                Ok(Self::PushPromise { push_id, block: borrow(&payload[consumed..]) })
-            }
-        }
-    }
-}
-
-/// Reads a payload that must be exactly one variable-length integer.
-///
-/// # Errors
-///
-/// Returns [`Error::Protocol`] when the integer is incomplete or anything
-/// follows it.
-pub fn only_varint(payload: &[u8], name: &str) -> Result<u64, Error> {
-    let (consumed, value) = decode_varint(payload);
-
-    if consumed == 0 || consumed != payload.len() {
-        return Err(Error::Protocol(format!("{name} payload is not a single variable-length integer")));
-    }
-
-    Ok(value)
-}
-
-/// What a stream is for.
-///
-/// A unidirectional stream announces its kind with a code at the front; a
-/// bidirectional one carries a request and has no such prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamKind {
-    /// The control stream, carrying SETTINGS and connection-wide frames.
-    Control,
-    /// A push stream. Not opened here, since push is disabled.
-    Push,
-    /// The QPACK encoder stream, carrying table insertions.
-    QPACKEncoder,
-    /// The QPACK decoder stream, carrying acknowledgements.
-    QPACKDecoder,
-    /// A bidirectional request stream.
-    Request,
-}
-
-impl StreamKind {
-    /// The code a unidirectional stream announces itself with, or `None` for
-    /// [`StreamKind::Request`], which is bidirectional and announces nothing.
-    pub fn code(&self) -> Option<u64> {
-        match self {
-            Self::Control => Some(0x00),
-            Self::Push => Some(0x01),
-            Self::QPACKEncoder => Some(0x02),
-            Self::QPACKDecoder => Some(0x03),
-            Self::Request => None,
-        }
-    }
-
-    /// The stream kind a code names, or `None` for an unknown one.
-    pub fn from_code(code: u64) -> Option<Self> {
-        match code {
-            0x00 => Some(Self::Control),
-            0x01 => Some(Self::Push),
-            0x02 => Some(Self::QPACKEncoder),
-            0x03 => Some(Self::QPACKDecoder),
-            _ => None,
-        }
-    }
-}
-
-/// The parameters one end of a connection has announced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Settings {
-    /// The QPACK dynamic table capacity this end is willing to hold.
-    pub qpack_max_table_capacity: u64,
-    /// How many streams may be QPACK-blocked at once.
-    pub qpack_blocked_streams: u64,
-    /// The largest decoded field section; `None` leaves it unbounded.
-    pub max_field_section_size: Option<u64>,
-    /// Whether extended CONNECT, and so WebSocket, is allowed.
-    pub enable_connect_protocol: bool,
-}
-
-impl Settings {
-    /// The parameters as they go on the wire.
-    pub fn parameters(&self) -> Vec<(u64, u64)> {
-        let mut params = vec![
-            (SETTINGS_QPACK_MAX_TABLE_CAPACITY, self.qpack_max_table_capacity),
-            (SETTINGS_QPACK_BLOCKED_STREAMS, self.qpack_blocked_streams),
-            (SETTINGS_ENABLE_CONNECT_PROTOCOL, u64::from(self.enable_connect_protocol)),
-        ];
-
-        if let Some(size) = self.max_field_section_size {
-            params.push((SETTINGS_MAX_FIELD_SECTION_SIZE, size));
-        }
-
-        params
-    }
-
-    /// What a peer must be assumed to have advertised before its SETTINGS
-    /// arrives.
-    ///
-    /// Conservative throughout: no dynamic table, no blocked streams, no
-    /// extended CONNECT — nothing that could be got wrong by assuming it.
-    /// This is the base a peer's parameters are applied onto, not
-    /// [`Settings::default`], which is what this end advertises.
-    pub fn peer() -> Self {
-        Self {
-            qpack_max_table_capacity: qpack::DEFAULT_MAX_TABLE_CAPACITY as u64,
-            qpack_blocked_streams: 0,
-            max_field_section_size: None,
-            enable_connect_protocol: false,
-        }
-    }
-
-    /// Applies one parameter.
-    ///
-    /// Unknown identifiers are ignored, so extensions and greasing do not
-    /// break the connection.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Protocol`] for a [`RESERVED_SETTINGS`] identifier,
-    /// which means the peer is speaking HTTP/2, and for a flag that is
-    /// neither zero nor one.
-    pub fn apply(&mut self, id: u64, value: u64) -> Result<(), Error> {
-        if RESERVED_SETTINGS.contains(&id) {
-            return Err(Error::Protocol(format!("setting {id:#x} is reserved")));
-        }
-
-        match id {
-            SETTINGS_QPACK_MAX_TABLE_CAPACITY => self.qpack_max_table_capacity = value,
-            SETTINGS_QPACK_BLOCKED_STREAMS => self.qpack_blocked_streams = value,
-            SETTINGS_MAX_FIELD_SECTION_SIZE => self.max_field_section_size = Some(value),
-
-            SETTINGS_ENABLE_CONNECT_PROTOCOL => {
-                if value > 1 {
-                    return Err(Error::Protocol("SETTINGS_ENABLE_CONNECT_PROTOCOL is not a flag".into()));
-                }
-                self.enable_connect_protocol = value == 1;
-            }
-
-            _ => {}
-        }
-
-        Ok(())
-    }
-}
-
-impl Default for Settings {
+impl Default for H3Limits {
     fn default() -> Self {
+        Limits::default().into()
+    }
+}
+
+impl From<Limits> for H3Limits {
+    fn from(limits: Limits) -> Self {
         Self {
-            qpack_max_table_capacity: qpack::ADVERTISED_TABLE_CAPACITY as u64,
-            qpack_blocked_streams: 0,
-            max_field_section_size: None,
-            enable_connect_protocol: true,
+            max_message_size: limits.max_message_size,
+            max_message_body_size: limits.max_message_body_size,
+            max_headers_size: limits.max_headers_size,
+            max_header_count: limits.max_header_count,
+            max_concurrent_streams: limits.max_concurrent_streams,
+            max_connection_buffer_size: limits.max_connection_buffer_size,
+            max_premature_resets: limits.max_premature_resets,
+            max_encoder_table_size: limits.max_encoder_table_size,
+            qpack_block_timeout: limits.qpack_block_timeout,
+            max_peer_uni_streams: limits.max_peer_uni_streams,
+            max_outstanding_sections: limits.max_outstanding_sections,
+            max_blocked_streams: limits.max_blocked_streams,
+            tunnel_backlog: limits.tunnel_backlog,
+            command_backlog: limits.command_backlog,
+            idle_capacity: limits.idle_capacity,
+            receive_timeout: limits.receive_timeout,
+            send_timeout: limits.send_timeout,
         }
     }
 }
 
-/// Wraps a failure from the QUIC layer as an [`Error`].
-pub fn quic_error(err: impl std::fmt::Display) -> Error {
-    Error::Io(std::io::Error::other(err.to_string()))
-}
+pub mod frames;
+
+pub use frames::{Code, Frame, FrameType, Settings, StreamKind};
+
+use crate::helpers::fields::HeaderField;
+use crate::helpers::qpack::{self, Decoder, Encoder, EncoderInstruction};
+use crate::models::{Body, ConnectionID, Headers, Limits, Message, Method, Role, StreamID, Version};
+use crate::tls::Security;
+use crate::protocol::base::{Connection, Stream};
+use crate::protocol::common::{self, Error};
+use crate::protocol::quic::{Handshake, QuicApplication, QuicConnection, QuicError, QuicGuard, QuicHandshake, QuicOutcome, QuicTransport, StreamId, StreamRead, StreamWrite, Varint};
+use crate::helpers::sync;
 
 /// What is known about one request stream.
 #[derive(Default)]
@@ -594,7 +152,7 @@ impl StreamState {
 ///
 /// This is where the protocol itself lives: framing, QPACK, settings, and the
 /// per-stream state. It holds no QUIC handle, so it can be driven from inside
-/// the [`ApplicationOverQuic`] callbacks where the connection is only borrowed.
+/// the [`QuicApplication`] callbacks where the connection is only borrowed.
 /// Octets go in through the `on_*_bytes` methods and come back out through the
 /// `take_*` ones, leaving the caller to do the actual sending.
 pub struct H3Session {
@@ -603,7 +161,7 @@ pub struct H3Session {
     /// The connection's identifier.
     pub id: ConnectionID,
     /// The limits this connection holds itself to.
-    pub limits: Limits,
+    pub limits: H3Limits,
 
     /// The settings this end advertised.
     pub settings_local: Settings,
@@ -618,22 +176,17 @@ pub struct H3Session {
     /// State for each request stream.
     pub streams: common::StreamMap<StreamID, StreamState>,
     /// When each blocked stream became blocked, for the timeout.
-    pub blocked: common::StreamMap<StreamID, std::time::Instant>,
+    ///
+    /// Which streams are blocked, and on what, is the decoder's own
+    /// bookkeeping; the wall clock is a connection concern, so it is kept
+    /// here.
+    pub blocked_since: common::StreamMap<StreamID, std::time::Instant>,
     /// Messages that have completed and are waiting to be handed over.
     pub ready: VecDeque<Message>,
 
     /// An upper bound on [`H3Session::buffered`]; see [`H3Session::overbuffered`].
     pub buffered_bound: u64,
 
-    /// QPACK encoder instructions waiting to go out.
-    pub encoder_out: Vec<u8>,
-    /// QPACK decoder instructions waiting to go out.
-    pub decoder_out: Vec<u8>,
-
-    /// Partial octets received on the peer's encoder stream.
-    pub encoder_recv: BytesMut,
-    /// Partial octets received on the peer's decoder stream.
-    pub decoder_recv: BytesMut,
     /// Partial octets received on the peer's control stream.
     pub control_recv: BytesMut,
 
@@ -642,22 +195,38 @@ pub struct H3Session {
 
     /// What the transport underneath turned out to be, stamped on every
     /// message this session hands over.
-    pub security: Security,
+    ///
+    /// Shared with the [`H3Connection`] this session was paired with: QUIC only
+    /// reports what it settled once the handshake completes, which happens in
+    /// the worker, long after the handle has been handed to the caller. One
+    /// cell means [`Connection::security`] and [`Message::security`] cannot
+    /// disagree.
+    pub security: std::sync::Arc<std::sync::Mutex<Security>>,
 }
 
 impl H3Session {
     /// A session with nothing exchanged yet.
-    pub fn new(role: Role, id: ConnectionID, limits: Limits) -> Self {
-        let settings_local = Settings::default();
+    pub fn new(role: Role, id: ConnectionID, limits: impl Into<H3Limits>) -> Self {
+        let limits: H3Limits = limits.into();
+        let settings_local = Settings { qpack_blocked_streams: limits.max_blocked_streams as u64, ..Settings::default() };
 
         let mut decoder = Decoder::new();
         decoder.set_max_capacity(settings_local.qpack_max_table_capacity as usize);
         decoder.set_max_decoded_size(limits.max_headers_size as usize);
+        decoder.set_max_instruction_size(limits.max_headers_size as usize);
+        decoder.set_max_blocked_streams(limits.max_blocked_streams as usize);
+        decoder.set_idle_capacity(limits.idle_capacity as usize);
 
         let mut encoder = Encoder::new();
         encoder.set_max_outstanding_sections(limits.max_outstanding_sections as usize);
+        encoder.set_max_instruction_size(limits.max_headers_size as usize);
+        encoder.set_idle_capacity(limits.idle_capacity as usize);
 
-        let next_stream_id = if role.is_client() { 0 } else { 1 };
+        if let Some(instruction) = encoder.set_capacity_limit(limits.max_encoder_table_size as usize) {
+            encoder.queue(&[instruction]);
+        }
+
+        let next_stream_id = StreamId::first_bidi(role);
 
         Self {
             role,
@@ -668,16 +237,12 @@ impl H3Session {
             encoder,
             decoder,
             streams: common::StreamMap::default(),
-            blocked: common::StreamMap::default(),
+            blocked_since: common::StreamMap::default(),
             ready: VecDeque::new(),
             buffered_bound: 0,
-            encoder_out: Vec::new(),
-            decoder_out: Vec::new(),
-            encoder_recv: BytesMut::new(),
-            decoder_recv: BytesMut::new(),
             control_recv: BytesMut::new(),
             next_stream_id,
-            security: Security::quic(quiche::PROTOCOL_VERSION),
+            security: std::sync::Arc::new(std::sync::Mutex::new(Security::quic(None))),
         }
     }
 
@@ -694,7 +259,7 @@ impl H3Session {
     /// keeps the two ends from colliding.
     pub fn open(&mut self) -> StreamID {
         let stream_id = StreamID(self.next_stream_id);
-        self.next_stream_id += 4;
+        self.next_stream_id += StreamId::STEP;
         self.streams.entry(stream_id).or_default();
         stream_id
     }
@@ -711,8 +276,9 @@ impl H3Session {
     /// Drops all state for a stream, and stops waiting on its QPACK
     /// acknowledgement.
     pub fn forget(&mut self, stream_id: StreamID) -> Option<StreamState> {
-        self.blocked.remove(&stream_id);
+        self.blocked_since.remove(&stream_id);
         self.encoder.cancel(stream_id.0);
+        self.decoder.cancel(stream_id.0);
         self.streams.remove(&stream_id)
     }
 
@@ -764,11 +330,11 @@ impl H3Session {
     ///
     /// Returns [`Error::Protocol`] when the body is a [`Body::File`], which
     /// must be read before it reaches here, and otherwise as
-    /// [`common::fields`].
+    /// [`common::Fields::of`].
     pub fn frame_message(&mut self, stream_id: StreamID, message: &Message, out: &mut BytesMut) -> Result<bool, Error> {
-        let fields = common::fields(message)?;
+        let fields = common::Fields::of(message)?;
         let (block, instructions) = self.encoder.encode(stream_id.0, &fields);
-        self.queue_encoder(&instructions);
+        self.encoder.queue(&instructions);
 
         Frame::Headers(block.into()).encode_into(out);
 
@@ -784,7 +350,7 @@ impl H3Session {
         if let Some(trailers) = message.trailers.as_ref().filter(|trailers| !trailers.is_empty()) {
             let fields: Vec<HeaderField> = trailers.iter().map(|(name, value)| HeaderField::new(name, value)).collect();
             let (block, instructions) = self.encoder.encode(stream_id.0, &fields);
-            self.queue_encoder(&instructions);
+            self.encoder.queue(&instructions);
             Frame::Headers(block.into()).encode_into(out);
         }
 
@@ -793,57 +359,37 @@ impl H3Session {
             state.method = message.method;
         }
 
-        let tunneling = tunneling(state.method, message);
+        let tunneling = message.tunneling(state.method);
         state.finished |= !tunneling;
 
         Ok(!tunneling)
     }
 
-    /// Queues QPACK encoder instructions for the encoder stream.
-    pub fn queue_encoder(&mut self, instructions: &[EncoderInstruction]) {
-        for instruction in instructions {
-            instruction.encode_into(&mut self.encoder_out);
-        }
-    }
-
     /// Takes in octets from the peer's QPACK encoder stream.
     ///
-    /// Each complete instruction is applied to the decoder's table, and any
-    /// stream that was blocked on those insertions is advanced.
+    /// The decoder buffers and applies the instructions itself; what is done
+    /// here is the connection's part — advancing any stream that was blocked
+    /// on the insertions that just arrived.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Limit`] when a single instruction grows past
     /// [`Limits::max_headers_size`], and otherwise as
-    /// [`qpack::Decoder::on_encoder_instruction`].
+    /// [`qpack::Decoder::on_encoder_stream`].
     pub fn on_encoder_bytes(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        self.encoder_recv.extend_from_slice(bytes);
-
-        let limit = self.limits.max_headers_size;
-        if self.encoder_recv.len() as u64 > limit {
-            return Err(Error::Limit(format!("an encoder instruction exceeds {limit} octets")));
-        }
-
-        loop {
-            match EncoderInstruction::decode(&self.encoder_recv) {
-                Ok((consumed, instruction)) => {
-                    let _ = self.encoder_recv.split_to(consumed);
-                    if let Some(acknowledgment) = self.decoder.on_encoder_instruction(instruction)? {
-                        acknowledgment.encode_into(&mut self.decoder_out);
-                    }
-                }
-                Err(qpack::Error::Incomplete) => break,
-                Err(err) => return Err(err.into()),
+        self.decoder.on_encoder_stream(bytes).map_err(|err| match err {
+            qpack::Error::InstructionTooLarge => {
+                Error::Limit(format!("an encoder instruction exceeds {} octets", self.limits.max_headers_size))
             }
-        }
+            err => err.into(),
+        })?;
 
-        if self.blocked.is_empty() {
+        if self.blocked_since.is_empty() {
             return Ok(());
         }
 
-        let waiting: Vec<StreamID> = self.blocked.keys().copied().collect();
-        for stream_id in waiting {
-            self.advance(stream_id)?;
+        for stream_id in self.decoder.unblocked() {
+            self.advance(StreamID(stream_id))?;
         }
 
         Ok(())
@@ -860,25 +406,12 @@ impl H3Session {
     /// [`Limits::max_headers_size`], and [`Error::Protocol`] when one will not
     /// decode.
     pub fn on_decoder_bytes(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        self.decoder_recv.extend_from_slice(bytes);
-
-        let limit = self.limits.max_headers_size;
-        if self.decoder_recv.len() as u64 > limit {
-            return Err(Error::Limit(format!("a decoder instruction exceeds {limit} octets")));
-        }
-
-        loop {
-            match DecoderInstruction::decode(&self.decoder_recv) {
-                Ok((consumed, instruction)) => {
-                    let _ = self.decoder_recv.split_to(consumed);
-                    self.encoder.on_decoder_instruction(instruction);
-                }
-                Err(qpack::Error::Incomplete) => break,
-                Err(err) => return Err(err.into()),
+        self.encoder.on_decoder_stream(bytes).map_err(|err| match err {
+            qpack::Error::InstructionTooLarge => {
+                Error::Limit(format!("a decoder instruction exceeds {} octets", self.limits.max_headers_size))
             }
-        }
-
-        Ok(())
+            err => err.into(),
+        })
     }
 
     /// Takes in octets from the peer's control stream.
@@ -900,7 +433,7 @@ impl H3Session {
             return Err(Error::Limit(format!("a control frame exceeds {limit} octets")));
         }
 
-        while let Some(frame) = parse_frame(&mut self.control_recv)? {
+        while let Some(frame) = Frame::parse(&mut self.control_recv)? {
             match frame {
                 Frame::Settings(parameters) => {
                     if self.settings_remote.is_some() {
@@ -923,13 +456,13 @@ impl H3Session {
     /// Adopts the peer's settings, and sizes the QPACK encoder table to match.
     ///
     /// Until this happens the encoder has no dynamic table at all, so every
-    /// field goes out as a literal or a static reference.
+    /// field goes out as a literal or a static reference. What the peer permits
+    /// is a ceiling and not an instruction: the table settles at the smaller of
+    /// it and [`Limits::max_encoder_table_size`], which is this end's own.
     pub fn apply_peer_settings(&mut self, settings: Settings) {
         let permitted = usize::try_from(settings.qpack_max_table_capacity).unwrap_or(usize::MAX);
-        self.encoder.set_max_capacity(permitted);
-
-        if let Some(instruction) = self.encoder.set_capacity(permitted.min(qpack::ADVERTISED_TABLE_CAPACITY)) {
-            self.queue_encoder(&[instruction]);
+        if let Some(instruction) = self.encoder.set_max_capacity(permitted) {
+            self.encoder.queue(&[instruction]);
         }
 
         self.settings_remote = Some(settings);
@@ -948,7 +481,7 @@ impl H3Session {
     pub fn on_stream_bytes(&mut self, stream_id: StreamID, bytes: &[u8], fin: bool) -> Result<(), Error> {
         if !self.streams.contains_key(&stream_id) && self.streams.len() >= self.stream_ceiling() {
             let reason = format!("more than {} streams are held open at once", self.stream_ceiling());
-            return Err(Error::stream(stream_id, H3_EXCESSIVE_LOAD, reason));
+            return Err(Error::stream(stream_id, Code::EXCESSIVE_LOAD, reason));
         }
 
         let state = self.streams.entry(stream_id).or_default();
@@ -963,7 +496,7 @@ impl H3Session {
         let limit = self.limits.max_message_size;
         if unparsed > limit {
             let reason = format!("unparsed stream data exceeds {limit} octets");
-            return Err(Error::stream(stream_id, H3_EXCESSIVE_LOAD, reason));
+            return Err(Error::stream(stream_id, Code::EXCESSIVE_LOAD, reason));
         }
 
         if self.overbuffered() {
@@ -1025,11 +558,11 @@ impl H3Session {
                 match self.decoder.decode(stream_id.0, &block) {
                     Ok((fields, acknowledgment)) => {
                         if let Some(acknowledgment) = acknowledgment {
-                            acknowledgment.encode_into(&mut self.decoder_out);
+                            self.decoder.queue(&[acknowledgment]);
                         }
                         let state = self.streams.get_mut(&stream_id).ok_or(Error::Closed)?;
                         state.pending = None;
-                        self.blocked.remove(&stream_id);
+                        self.blocked_since.remove(&stream_id);
                         self.absorb_headers(stream_id, fields)?;
                         continue;
                     }
@@ -1042,7 +575,7 @@ impl H3Session {
                 return Ok(());
             };
 
-            let Some(frame) = parse_frame(&mut state.buffer)? else {
+            let Some(frame) = Frame::parse(&mut state.buffer)? else {
                 if state.eof {
                     break;
                 }
@@ -1053,19 +586,19 @@ impl H3Session {
                 Frame::Headers(block) => {
                     if block.len() as u64 > self.limits.max_headers_size {
                         let reason = format!("field section exceeds {} octets", self.limits.max_headers_size);
-                        return Err(Error::stream(stream_id, H3_EXCESSIVE_LOAD, reason));
+                        return Err(Error::stream(stream_id, Code::EXCESSIVE_LOAD, reason));
                     }
                     match self.decoder.decode(stream_id.0, &block) {
                         Ok((fields, acknowledgment)) => {
                             if let Some(acknowledgment) = acknowledgment {
-                                acknowledgment.encode_into(&mut self.decoder_out);
+                                self.decoder.queue(&[acknowledgment]);
                             }
                             self.absorb_headers(stream_id, fields)?;
                         }
                         Err(qpack::Error::Blocked) => {
                             let state = self.streams.get_mut(&stream_id).ok_or(Error::Closed)?;
                             state.pending = Some(block);
-                            self.blocked.entry(stream_id).or_insert_with(std::time::Instant::now);
+                            self.blocked_since.entry(stream_id).or_insert_with(std::time::Instant::now);
                             return Ok(());
                         }
                         Err(err) => return Err(err.into()),
@@ -1081,7 +614,7 @@ impl H3Session {
 
                     let limit = self.limits.max_message_body_size;
                     if state.body.len() as u64 > limit {
-                        return Err(Error::stream(stream_id, H3_EXCESSIVE_LOAD, format!("body exceeds {limit} octets")));
+                        return Err(Error::stream(stream_id, Code::EXCESSIVE_LOAD, format!("body exceeds {limit} octets")));
                     }
                 }
 
@@ -1102,7 +635,7 @@ impl H3Session {
         }
 
         let Some(mut message) = state.message.take() else {
-            return Err(Error::stream(stream_id, H3_REQUEST_INCOMPLETE, "request stream carried no field section"));
+            return Err(Error::stream(stream_id, Code::REQUEST_INCOMPLETE, "request stream carried no field section"));
         };
 
         if !state.body.is_empty() {
@@ -1126,11 +659,11 @@ impl H3Session {
     ///
     /// Returns [`Error::Stream`] when the section carries more than
     /// [`Limits::max_header_count`] fields, when a trailer section carries a
-    /// pseudo-header, and when [`common::message_from`] rejects the message.
+    /// pseudo-header, and when [`common::Fields::into_message`] rejects the message.
     pub fn absorb_headers(&mut self, stream_id: StreamID, fields: Vec<HeaderField>) -> Result<(), Error> {
         if fields.len() > self.limits.max_header_count as usize {
             let reason = format!("more than {} header fields", self.limits.max_header_count);
-            return Err(Error::stream(stream_id, H3_EXCESSIVE_LOAD, reason));
+            return Err(Error::stream(stream_id, Code::EXCESSIVE_LOAD, reason));
         }
 
         let id = self.id.clone();
@@ -1140,7 +673,7 @@ impl H3Session {
             let mut trailers = Headers::with_capacity(fields.len());
             for field in fields {
                 if field.name.starts_with(':') {
-                    return Err(Error::stream(stream_id, H3_MESSAGE_ERROR, "trailer section carries a pseudo-header"));
+                    return Err(Error::stream(stream_id, Code::MESSAGE_ERROR, "trailer section carries a pseudo-header"));
                 }
                 trailers.append(field.name, field.value);
             }
@@ -1148,16 +681,16 @@ impl H3Session {
             return Ok(());
         }
 
-        let mut message = common::message_from(fields, Version::V3_0).map_err(|err| err.on_stream(stream_id, H3_MESSAGE_ERROR))?;
+        let mut message = common::Fields::into_message(fields, Version::V3_0).map_err(|err| err.on_stream(stream_id, Code::MESSAGE_ERROR))?;
         message.stream_id = Some(stream_id);
         message.connection_id = Some(id);
-        self.security.apply(&mut message);
+        sync::lock(&self.security).apply(&mut message);
 
         if message.is_request() {
             state.method = message.method;
         }
 
-        if tunneling(state.method, &message) {
+        if message.tunneling(state.method) {
             state.delivered = true;
             state.raw = true;
             self.ready.push_back(message);
@@ -1175,64 +708,16 @@ impl H3Session {
 
     /// Takes the QPACK encoder instructions queued for the encoder stream.
     pub fn take_encoder_out(&mut self) -> Bytes {
-        Bytes::from(std::mem::take(&mut self.encoder_out))
+        Bytes::from(self.encoder.take_encoder_stream())
     }
 
     /// Takes the QPACK decoder instructions queued for the decoder stream.
     pub fn take_decoder_out(&mut self) -> Bytes {
-        Bytes::from(std::mem::take(&mut self.decoder_out))
+        Bytes::from(self.decoder.take_decoder_stream())
     }
 }
 
-/// Whether a message opens or confirms a tunnel on its stream.
-///
-/// True for a `CONNECT` request, and for the 2xx that accepts one — so both
-/// ends stop framing and start relaying at the same point.
-pub fn tunneling(method: Option<Method>, message: &Message) -> bool {
-    method == Some(Method::CONNECT) && (message.is_request() || matches!(message.status_code, Some(200..=299)))
-}
 
-/// Takes one whole frame off the front of a buffer.
-///
-/// `None` when the frame has not fully arrived; the buffer is left untouched
-/// so the call can be repeated as more octets come in. Frames of unknown type
-/// are consumed and skipped over rather than returned.
-///
-/// # Errors
-///
-/// Returns [`Error::Protocol`] for a [`RESERVED_FRAME_TYPES`] frame, which
-/// means the peer is speaking HTTP/2, and otherwise as [`Frame::assemble`].
-pub fn parse_frame(buffer: &mut BytesMut) -> Result<Option<Frame>, Error> {
-    loop {
-        let (consumed, code, length) = {
-            let data = &buffer[..];
-            let (taken, code) = decode_varint(data);
-            let (took, length) = decode_varint(&data[taken.min(data.len())..]);
-
-            if taken == 0 || took == 0 || data.len() < taken + took + length as usize {
-                (0, 0, 0)
-            } else {
-                (taken + took, code, length)
-            }
-        };
-
-        if consumed == 0 {
-            return Ok(None);
-        }
-
-        if RESERVED_FRAME_TYPES.contains(&code) {
-            return Err(Error::Protocol(format!("frame type {code:#x} is reserved")));
-        }
-
-        let mut frame = buffer.split_to(consumed + length as usize).freeze();
-        let payload = frame.split_off(consumed);
-
-        match FrameType::from_code(code) {
-            Some(kind) => return Frame::decode_shared(kind, &payload).map(Some),
-            None => continue,
-        }
-    }
-}
 
 /// What an [`H3Connection`] asks its [`H3Worker`] to do.
 ///
@@ -1249,6 +734,8 @@ pub enum H3Command {
     Tunnel(StreamID, tokio::sync::mpsc::Sender<(Bytes, bool)>),
     /// Write raw octets to the QPACK encoder stream.
     WriteEncoder(Bytes),
+    /// Abandon a stream, resetting it towards the peer with an error code.
+    Reset(StreamID, u64),
     /// Close the QUIC connection.
     Close,
 }
@@ -1263,7 +750,7 @@ pub enum H3Event {
 
 /// An HTTP/3 connection, as the caller holds it.
 ///
-/// The protocol itself runs in an [`H3Worker`] inside `tokio-quiche`'s
+/// The protocol itself runs in an [`H3Worker`] inside the QUIC driver's
 /// callbacks, because that is where the QUIC connection is reachable. This is
 /// the handle on the other side of the channels, and it implements
 /// [`Connection`] like the other two versions, so the split does not show from
@@ -1280,24 +767,37 @@ pub struct H3Connection {
     /// Which end of the connection this is.
     pub role: Role,
     /// The limits this connection holds itself to.
-    pub limits: Limits,
+    pub limits: H3Limits,
     /// Keeps the QUIC connection alive for as long as this handle exists.
-    pub guard: Option<std::sync::Arc<tokio_quiche::QuicConnection>>,
-    /// The HSTS policy to attach to responses, if any.
-    pub hsts: Option<crate::helpers::hsts::HstsPolicy>,
+    pub guard: Option<std::sync::Arc<QuicGuard>>,
+    /// The settings this end advertised, as the paired [`H3Session`] holds them.
+    ///
+    /// A copy rather than a borrow: the session itself lives in the worker,
+    /// where the QUIC connection is reachable, so the handle keeps the part of
+    /// it that is settled before the worker starts. What the peer advertised
+    /// is not settled then, and stays on [`H3Session::settings_remote`].
+    pub settings_local: Settings,
+    /// The finalisation applied to requests on the way out.
+    pub request_finalizer: crate::finalizer::RequestFinalizer,
+    /// The finalisation applied to responses on the way out.
+    pub response_finalizer: crate::finalizer::ResponseFinalizer,
     /// What the transport underneath turned out to be, as the session sees it.
-    pub security: Security,
+    ///
+    /// The same cell the paired [`H3Session`] holds, so what the handshake
+    /// settled shows here as soon as the worker has read it.
+    pub security: std::sync::Arc<std::sync::Mutex<Security>>,
 }
 
 impl H3Connection {
     /// Builds a connection handle and the worker that backs it.
     ///
-    /// The worker has to be handed to `tokio-quiche` to be driven; until it
+    /// The worker has to be handed to the QUIC driver to be driven; until it
     /// is, nothing the handle asks for happens.
-    pub fn pair(session: H3Session, hsts: Option<crate::helpers::hsts::HstsPolicy>) -> (Self, H3Worker) {
-        let (commands, commands_receiver) = tokio::sync::mpsc::channel(256);
-        let (events_sender, events) = tokio::sync::mpsc::channel(256);
-        let (raw, raw_receiver) = tokio::sync::mpsc::channel(TUNNEL_BACKLOG);
+    pub fn pair(session: H3Session) -> (Self, H3Worker) {
+        let backlog = (session.limits.command_backlog as usize).max(1);
+        let (commands, commands_receiver) = tokio::sync::mpsc::channel(backlog);
+        let (events_sender, events) = tokio::sync::mpsc::channel(backlog);
+        let (raw, raw_receiver) = tokio::sync::mpsc::channel(session.limits.tunnel_backlog as usize);
 
         let connection = Self {
             commands,
@@ -1307,16 +807,58 @@ impl H3Connection {
             role: session.role,
             limits: session.limits,
             guard: None,
-            hsts,
-            security: session.security,
+            settings_local: session.settings_local,
+            request_finalizer: crate::finalizer::RequestFinalizer::default(),
+            response_finalizer: crate::finalizer::ResponseFinalizer::new(None),
+            security: std::sync::Arc::clone(&session.security),
         };
 
         (connection, H3Worker::new(session, commands_receiver, events_sender, raw_receiver))
     }
 
-    /// The limits this connection holds itself to.
-    pub fn limits(&self) -> &Limits {
-        &self.limits
+    /// The ceilings this connection holds itself to.
+    pub fn limits(&self) -> H3Limits {
+        self.limits
+    }
+
+    /// The settings this end advertised.
+    pub fn settings_local(&self) -> &Settings {
+        &self.settings_local
+    }
+
+    /// Attaches the finalisation applied to requests on the way out.
+    ///
+    /// What finalising a request means is the finalizer's business, not this
+    /// connection's: a connection frames messages and knows nothing of what an
+    /// endpoint owes them.
+    pub fn with_request_finalizer(mut self, finalizer: crate::finalizer::RequestFinalizer) -> Self {
+        self.request_finalizer = finalizer;
+        self
+    }
+
+    /// Attaches the finalisation applied to responses on the way out.
+    ///
+    /// The counterpart of [`H3Connection::with_request_finalizer`], and for the
+    /// same reason.
+    pub fn with_response_finalizer(mut self, finalizer: crate::finalizer::ResponseFinalizer) -> Self {
+        self.response_finalizer = finalizer;
+        self
+    }
+
+    /// Attaches what the handshake settled.
+    ///
+    /// QUIC carries its own TLS and reports what it settled through the worker,
+    /// so this is only for a caller building a session by hand; a connection
+    /// paired with a worker fills it in for itself.
+    pub fn with_security(self, security: Security) -> Self {
+        *sync::lock(&self.security) = security;
+        self
+    }
+
+    /// Attaches the handle that keeps the QUIC connection alive.
+    pub fn with_guard(mut self, guard: std::sync::Arc<QuicGuard>) -> Self {
+        self.guard = Some(guard);
+        self
     }
 
     /// Sends one whole message on a stream.
@@ -1331,10 +873,8 @@ impl H3Connection {
     /// surface later, through [`H3Connection::receive_message`].
     pub async fn send_message(&mut self, message: Message) -> Result<(), Error> {
         let mut message = message;
-        if self.role.is_server() && message.is_response() {
-            message.secure = self.security.secure;
-            crate::finalizer::finalize_response(&mut message, crate::finalizer::date_cache(), self.hsts.as_ref());
-        }
+        self.request_finalizer.finalize(self.role, &mut message);
+        self.response_finalizer.finalize(self.role, sync::lock(&self.security).secure, &mut message);
 
         if let Some(body) = message.body.take() {
             message.body = Some(Body::Data(body.into_bytes().await?));
@@ -1417,9 +957,9 @@ impl H3Connection {
     /// Returns [`Error::Closed`] when the worker is gone or its command queue
     /// is full.
     pub fn tunnel(&mut self, stream_id: StreamID) -> Result<H3Stream, Error> {
-        let (sink, reads) = tokio::sync::mpsc::channel(TUNNEL_BACKLOG);
+        let (sink, reads) = tokio::sync::mpsc::channel(self.limits.tunnel_backlog as usize);
         self.commands.try_send(H3Command::Tunnel(stream_id, sink)).map_err(|_| Error::Closed)?;
-        Ok(H3Stream::new(stream_id, self.raw.clone(), reads, self.guard.clone()))
+        Ok(H3Stream::new(stream_id, self.raw.clone(), reads, self.guard.clone()).with_commands(self.commands.clone()))
     }
 
     /// Writes QPACK encoder instructions straight onto the encoder stream.
@@ -1465,13 +1005,21 @@ pub struct H3Stream {
     /// Whether the peer has finished sending.
     pub eof: bool,
     /// Keeps the QUIC connection alive for as long as this stream exists.
-    pub guard: Option<std::sync::Arc<tokio_quiche::QuicConnection>>,
+    pub guard: Option<std::sync::Arc<QuicGuard>>,
+    /// Where a reset is sent, when the worker is still reachable.
+    pub commands: Option<tokio::sync::mpsc::Sender<H3Command>>,
 }
 
 impl H3Stream {
     /// A stream over the given write and read channels.
-    pub fn new(id: StreamID, writes: tokio::sync::mpsc::Sender<RawWrite>, reads: tokio::sync::mpsc::Receiver<(Bytes, bool)>, guard: Option<std::sync::Arc<tokio_quiche::QuicConnection>>) -> Self {
-        Self { id, writes, reads, reserving: None, buffer: BytesMut::new(), eof: false, guard }
+    pub fn new(id: StreamID, writes: tokio::sync::mpsc::Sender<RawWrite>, reads: tokio::sync::mpsc::Receiver<(Bytes, bool)>, guard: Option<std::sync::Arc<QuicGuard>>) -> Self {
+        Self { id, writes, reads, reserving: None, buffer: BytesMut::new(), eof: false, guard, commands: None }
+    }
+
+    /// Attaches the channel a reset travels down.
+    pub fn with_commands(mut self, commands: tokio::sync::mpsc::Sender<H3Command>) -> Self {
+        self.commands = Some(commands);
+        self
     }
 
     /// Reserves a slot in the write queue.
@@ -1505,14 +1053,23 @@ impl H3Stream {
         }
     }
 
-    /// The stream's identifier.
-    pub fn id(&self) -> StreamID {
+    /// The handle keeping the QUIC connection alive, if there is one.
+    pub fn guard(&self) -> Option<&std::sync::Arc<QuicGuard>> {
+        self.guard.as_ref()
+    }
+}
+
+impl Stream for H3Stream {
+    fn id(&self) -> StreamID {
         self.id
     }
 
-    /// The handle keeping the QUIC connection alive, if there is one.
-    pub fn guard(&self) -> Option<&std::sync::Arc<tokio_quiche::QuicConnection>> {
-        self.guard.as_ref()
+    async fn reset(&mut self, code: u64) {
+        self.eof = true;
+
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(H3Command::Reset(self.id, code)).await;
+        }
     }
 }
 
@@ -1585,19 +1142,19 @@ impl Connection for H3Connection {
     }
 
     fn security(&self) -> Security {
-        self.security
+        *sync::lock(&self.security)
     }
 
     async fn send(&mut self, message: Message) -> Result<(), Error> {
         let timeout = self.limits.send_timeout;
         let sending = std::pin::pin!(self.send_message(message));
-        common::within(timeout, sending).await?
+        sync::Timeout::within(timeout, sending).await?
     }
 
     async fn receive(&mut self) -> Result<Message, Error> {
         let timeout = self.limits.receive_timeout;
         let receiving = std::pin::pin!(self.receive_message());
-        common::within(timeout, receiving).await?
+        sync::Timeout::within(timeout, receiving).await?
     }
 
     async fn close(&mut self) {
@@ -1605,10 +1162,6 @@ impl Connection for H3Connection {
     }
 }
 
-/// Boxes an [`Error`] as the error type `tokio-quiche` expects.
-pub fn boxed(error: Error) -> BoxError {
-    Box::new(error)
-}
 
 /// A unidirectional stream the peer opened, before and after its kind is known.
 ///
@@ -1620,6 +1173,9 @@ pub struct PeerUni {
     pub kind: Option<StreamKind>,
     /// Octets gathered while the kind is still unknown.
     pub prefix: Vec<u8>,
+    /// Whether the stream announced a kind this end does not speak, and so
+    /// is read no further.
+    pub abandoned: bool,
 }
 
 /// Which QPACK side channel a drain concerns.
@@ -1631,9 +1187,9 @@ pub enum Side {
     Decoder,
 }
 
-/// The half of an HTTP/3 connection that runs inside `tokio-quiche`.
+/// The half of an HTTP/3 connection that runs inside the QUIC driver.
 ///
-/// Implements [`ApplicationOverQuic`], so `tokio-quiche` calls into it as the
+/// Implements [`QuicApplication`], so the QUIC driver calls into it as the
 /// QUIC connection makes progress. It owns the [`H3Session`] and does the
 /// actual reading and writing; the caller's [`H3Connection`] talks to it over
 /// channels.
@@ -1682,7 +1238,7 @@ pub struct H3Worker {
     /// How many streams the peer reset before a response was sent.
     pub premature_resets: u32,
 
-    /// The buffer `tokio-quiche` reads datagrams into.
+    /// The buffer the QUIC driver reads datagrams into.
     pub scratch: Vec<u8>,
     /// The buffer stream octets are read into.
     pub read: Vec<u8>,
@@ -1694,9 +1250,14 @@ pub struct H3Worker {
 }
 
 impl H3Worker {
+    /// Boxes an [`Error`] as the error type the QUIC driver expects.
+    pub fn boxed(error: Error) -> QuicError {
+        Box::new(error)
+    }
+
     /// A worker over `session`, wired to a connection handle's channels.
     pub fn new(session: H3Session, commands: tokio::sync::mpsc::Receiver<H3Command>, events: tokio::sync::mpsc::Sender<H3Event>, raw_writes: tokio::sync::mpsc::Receiver<(StreamID, Bytes, bool)>) -> Self {
-        let next_uni = if session.role.is_server() { 3 } else { 2 };
+        let next_uni = StreamId::first_uni(session.role);
 
         Self {
             session,
@@ -1746,11 +1307,11 @@ impl H3Worker {
         self.outbound_bytes < self.outbound_limit()
     }
 
-    /// Reports a failure to the connection handle and converts it for `tokio-quiche`.
+    /// Reports a failure to the connection handle and converts it for the QUIC driver.
     ///
     /// The error is described before it is sent, so the description survives
     /// even if the handle is gone and the event is dropped.
-    pub fn fail(&mut self, error: Error) -> BoxError {
+    pub fn fail(&mut self, error: Error) -> QuicError {
         let description = error.to_string();
         let _ = self.events.try_send(H3Event::Failed(error));
         Box::new(std::io::Error::other(description))
@@ -1761,12 +1322,12 @@ impl H3Worker {
     /// `None` when nothing is blocked, or when
     /// [`Limits::qpack_block_timeout`] disables the timeout.
     pub fn block_deadline(&self) -> Option<std::time::Instant> {
-        if self.session.blocked.is_empty() {
+        if self.session.blocked_since.is_empty() {
             return None;
         }
 
-        let wait = common::duration(self.session.limits.qpack_block_timeout)?;
-        let earliest = self.session.blocked.values().min()?;
+        let wait = sync::Timeout::duration(self.session.limits.qpack_block_timeout)?;
+        let earliest = self.session.blocked_since.values().min()?;
         Some(*earliest + wait)
     }
 
@@ -1789,7 +1350,7 @@ impl H3Worker {
     /// Clients get 2, 6, 10, ... and servers 3, 7, 11, ....
     pub fn alloc_uni(&mut self) -> u64 {
         let id = self.next_uni;
-        self.next_uni += 4;
+        self.next_uni += StreamId::STEP;
         id
     }
 
@@ -1799,14 +1360,14 @@ impl H3Worker {
     ///
     /// Returns [`Error::Protocol`] for [`StreamKind::Request`], which is
     /// bidirectional, and otherwise as [`H3Worker::write`].
-    pub fn open_uni(&mut self, qconn: &mut QuicheConnection, stream_id: u64, kind: StreamKind) -> Result<(), Error> {
+    pub fn open_uni(&mut self, transport: &mut impl QuicTransport, stream_id: u64, kind: StreamKind) -> Result<(), Error> {
         let code = kind
             .code()
             .ok_or_else(|| Error::Protocol(format!("{kind:?} is not a unidirectional stream type")))?;
 
         let mut prefix = BytesMut::new();
-        encode_varint(&mut prefix, code);
-        self.write(qconn, stream_id, &prefix, false)
+        Varint::encode(&mut prefix, code);
+        self.write(transport, stream_id, &prefix, false)
     }
 
     /// Buffers octets for a stream and tries to send at once.
@@ -1814,12 +1375,12 @@ impl H3Worker {
     /// # Errors
     ///
     /// As [`H3Worker::flush_stream`].
-    pub fn write(&mut self, qconn: &mut QuicheConnection, stream_id: u64, data: &[u8], fin: bool) -> Result<(), Error> {
+    pub fn write(&mut self, transport: &mut impl QuicTransport, stream_id: u64, data: &[u8], fin: bool) -> Result<(), Error> {
         let entry = self.outbound.entry(stream_id).or_default();
         entry.0.extend_from_slice(data);
         entry.1 |= fin;
         self.outbound_bytes = self.outbound_bytes.saturating_add(data.len() as u64);
-        self.flush_stream(qconn, stream_id)
+        self.flush_stream(transport, stream_id)
     }
 
     /// Sends as much of a stream's buffered output as QUIC will take.
@@ -1832,7 +1393,7 @@ impl H3Worker {
     ///
     /// Returns [`Error::Io`] when QUIC fails for any reason other than the
     /// stream being blocked or stopped.
-    pub fn flush_stream(&mut self, qconn: &mut QuicheConnection, stream_id: u64) -> Result<(), Error> {
+    pub fn flush_stream(&mut self, transport: &mut impl QuicTransport, stream_id: u64) -> Result<(), Error> {
         let Some((buffer, fin)) = self.outbound.get_mut(&stream_id) else {
             return Ok(());
         };
@@ -1841,8 +1402,8 @@ impl H3Worker {
             return Ok(());
         }
 
-        match qconn.stream_send(stream_id, buffer, *fin) {
-            Ok(sent) => {
+        match transport.send(stream_id, buffer, *fin)? {
+            StreamWrite::Sent(sent) => {
                 let _ = buffer.split_to(sent);
                 self.outbound_bytes = self.outbound_bytes.saturating_sub(sent as u64);
 
@@ -1851,8 +1412,8 @@ impl H3Worker {
                 }
                 Ok(())
             }
-            Err(quiche::Error::Done) => Ok(()),
-            Err(quiche::Error::StreamStopped(code)) => {
+            StreamWrite::Blocked => Ok(()),
+            StreamWrite::Stopped(code) => {
                 if let Some((buffer, _)) = self.outbound.remove(&stream_id) {
                     self.outbound_bytes = self.outbound_bytes.saturating_sub(buffer.len() as u64);
                 }
@@ -1861,7 +1422,6 @@ impl H3Worker {
                 let _ = self.events.try_send(H3Event::Failed(error));
                 Ok(())
             }
-            Err(err) => Err(quic_error(err)),
         }
     }
 
@@ -1870,7 +1430,7 @@ impl H3Worker {
     /// # Errors
     ///
     /// As [`H3Session::encode_message_into`] and [`H3Worker::write`].
-    pub fn execute(&mut self, qconn: &mut QuicheConnection, command: H3Command) -> Result<(), Error> {
+    pub fn execute(&mut self, transport: &mut impl QuicTransport, command: H3Command) -> Result<(), Error> {
         match command {
             H3Command::Send(message) => {
                 let stream_id = message.stream_id.unwrap_or_else(|| self.session.open());
@@ -1884,7 +1444,7 @@ impl H3Worker {
                 let framed = entry.0.len().saturating_sub(before) as u64;
                 self.outbound_bytes = self.outbound_bytes.saturating_add(framed);
 
-                self.flush_stream(qconn, stream_id.0)?;
+                self.flush_stream(transport, stream_id.0)?;
                 self.session.retire(stream_id);
                 Ok(())
             }
@@ -1894,7 +1454,7 @@ impl H3Worker {
             }
             H3Command::OpenUni(kind, reply) => {
                 let stream_id = self.alloc_uni();
-                self.open_uni(qconn, stream_id, kind)?;
+                self.open_uni(transport, stream_id, kind)?;
                 let _ = reply.send(StreamID(stream_id));
                 Ok(())
             }
@@ -1908,9 +1468,18 @@ impl H3Worker {
                 self.tunnels.insert(stream_id.0, sink);
                 Ok(())
             }
-            H3Command::WriteEncoder(bytes) => self.write(qconn, self.local_encoder, &bytes, false),
+            H3Command::WriteEncoder(bytes) => self.write(transport, self.local_encoder, &bytes, false),
+            H3Command::Reset(stream_id, code) => {
+                self.outbound.remove(&stream_id.0);
+                self.tunnels.remove(&stream_id.0);
+                self.session.retire(stream_id);
+
+                let _ = transport.shutdown_write(stream_id.0, code);
+                let _ = transport.shutdown_read(stream_id.0, code);
+                Ok(())
+            }
             H3Command::Close => {
-                let _ = qconn.close(true, H3_NO_ERROR, b"");
+                let _ = transport.close(Code::NO_ERROR, b"");
                 Ok(())
             }
         }
@@ -1925,10 +1494,10 @@ impl H3Worker {
     ///
     /// Returns [`Error::Stream`] when a tunnel cannot take the octets, and
     /// otherwise as [`H3Session::on_stream_bytes`] and [`H3Worker::feed_uni`].
-    pub fn dispatch(&mut self, stream_id: u64, data: &[u8], fin: bool) -> Result<(), Error> {
+    pub fn dispatch(&mut self, transport: &mut impl QuicTransport, stream_id: u64, data: &[u8], fin: bool) -> Result<(), Error> {
         if let Some(sink) = self.tunnels.get(&stream_id) {
             if sink.try_send((Bytes::copy_from_slice(data), fin)).is_err() {
-                return Err(Error::stream(StreamID(stream_id), H3_EXCESSIVE_LOAD, "the tunnel could not take the octets"));
+                return Err(Error::stream(StreamID(stream_id), Code::EXCESSIVE_LOAD, "the tunnel could not take the octets"));
             }
 
             if fin {
@@ -1939,11 +1508,11 @@ impl H3Worker {
             return Ok(());
         }
 
-        if stream_id & 0x2 == 0 {
+        if StreamId::is_bidi(stream_id) {
             return self.session.on_stream_bytes(StreamID(stream_id), data, fin);
         }
 
-        self.feed_uni(stream_id, data, fin)
+        self.feed_uni(transport, stream_id, data, fin)
     }
 
     /// Feeds octets to a peer's unidirectional stream, forgetting it at end of
@@ -1952,8 +1521,8 @@ impl H3Worker {
     /// # Errors
     ///
     /// As [`H3Worker::feed_uni_bytes`].
-    pub fn feed_uni(&mut self, stream_id: u64, data: &[u8], fin: bool) -> Result<(), Error> {
-        let outcome = self.feed_uni_bytes(stream_id, data);
+    pub fn feed_uni(&mut self, transport: &mut impl QuicTransport, stream_id: u64, data: &[u8], fin: bool) -> Result<(), Error> {
+        let outcome = self.feed_uni_bytes(transport, stream_id, data);
 
         if fin {
             self.peer_uni.remove(&stream_id);
@@ -1965,14 +1534,19 @@ impl H3Worker {
     /// Reads a unidirectional stream's kind prefix, then feeds it onward.
     ///
     /// The prefix may span several reads, so it is gathered until it decodes.
-    /// An unknown kind is treated as a push stream, which is then ignored.
+    /// A stream announcing a kind this end does not speak is abandoned, as
+    /// RFC 9114 §6.2 allows: reading stops and the peer is told to as well.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Limit`] past [`Limits::max_peer_uni_streams`],
-    /// [`Error::Protocol`] when the prefix grows past [`MAX_VARINT_SIZE`]
+    /// [`Error::Protocol`] when the prefix grows past [`Varint::MAX_SIZE`]
     /// without decoding, and otherwise as [`H3Worker::feed_uni_kind`].
-    pub fn feed_uni_bytes(&mut self, stream_id: u64, data: &[u8]) -> Result<(), Error> {
+    pub fn feed_uni_bytes(&mut self, transport: &mut impl QuicTransport, stream_id: u64, data: &[u8]) -> Result<(), Error> {
+        if self.peer_uni.get(&stream_id).is_some_and(|uni| uni.abandoned) {
+            return Ok(());
+        }
+
         if let Some(kind) = self.peer_uni.get(&stream_id).and_then(|uni| uni.kind) {
             return self.feed_uni_kind(kind, data);
         }
@@ -1987,15 +1561,21 @@ impl H3Worker {
         let uni = self.peer_uni.entry(stream_id).or_default();
         uni.prefix.extend_from_slice(data);
 
-        let (consumed, code) = decode_varint(&uni.prefix);
+        let (consumed, code) = Varint::decode(&uni.prefix);
         if consumed == 0 {
-            if uni.prefix.len() > MAX_VARINT_SIZE {
+            if uni.prefix.len() > Varint::MAX_SIZE {
                 return Err(Error::Protocol("a unidirectional stream carries no readable type".into()));
             }
             return Ok(());
         }
 
-        let kind = StreamKind::from_code(code).unwrap_or(StreamKind::Push);
+        let Some(kind) = StreamKind::from_code(code) else {
+            uni.prefix = Vec::new();
+            uni.abandoned = true;
+            let _ = transport.shutdown_read(stream_id, Code::STREAM_CREATION_ERROR);
+            return Ok(());
+        };
+
         uni.kind = Some(kind);
 
         let payload = uni.prefix.split_off(consumed);
@@ -2023,26 +1603,26 @@ impl H3Worker {
         }
     }
 
-    /// Closes the connection with `H3_EXCESSIVE_LOAD` and builds the matching error.
-    pub fn overloaded(&mut self, qconn: &mut QuicheConnection, reason: impl Into<String>) -> Error {
-        let _ = qconn.close(true, H3_EXCESSIVE_LOAD, b"");
+    /// Closes the connection with `Code::EXCESSIVE_LOAD` and builds the matching error.
+    pub fn overloaded(&mut self, transport: &mut impl QuicTransport, reason: impl Into<String>) -> Error {
+        let _ = transport.close(Code::EXCESSIVE_LOAD, b"");
         Error::Limit(reason.into())
     }
 
     /// Abandons one stream in both directions, leaving the connection running.
     ///
     /// The code comes from the error where it carries one, and falls back to
-    /// `H3_MESSAGE_ERROR`.
-    pub fn reset_stream(&mut self, qconn: &mut QuicheConnection, stream_id: u64, error: &Error) {
+    /// `Code::MESSAGE_ERROR`.
+    pub fn reset_stream(&mut self, transport: &mut impl QuicTransport, stream_id: u64, error: &Error) {
         self.forget_stream(stream_id);
 
         let code = match error {
             Error::Stream { code, .. } => *code,
-            _ => H3_MESSAGE_ERROR,
+            _ => Code::MESSAGE_ERROR,
         };
 
-        let _ = qconn.stream_shutdown(stream_id, quiche::Shutdown::Write, code);
-        let _ = qconn.stream_shutdown(stream_id, quiche::Shutdown::Read, code);
+        let _ = transport.shutdown_write(stream_id, code);
+        let _ = transport.shutdown_read(stream_id, code);
     }
 
     /// Sends whatever QPACK has queued on both side channels.
@@ -2050,52 +1630,55 @@ impl H3Worker {
     /// # Errors
     ///
     /// As [`H3Worker::drain_side_channel`].
-    pub fn drain_side_channels(&mut self, qconn: &mut QuicheConnection) -> Result<(), Error> {
-        self.drain_side_channel(qconn, Side::Encoder)?;
-        self.drain_side_channel(qconn, Side::Decoder)
+    pub fn drain_side_channels(&mut self, transport: &mut impl QuicTransport) -> Result<(), Error> {
+        self.drain_side_channel(transport, Side::Encoder)?;
+        self.drain_side_channel(transport, Side::Decoder)
     }
 
     /// Sends whatever QPACK has queued on one side channel.
     ///
     /// The buffer is kept and reused, and given back with
-    /// [`common::reclaim_octets`] once it has grown past what an idle
+    /// [`common::Buffer::reclaim_octets`] once it has grown past what an idle
     /// connection should hold.
     ///
     /// # Errors
     ///
     /// As [`H3Worker::write`].
-    pub fn drain_side_channel(&mut self, qconn: &mut QuicheConnection, side: Side) -> Result<(), Error> {
-        let (source, stream_id) = match side {
-            Side::Encoder => (&mut self.session.encoder_out, self.local_encoder),
-            Side::Decoder => (&mut self.session.decoder_out, self.local_decoder),
+    pub fn drain_side_channel(&mut self, transport: &mut impl QuicTransport, side: Side) -> Result<(), Error> {
+        let (pending, stream_id) = match side {
+            Side::Encoder => (!self.session.encoder.encoder_stream().is_empty(), self.local_encoder),
+            Side::Decoder => (!self.session.decoder.decoder_stream().is_empty(), self.local_decoder),
         };
 
-        if source.is_empty() {
+        if !pending {
             return Ok(());
         }
 
-        let mut queued = std::mem::take(source);
-        let outcome = self.write(qconn, stream_id, &queued, false);
+        let queued = match side {
+            Side::Encoder => self.session.encoder.take_encoder_stream(),
+            Side::Decoder => self.session.decoder.take_decoder_stream(),
+        };
 
-        queued.clear();
-        common::reclaim_octets(&mut queued);
+        let outcome = self.write(transport, stream_id, &queued, false);
 
         match side {
-            Side::Encoder => self.session.encoder_out = queued,
-            Side::Decoder => self.session.decoder_out = queued,
+            Side::Encoder => self.session.encoder.reclaim_encoder_stream(queued),
+            Side::Decoder => self.session.decoder.reclaim_decoder_stream(queued),
         }
 
         outcome
     }
 }
 
-impl ApplicationOverQuic for H3Worker {
+impl QuicApplication for H3Worker {
     /// Opens the three streams HTTP/3 needs and sends the opening SETTINGS.
     ///
     /// Called once the QUIC handshake completes, which is the first moment a
-    /// stream can be opened.
-    fn on_conn_established(&mut self, qconn: &mut QuicheConnection, _handshake: &HandshakeInfo) -> QuicResult<()> {
+    /// stream can be opened — and the first moment the transport facts exist
+    /// to be read, which is when [`H3Session::security`] is stamped.
+    fn on_conn_established(&mut self, qconn: &mut QuicConnection, _handshake: &QuicHandshake) -> QuicOutcome<()> {
         self.established = true;
+        *sync::lock(&self.session.security) = Handshake::of(qconn).security();
 
         self.local_control = self.alloc_uni();
         self.local_encoder = self.alloc_uni();
@@ -2118,7 +1701,7 @@ impl ApplicationOverQuic for H3Worker {
         true
     }
 
-    /// The buffer `tokio-quiche` reads datagrams into.
+    /// The buffer the QUIC driver reads datagrams into.
     fn buffer(&mut self) -> &mut [u8] {
         &mut self.scratch
     }
@@ -2129,7 +1712,7 @@ impl ApplicationOverQuic for H3Worker {
     /// writes are only taken while [`H3Worker::accepting_writes`], which is
     /// how back pressure reaches a tunnel. Once the connection handle is gone
     /// the command arm is dropped, so a closed channel does not spin.
-    async fn wait_for_data(&mut self, _qconn: &mut QuicheConnection) -> QuicResult<()> {
+    async fn wait_for_data(&mut self, _qconn: &mut QuicConnection) -> QuicOutcome<()> {
         let deadline = self.block_deadline();
 
         tokio::select! {
@@ -2149,7 +1732,7 @@ impl ApplicationOverQuic for H3Worker {
                     self.pending_raw = Some(raw);
                     Ok(())
                 }
-                None => Err(boxed(Error::Closed)),
+                None => Err(Self::boxed(Error::Closed)),
             },
 
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline.unwrap_or_else(std::time::Instant::now))), if deadline.is_some() => Ok(()),
@@ -2162,12 +1745,12 @@ impl ApplicationOverQuic for H3Worker {
     }
 
     /// Reads every readable stream and delivers whatever messages complete.
-    fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+    fn process_reads(&mut self, qconn: &mut QuicConnection) -> QuicOutcome<()> {
         let mut read = std::mem::take(&mut self.read);
         let mut readable = std::mem::take(&mut self.readable);
 
         readable.clear();
-        readable.extend(qconn.readable());
+        readable.extend(QuicTransport::readable(qconn));
 
         let outcome = self.drain_reads(qconn, &readable, &mut read);
 
@@ -2183,11 +1766,11 @@ impl ApplicationOverQuic for H3Worker {
     /// Runs pending commands and flushes everything waiting to be sent.
     ///
     /// Checks the QPACK block deadline first: a stream that has waited too
-    /// long takes the connection down with `QPACK_DECOMPRESSION_FAILED`, since
+    /// long takes the connection down with `Code::QPACK_DECOMPRESSION_FAILED`, since
     /// the peer has left the decoder unable to make progress.
-    fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+    fn process_writes(&mut self, qconn: &mut QuicConnection) -> QuicOutcome<()> {
         if let Some(error) = self.expired_block() {
-            let _ = qconn.close(true, QPACK_DECOMPRESSION_FAILED, b"");
+            let _ = QuicTransport::close(qconn, Code::QPACK_DECOMPRESSION_FAILED, b"");
             return Err(self.fail(error));
         }
 
@@ -2271,30 +1854,35 @@ impl H3Worker {
     ///
     /// Any connection-fatal failure, already reported to the connection
     /// handle by [`H3Worker::fail`].
-    pub fn drain_reads(&mut self, qconn: &mut QuicheConnection, readable: &[u64], read: &mut [u8]) -> Result<(), BoxError> {
+    pub fn drain_reads(&mut self, transport: &mut impl QuicTransport, readable: &[u64], read: &mut [u8]) -> Result<(), QuicError> {
         for stream_id in readable.iter().copied() {
             loop {
                 if self.tunnels.get(&stream_id).is_some_and(|sink| sink.capacity() == 0) {
                     break;
                 }
 
-                match qconn.stream_recv(stream_id, read) {
-                    Ok((count, fin)) => {
-                        match self.dispatch(stream_id, &read[..count], fin) {
+                let outcome = match transport.receive(stream_id, read) {
+                    Ok(outcome) => outcome,
+                    Err(error) => return Err(self.fail(error)),
+                };
+
+                match outcome {
+                    StreamRead::Data { len, fin } => {
+                        match self.dispatch(transport, stream_id, &read[..len], fin) {
                             Ok(()) => {}
                             Err(error) if matches!(error, Error::Stream { .. }) => {
-                                self.reset_stream(qconn, stream_id, &error);
+                                self.reset_stream(transport, stream_id, &error);
                                 let _ = self.events.try_send(H3Event::Failed(error));
                                 break;
                             }
                             Err(error) => return Err(self.fail(error)),
                         }
-                        if fin || count == 0 {
+                        if fin || len == 0 {
                             break;
                         }
                     }
-                    Err(quiche::Error::Done) => break,
-                    Err(quiche::Error::StreamReset(code)) => {
+                    StreamRead::Done => break,
+                    StreamRead::Reset(code) => {
                         let premature = self.session.forget(StreamID(stream_id)).is_some_and(|state| !state.responded);
                         self.forget_stream(stream_id);
 
@@ -2306,7 +1894,7 @@ impl H3Worker {
                                     "more than {} streams were reset before a response was sent",
                                     self.session.limits.max_premature_resets
                                 );
-                                let error = self.overloaded(qconn, reason);
+                                let error = self.overloaded(transport, reason);
                                 return Err(self.fail(error));
                             }
                         }
@@ -2314,10 +1902,6 @@ impl H3Worker {
                         let error = Error::stream(StreamID(stream_id), code, "the peer reset the stream");
                         let _ = self.events.try_send(H3Event::Failed(error));
                         break;
-                    }
-                    Err(err) => {
-                        let error = quic_error(err);
-                        return Err(self.fail(error));
                     }
                 }
             }

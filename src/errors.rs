@@ -2,20 +2,13 @@
 
 use std::fmt;
 
-use crate::helpers::hpack;
-use crate::helpers::qpack;
 use crate::models::StreamID;
 
 /// What went wrong.
 ///
 /// The variants are graded by how much they cost: [`Error::Stream`] takes down
 /// one stream and leaves the connection running, while the rest end the
-/// connection. The codec errors in [`helpers::hpack`] and [`helpers::qpack`]
-/// convert into [`Error::Protocol`], since a field block that will not decode
-/// leaves the peer's compression state unrecoverable.
-///
-/// [`helpers::hpack`]: crate::helpers::hpack
-/// [`helpers::qpack`]: crate::helpers::qpack
+/// connection.
 #[derive(Debug)]
 pub enum Error {
     /// The peer closed the connection, or it was closed under us.
@@ -24,7 +17,7 @@ pub enum Error {
     Protocol(String),
     /// The peer went past one of the ceilings in [`Limits`].
     ///
-    /// [`Limits`]: crate::api::common::Limits
+    /// [`Limits`]: crate::models::Limits
     Limit(String),
     /// One stream failed, with the error code to reset it by.
     ///
@@ -48,6 +41,16 @@ pub enum Error {
 }
 
 impl Error {
+    /// Wraps a BoringSSL failure as an [`Error::Tls`].
+    pub fn tls(error: impl fmt::Display) -> Self {
+        Self::Tls(error.to_string())
+    }
+
+    /// Wraps a failure from the QUIC layer as an [`Error::Io`].
+    pub fn quic(error: impl fmt::Display) -> Self {
+        Self::Io(std::io::Error::other(error.to_string()))
+    }
+
     /// A [`Error::Stream`] for `id`, to be reset with `code`.
     pub fn stream(id: StreamID, code: u64, reason: impl Into<String>) -> Self {
         Self::Stream { id, code, reason: reason.into() }
@@ -89,14 +92,8 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl From<hpack::Error> for Error {
-    fn from(err: hpack::Error) -> Self {
-        Self::Protocol(format!("hpack: {err}"))
-    }
-}
-
-impl From<qpack::Error> for Error {
-    fn from(err: qpack::Error) -> Self {
-        Self::Protocol(format!("qpack: {err}"))
+impl From<crate::helpers::sync::Elapsed> for Error {
+    fn from(elapsed: crate::helpers::sync::Elapsed) -> Self {
+        Self::Timeout(elapsed.to_string())
     }
 }

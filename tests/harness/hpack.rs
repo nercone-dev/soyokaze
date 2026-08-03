@@ -1,4 +1,5 @@
-use soyokaze::helpers::hpack::{self, Decoder, Encoder, HeaderField};
+use soyokaze::helpers::fields::{HeaderField, Integer, StringLiteral};
+use soyokaze::helpers::hpack::{Decoder, Encoder};
 
 use super::input::Input;
 
@@ -19,34 +20,34 @@ pub fn block(data: &[u8]) {
 
     let decoded: usize = fields.iter().map(HeaderField::size).sum();
     assert!(
-        decoded <= hpack::DEFAULT_MAX_DECODED_SIZE,
+        decoded <= Decoder::DEFAULT_MAX_DECODED_SIZE,
         "the decoder returned {decoded} octets past its own ceiling",
     );
 
     assert!(
-        decoder.dynamic_table().size() <= decoder.dynamic_table().max_size(),
+        decoder.dynamic_table().size() <= decoder.dynamic_table().capacity(),
         "the dynamic table grew past its maximum size",
     );
 }
 
 pub fn integers(data: &[u8]) {
     for prefix_bits in 1..=8u8 {
-        let Ok((consumed, value)) = hpack::decode_integer(data, prefix_bits) else {
+        let Ok((consumed, value)) = Integer::decode(data, prefix_bits) else {
             continue;
         };
 
         assert!(consumed <= data.len(), "the integer decoder ran past the end of the input");
 
         let mut out = Vec::new();
-        hpack::encode_integer(&mut out, value, prefix_bits, 0);
+        Integer::encode(&mut out, value, prefix_bits, 0);
 
-        let again = hpack::decode_integer(&out, prefix_bits);
+        let again = Integer::decode(&out, prefix_bits);
         assert_eq!(again, Ok((out.len(), value)), "integer {value} did not survive prefix {prefix_bits}");
     }
 }
 
 pub fn strings(data: &[u8]) {
-    let Ok((consumed, value)) = hpack::decode_string(data) else {
+    let Ok((consumed, value)) = StringLiteral::decode(data, 7) else {
         return;
     };
 
@@ -54,9 +55,9 @@ pub fn strings(data: &[u8]) {
 
     for huffman in [false, true] {
         let mut out = Vec::new();
-        hpack::encode_string(&mut out, &value, huffman);
+        StringLiteral::encode(&mut out, &value, 7, 0x00, huffman);
 
-        let again = hpack::decode_string(&out);
+        let again = StringLiteral::decode(&out, 7);
         assert_eq!(again, Ok((out.len(), value.clone())), "a string did not survive huffman={huffman}");
     }
 }

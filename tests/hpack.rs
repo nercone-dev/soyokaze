@@ -1,125 +1,46 @@
-use soyokaze::helpers::hpack::{
-    self, Decoder, DynamicTable, Encoder, Error, HeaderField, DEFAULT_DYNAMIC_TABLE_SIZE,
-};
+use soyokaze::helpers::fields::{HeaderField, Integer};
+use soyokaze::helpers::hpack::{Decoder, DynamicTable, Encoder, Error};
 
 fn field(name: &str, value: &str) -> HeaderField {
     HeaderField::new(name, value)
 }
 
-#[test]
-fn encodes_the_specification_integers() {
-    let mut out = Vec::new();
-    hpack::encode_integer(&mut out, 10, 5, 0);
-    assert_eq!(out, [10]);
-
-    let mut out = Vec::new();
-    hpack::encode_integer(&mut out, 1337, 5, 0);
-    assert_eq!(out, [31, 154, 10]);
-
-    let mut out = Vec::new();
-    hpack::encode_integer(&mut out, 42, 8, 0);
-    assert_eq!(out, [42]);
-}
-
-#[test]
-fn decodes_the_specification_integers() {
-    assert_eq!(hpack::decode_integer(&[10], 5), Ok((1, 10)));
-    assert_eq!(hpack::decode_integer(&[31, 154, 10], 5), Ok((3, 1337)));
-    assert_eq!(hpack::decode_integer(&[42], 8), Ok((1, 42)));
-}
-
-#[test]
-fn keeps_the_flag_bits_above_the_prefix() {
-    let mut out = Vec::new();
-    hpack::encode_integer(&mut out, 2, 6, 0x40);
-    assert_eq!(out, [0x42]);
-    assert_eq!(hpack::decode_integer(&out, 6), Ok((1, 2)));
-}
-
-#[test]
-fn round_trips_integers_at_every_prefix() {
-    let values = [0, 1, 2, 14, 15, 16, 30, 31, 32, 127, 128, 255, 256, 16_383, 1 << 32, u64::MAX];
-
-    for prefix_bits in 1..=8u8 {
-        for value in values {
-            let mut out = Vec::new();
-            hpack::encode_integer(&mut out, value, prefix_bits, 0);
-            assert_eq!(hpack::decode_integer(&out, prefix_bits), Ok((out.len(), value)), "{value} at {prefix_bits}");
-        }
-    }
-}
-
-#[test]
-fn reports_a_truncated_integer() {
-    assert_eq!(hpack::decode_integer(&[], 5), Err(Error::Incomplete));
-    assert_eq!(hpack::decode_integer(&[31, 154], 5), Err(Error::Incomplete));
-}
-
-#[test]
-fn refuses_an_integer_that_does_not_fit() {
-    let overflowing = [0xff, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7f];
-    assert_eq!(hpack::decode_integer(&overflowing, 8), Err(Error::IntegerOverflow));
-}
-
-#[test]
-fn round_trips_strings_both_ways() {
-    for value in [&b""[..], b"a", b"custom-key", b"www.example.com", &[0xff, 0x00, 0x80]] {
-        for huffman in [false, true] {
-            let mut out = Vec::new();
-            hpack::encode_string(&mut out, value, huffman);
-
-            assert_eq!(out.first().is_some_and(|first| first & 0x80 != 0), huffman);
-            assert_eq!(hpack::decode_string(&out), Ok((out.len(), value.to_vec())));
-        }
-    }
-}
-
-#[test]
-fn reports_a_string_that_ends_early() {
-    assert_eq!(hpack::decode_string(&[0x05, b'a', b'b']), Err(Error::Incomplete));
-    assert_eq!(hpack::decode_string(&[]), Err(Error::Incomplete));
-}
-
-#[test]
-fn refuses_a_string_whose_length_cannot_be_addressed() {
-    let huge = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
-    assert!(matches!(hpack::decode_string(&huge), Err(Error::Incomplete | Error::IntegerOverflow)));
-}
-
-#[test]
-fn prefers_huffman_only_when_it_helps() {
-    assert!(hpack::preferred_huffman(b"www.example.com"));
-    assert!(!hpack::preferred_huffman(&[0xc0; 8]));
+fn literal_with_indexing(name: &str, value: &str) -> Vec<u8> {
+    let mut block = vec![0x40, name.len() as u8];
+    block.extend_from_slice(name.as_bytes());
+    block.push(value.len() as u8);
+    block.extend_from_slice(value.as_bytes());
+    block
 }
 
 #[test]
 fn resolves_the_static_table() {
-    let table = DynamicTable::new(DEFAULT_DYNAMIC_TABLE_SIZE);
+    let decoder = Decoder::new();
 
-    assert_eq!(table.resolve(1), Ok(&field(":authority", "")));
-    assert_eq!(table.resolve(2), Ok(&field(":method", "GET")));
-    assert_eq!(table.resolve(61), Ok(&field("www-authenticate", "")));
+    assert_eq!(decoder.resolve(1), Ok(&field(":authority", "")));
+    assert_eq!(decoder.resolve(2), Ok(&field(":method", "GET")));
+    assert_eq!(decoder.resolve(61), Ok(&field("www-authenticate", "")));
 }
 
 #[test]
 fn refuses_index_zero_and_anything_past_the_end() {
-    let table = DynamicTable::new(DEFAULT_DYNAMIC_TABLE_SIZE);
+    let decoder = Decoder::new();
 
-    assert_eq!(table.resolve(0), Err(Error::IndexOutOfRange(0)));
-    assert_eq!(table.resolve(62), Err(Error::IndexOutOfRange(62)));
-    assert_eq!(table.resolve(usize::MAX), Err(Error::IndexOutOfRange(usize::MAX)));
+    assert_eq!(decoder.resolve(0), Err(Error::IndexOutOfRange(0)));
+    assert_eq!(decoder.resolve(62), Err(Error::IndexOutOfRange(62)));
+    assert_eq!(decoder.resolve(u64::MAX), Err(Error::IndexOutOfRange(u64::MAX)));
 }
 
 #[test]
 fn indexes_the_dynamic_table_from_the_newest_entry() {
-    let mut table = DynamicTable::new(DEFAULT_DYNAMIC_TABLE_SIZE);
+    let mut decoder = Decoder::new();
 
-    table.insert(field("first", "1"));
-    table.insert(field("second", "2"));
+    decoder.decode(&literal_with_indexing("first", "1")).expect("the literal did not decode");
+    decoder.decode(&literal_with_indexing("second", "2")).expect("the literal did not decode");
 
-    assert_eq!(table.resolve(62), Ok(&field("second", "2")));
-    assert_eq!(table.resolve(63), Ok(&field("first", "1")));
-    assert_eq!(table.len(), 2);
+    assert_eq!(decoder.resolve(62), Ok(&field("second", "2")));
+    assert_eq!(decoder.resolve(63), Ok(&field("first", "1")));
+    assert_eq!(decoder.dynamic_table().len(), 2);
 }
 
 #[test]
@@ -132,8 +53,8 @@ fn evicts_the_oldest_entries_to_make_room() {
 
     table.insert(field("cccc", "c"));
     assert_eq!(table.len(), 2);
-    assert_eq!(table.resolve(62), Ok(&field("cccc", "c")));
-    assert_eq!(table.resolve(63), Ok(&field("bbbb", "b")));
+    assert_eq!(table.get(0), Some(&field("cccc", "c")));
+    assert_eq!(table.get(1), Some(&field("bbbb", "b")));
 }
 
 #[test]
@@ -149,23 +70,23 @@ fn drops_an_entry_larger_than_the_whole_table() {
 
 #[test]
 fn resizing_evicts_down_to_the_new_maximum() {
-    let mut table = DynamicTable::new(DEFAULT_DYNAMIC_TABLE_SIZE);
+    let mut table = DynamicTable::new(DynamicTable::DEFAULT_CAPACITY);
 
     for index in 0..8 {
         table.insert(field(&format!("name-{index}"), "value"));
     }
 
-    table.resize(HeaderField::OVERHEAD + 11);
+    table.set_capacity(HeaderField::OVERHEAD + 11);
     assert_eq!(table.len(), 1);
-    assert!(table.size() <= table.max_size());
+    assert!(table.size() <= table.capacity());
 
-    table.resize(0);
+    table.set_capacity(0);
     assert!(table.is_empty());
 }
 
 #[test]
 fn finds_a_full_match_before_a_name_only_match() {
-    let table = DynamicTable::new(DEFAULT_DYNAMIC_TABLE_SIZE);
+    let table = DynamicTable::new(DynamicTable::DEFAULT_CAPACITY);
 
     assert_eq!(table.find(&field(":method", "GET")), Some((2, true)));
     assert_eq!(table.find(&field(":method", "PATCH")), Some((2, false)));
@@ -241,39 +162,46 @@ fn never_indexes_a_sensitive_field() {
 }
 
 #[test]
-fn every_sensitive_name_is_recognised() {
-    for name in hpack::SENSITIVE_NAMES {
-        assert!(field(name, "value").sensitive(), "{name} should be treated as sensitive");
-    }
-
-    assert!(!field("accept", "value").sensitive());
-}
-
-#[test]
 fn a_size_update_leads_the_next_block() {
     let mut encoder = Encoder::new();
-    encoder.set_dynamic_table_size(256);
+    encoder.set_max_capacity(256);
 
     let block = encoder.encode(&[field("x-a", "1")]);
     assert_eq!(block[0] & 0xe0, 0x20, "the block does not open with a dynamic table size update");
 
     let mut decoder = Decoder::new();
     assert_eq!(decoder.decode(&block), Ok(vec![field("x-a", "1")]));
-    assert_eq!(decoder.dynamic_table().max_size(), 256);
+    assert_eq!(decoder.dynamic_table().capacity(), 256);
 
     let next = encoder.encode(&[field("x-b", "2")]);
     assert_ne!(next[0] & 0xe0, 0x20);
 }
 
 #[test]
+fn the_capacity_limit_caps_what_the_peer_permits() {
+    let mut encoder = Encoder::new();
+    encoder.set_capacity_limit(128);
+    encoder.set_max_capacity(4096);
+
+    assert_eq!(encoder.dynamic_table().capacity(), 128);
+
+    let block = encoder.encode(&[field("x-a", "1")]);
+    assert_eq!(block[0] & 0xe0, 0x20, "the block does not open with a dynamic table size update");
+
+    let mut decoder = Decoder::new();
+    assert_eq!(decoder.decode(&block), Ok(vec![field("x-a", "1")]));
+    assert_eq!(decoder.dynamic_table().capacity(), 128);
+}
+
+#[test]
 fn refuses_a_size_update_above_the_negotiated_maximum() {
     let mut decoder = Decoder::new();
-    decoder.set_dynamic_table_size(512);
+    decoder.set_max_capacity(512);
 
     let mut block = Vec::new();
-    hpack::encode_integer(&mut block, 4096, 5, 0x20);
+    Integer::encode(&mut block, 4096, 5, 0x20);
 
-    assert_eq!(decoder.decode(&block), Err(Error::InvalidDynamicTableSizeUpdate));
+    assert_eq!(decoder.decode(&block), Err(Error::InvalidCapacityUpdate));
 }
 
 #[test]

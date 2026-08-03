@@ -2,7 +2,8 @@
 
 An :class:`Encoder` and a :class:`Decoder` are stateful — each keeps a
 dynamic table — so one of each serves one connection's lifetime, blocks fed
-in the order they travel. Fields cross as lists of name and value pairs.
+in the order they travel. Fields cross as lists of name and value pairs,
+the shared vocabulary in :mod:`.fields`.
 """
 
 import ctypes
@@ -10,22 +11,7 @@ import ctypes
 from .. import ffi
 from ..errors import error_out, raise_for
 from ..ffi import library
-
-def fields_argument(fields):
-    """A C array of ``soyokaze_field_t`` and the slices keeping it alive."""
-    slices = [(ffi.slice_of(ffi.encoded(name)), ffi.slice_of(ffi.encoded(value))) for name, value in fields]
-    array = (ffi.Field * len(slices))(*[ffi.Field(name, value) for name, value in slices])
-    return array, slices
-
-def fields_taken(handle):
-    """The pairs a ``soyokaze_fields_t`` holds, releasing it as they are read."""
-    count = library.soyokaze_fields_count(handle)
-    pairs = [
-        (library.soyokaze_fields_name(handle, index).text(), library.soyokaze_fields_value(handle, index).text())
-        for index in range(count)
-    ]
-    library.soyokaze_fields_free(handle)
-    return pairs
+from .fields import fields_argument, fields_taken
 
 class Encoder:
     """An HPACK encoder with its dynamic table."""
@@ -38,9 +24,13 @@ class Encoder:
             library.soyokaze_hpack_encoder_free(self.handle)
             self.handle = None
 
-    def set_dynamic_table_size(self, max_size):
-        """Caps the dynamic table, as a ``SETTINGS_HEADER_TABLE_SIZE`` would."""
-        library.soyokaze_hpack_encoder_set_dynamic_table_size(self.handle, max_size)
+    def set_max_capacity(self, max_capacity):
+        """Records the peer's ``SETTINGS_HEADER_TABLE_SIZE``."""
+        library.soyokaze_hpack_encoder_set_max_capacity(self.handle, max_capacity)
+
+    def set_capacity_limit(self, capacity_limit):
+        """Bounds the capacity the encoder keeps, whatever the peer permits."""
+        library.soyokaze_hpack_encoder_set_capacity_limit(self.handle, capacity_limit)
 
     def encode(self, fields):
         """Encodes one field section — pairs of name and value — as a block."""
@@ -62,9 +52,9 @@ class Decoder:
         """Caps how large one decoded section may grow."""
         library.soyokaze_hpack_decoder_set_max_decoded_size(self.handle, max_size)
 
-    def set_dynamic_table_size(self, max_size):
-        """Caps the dynamic table, as a ``SETTINGS_HEADER_TABLE_SIZE`` would."""
-        library.soyokaze_hpack_decoder_set_dynamic_table_size(self.handle, max_size)
+    def set_max_capacity(self, max_capacity):
+        """Records this side's advertised ``SETTINGS_HEADER_TABLE_SIZE``."""
+        library.soyokaze_hpack_decoder_set_max_capacity(self.handle, max_capacity)
 
     def decode(self, block):
         """Decodes one block into pairs of name and value."""

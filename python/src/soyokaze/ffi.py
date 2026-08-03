@@ -58,18 +58,26 @@ class Limits(Structure):
         ("max_headers_size", c_uint64),
         ("max_header_count", c_uint16),
         ("max_chunk_header_size", c_uint32),
+        ("read_chunk_size", c_uint64),
+        ("idle_capacity", c_uint64),
         ("max_pending_handshakes", c_uint32),
         ("read_timeout", c_double),
         ("write_timeout", c_double),
         ("receive_timeout", c_double),
         ("send_timeout", c_double),
+        ("inline_body_size", c_uint64),
         ("max_concurrent_streams", c_uint32),
         ("max_connection_buffer_size", c_uint64),
         ("max_premature_resets", c_uint32),
+        ("max_encoder_table_size", c_uint64),
         ("max_idle_frames", c_uint32),
+        ("output_high_water", c_uint64),
         ("qpack_block_timeout", c_double),
         ("max_peer_uni_streams", c_uint32),
         ("max_outstanding_sections", c_uint32),
+        ("max_blocked_streams", c_uint32),
+        ("tunnel_backlog", c_uint32),
+        ("command_backlog", c_uint32),
         ("ws_linger_timeout", c_double),
         ("ws_max_fragments", c_uint16),
         ("max_cookies", c_uint32),
@@ -92,11 +100,26 @@ class ServerLimits(Structure):
 
     _fields_ = [
         ("message", Limits),
+        ("backlog", c_uint32),
         ("max_connections", c_uint32),
         ("max_connections_per_ip", c_uint32),
         ("max_connection_rate", POINTER(Rate)),
         ("rate_count", c_size_t),
         ("max_connection_history", c_size_t),
+        ("worker_stack_size", c_size_t),
+    ]
+
+class TlsConfig(Structure):
+    """The TLS details a context is built with: ``soyokaze_tls_config_t``."""
+
+    _fields_ = [
+        ("ciphers", Slice),
+        ("groups", Slice),
+        ("signature_algorithms", Slice),
+        ("prefer_server_ciphers", c_bool),
+        ("session_tickets", c_bool),
+        ("early_data", c_bool),
+        ("certificate_compression", c_bool),
     ]
 
 class EchEntry(Structure):
@@ -116,6 +139,7 @@ class ClientConfig(Structure):
         ("hsts", c_bool),
         ("roots", POINTER(Slice)),
         ("root_count", c_size_t),
+        ("tls", POINTER(TlsConfig)),
         ("ech", POINTER(EchEntry)),
         ("ech_count", c_size_t),
     ]
@@ -135,6 +159,7 @@ class ServerConfig(Structure):
         ("identity", c_void_p),
         ("certificate", Slice),
         ("key", Slice),
+        ("tls", POINTER(TlsConfig)),
         ("ech", c_void_p),
         ("hsts", POINTER(HstsPolicy)),
         ("reuseport", c_bool),
@@ -344,6 +369,7 @@ declare("soyokaze_hsts_store_learn", c_bool, c_void_p, c_char_p, c_size_t, c_cha
 declare("soyokaze_hsts_store_secure", c_bool, c_void_p, c_char_p, c_size_t)
 
 # ---------------------------------------------------------------------- tls
+declare("soyokaze_tls_config_default", TlsConfig)
 declare("soyokaze_identity_new", c_void_p, POINTER(Slice), c_size_t, c_char_p, c_size_t)
 declare("soyokaze_identity_from_pkcs12", c_int32, c_char_p, c_size_t, c_char_p, c_size_t, POINTER(c_void_p), POINTER(c_void_p))
 declare("soyokaze_identity_free", None, c_void_p)
@@ -380,7 +406,7 @@ declare("soyokaze_connection_id", Buffer, c_void_p)
 declare("soyokaze_connection_reusable", c_bool, c_void_p)
 declare("soyokaze_connection_send", c_int32, c_void_p, c_void_p, c_void_p, POINTER(c_void_p))
 declare("soyokaze_connection_receive", c_int32, c_void_p, c_void_p, POINTER(c_void_p), POINTER(c_void_p))
-declare("soyokaze_connection_open_websocket", c_int32, c_void_p, c_void_p, c_char_p, c_size_t, c_char_p, c_size_t, POINTER(c_void_p), POINTER(c_void_p))
+declare("soyokaze_connection_open_websocket", c_int32, c_void_p, c_void_p, c_char_p, c_size_t, c_char_p, c_size_t, c_void_p, POINTER(c_void_p), POINTER(c_void_p))
 declare("soyokaze_connection_close", None, c_void_p, c_void_p)
 declare("soyokaze_connection_free", None, c_void_p)
 
@@ -428,18 +454,20 @@ declare("soyokaze_fields_name", Slice, c_void_p, c_size_t)
 declare("soyokaze_fields_value", Slice, c_void_p, c_size_t)
 declare("soyokaze_hpack_encoder_new", c_void_p)
 declare("soyokaze_hpack_encoder_free", None, c_void_p)
-declare("soyokaze_hpack_encoder_set_dynamic_table_size", c_bool, c_void_p, c_size_t)
+declare("soyokaze_hpack_encoder_set_max_capacity", c_bool, c_void_p, c_size_t)
+declare("soyokaze_hpack_encoder_set_capacity_limit", c_bool, c_void_p, c_size_t)
 declare("soyokaze_hpack_encode", Buffer, c_void_p, POINTER(Field), c_size_t)
 declare("soyokaze_hpack_decoder_new", c_void_p)
 declare("soyokaze_hpack_decoder_free", None, c_void_p)
 declare("soyokaze_hpack_decoder_set_max_decoded_size", c_bool, c_void_p, c_size_t)
-declare("soyokaze_hpack_decoder_set_dynamic_table_size", c_bool, c_void_p, c_size_t)
+declare("soyokaze_hpack_decoder_set_max_capacity", c_bool, c_void_p, c_size_t)
 declare("soyokaze_hpack_decode", c_int32, c_void_p, c_char_p, c_size_t, POINTER(c_void_p), POINTER(c_void_p))
 declare("soyokaze_qpack_encoder_new", c_void_p)
 declare("soyokaze_qpack_encoder_free", None, c_void_p)
-declare("soyokaze_qpack_encoder_set_max_capacity", c_bool, c_void_p, c_size_t)
+declare("soyokaze_qpack_encoder_set_max_capacity", c_bool, c_void_p, c_size_t, POINTER(Buffer))
+declare("soyokaze_qpack_encoder_set_capacity_limit", c_bool, c_void_p, c_size_t, POINTER(Buffer))
+declare("soyokaze_qpack_encoder_set_max_instruction_size", c_bool, c_void_p, c_size_t)
 declare("soyokaze_qpack_encoder_set_max_outstanding_sections", c_bool, c_void_p, c_size_t)
-declare("soyokaze_qpack_encoder_set_capacity", c_bool, c_void_p, c_size_t, POINTER(Buffer))
 declare("soyokaze_qpack_encode", c_bool, c_void_p, c_uint64, POINTER(Field), c_size_t, POINTER(Buffer), POINTER(Buffer))
 declare("soyokaze_qpack_encoder_on_decoder_instructions", c_int32, c_void_p, c_char_p, c_size_t, POINTER(c_void_p))
 declare("soyokaze_qpack_encoder_cancel", c_bool, c_void_p, c_uint64)
@@ -447,6 +475,8 @@ declare("soyokaze_qpack_decoder_new", c_void_p)
 declare("soyokaze_qpack_decoder_free", None, c_void_p)
 declare("soyokaze_qpack_decoder_set_max_decoded_size", c_bool, c_void_p, c_size_t)
 declare("soyokaze_qpack_decoder_set_max_capacity", c_bool, c_void_p, c_size_t)
+declare("soyokaze_qpack_decoder_set_max_instruction_size", c_bool, c_void_p, c_size_t)
+declare("soyokaze_qpack_decoder_set_max_blocked_streams", c_bool, c_void_p, c_size_t)
 declare("soyokaze_qpack_decoder_on_encoder_instructions", c_int32, c_void_p, c_char_p, c_size_t, POINTER(Buffer), POINTER(c_void_p))
 declare("soyokaze_qpack_decode", c_int32, c_void_p, c_uint64, c_char_p, c_size_t, POINTER(c_void_p), POINTER(Buffer), POINTER(c_void_p))
 

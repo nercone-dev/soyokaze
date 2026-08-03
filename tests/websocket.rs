@@ -1,5 +1,6 @@
-use soyokaze::api::common::Limits;
+use soyokaze::models::Limits;
 use soyokaze::models::{ConnectionID, Headers, Message, Method, Role, Version};
+use soyokaze::protocol::common::Fields;
 use soyokaze::websocket::{self, CloseCode, Frame, Opcode, WebSocketConnection};
 use soyokaze::Error;
 
@@ -143,26 +144,26 @@ fn decoding_arbitrary_octets_never_panics() {
 
 #[test]
 fn the_accept_key_matches_the_specification_example() {
-    assert_eq!(websocket::accept_key("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    assert_eq!(websocket::Upgrade::accept_key("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
 }
 
 #[test]
 fn a_nonce_is_sixteen_octets_of_base64() {
-    let nonce = websocket::nonce().expect("no randomness was available");
+    let nonce = websocket::Upgrade::nonce().expect("no randomness was available");
     assert_eq!(soyokaze::helpers::base64::decode(&nonce).map(|key| key.len()), Ok(16));
 }
 
 #[test]
 fn a_handshake_request_and_response_verify_against_each_other() {
-    let key = websocket::nonce().expect("no randomness was available");
+    let key = websocket::Upgrade::nonce().expect("no randomness was available");
 
-    let request = websocket::handshake_request("example.test", "/chat", &key);
-    assert_eq!(websocket::verify_request(&request).ok(), Some(key.clone()));
-    assert!(websocket::upgrade_requested(&request));
+    let request = websocket::Upgrade::request("example.test", "/chat", &key, Version::V1_1);
+    assert_eq!(websocket::Upgrade::verify_request(&request).ok(), Some(key.clone()));
+    assert!(websocket::Handshake::requested(&request));
 
-    let response = websocket::handshake_response(&key);
+    let response = websocket::Upgrade::response(&key, Version::V1_1);
     assert_eq!(response.status_code, Some(101));
-    assert!(websocket::verify_response(&response, &key).is_ok());
+    assert!(websocket::Upgrade::verify_response(&response, &key).is_ok());
 }
 
 #[test]
@@ -170,7 +171,7 @@ fn refuses_a_handshake_request_that_is_missing_something() {
     let key = "dGhlIHNhbXBsZSBub25jZQ==";
 
     let strip = |name: &str| {
-        let mut request = websocket::handshake_request("example.test", "/chat", key);
+        let mut request = websocket::Upgrade::request("example.test", "/chat", key, Version::V1_1);
         if let Some(headers) = request.headers.as_mut() {
             headers.remove(name);
         }
@@ -178,49 +179,49 @@ fn refuses_a_handshake_request_that_is_missing_something() {
     };
 
     for name in ["upgrade", "connection", "sec-websocket-version", "sec-websocket-key"] {
-        assert!(websocket::verify_request(&strip(name)).is_err(), "a request with no {name} should be refused");
+        assert!(websocket::Upgrade::verify_request(&strip(name)).is_err(), "a request with no {name} should be refused");
     }
 
-    let mut short = websocket::handshake_request("example.test", "/chat", "c2hvcnQ=");
-    assert!(websocket::verify_request(&short).is_err());
+    let mut short = websocket::Upgrade::request("example.test", "/chat", "c2hvcnQ=", Version::V1_1);
+    assert!(websocket::Upgrade::verify_request(&short).is_err());
 
     short.method = Some(Method::POST);
-    assert!(websocket::verify_request(&short).is_err());
+    assert!(websocket::Upgrade::verify_request(&short).is_err());
 
     let mut bare = Message::request(Method::GET, "/chat", Version::V1_1);
     bare.headers = None;
-    assert!(websocket::verify_request(&bare).is_err());
+    assert!(websocket::Upgrade::verify_request(&bare).is_err());
 }
 
 #[test]
 fn refuses_a_response_that_does_not_confirm_the_upgrade() {
     let key = "dGhlIHNhbXBsZSBub25jZQ==";
 
-    let mut wrong_status = websocket::handshake_response(key);
+    let mut wrong_status = websocket::Upgrade::response(key, Version::V1_1);
     wrong_status.status_code = Some(200);
-    assert!(websocket::verify_response(&wrong_status, key).is_err());
+    assert!(websocket::Upgrade::verify_response(&wrong_status, key).is_err());
 
-    let mismatched = websocket::handshake_response("YW5vdGhlciBub25jZSEh");
-    assert!(websocket::verify_response(&mismatched, key).is_err());
+    let mismatched = websocket::Upgrade::response("YW5vdGhlciBub25jZSEh", Version::V1_1);
+    assert!(websocket::Upgrade::verify_response(&mismatched, key).is_err());
 
-    let mut without_upgrade = websocket::handshake_response(key);
+    let mut without_upgrade = websocket::Upgrade::response(key, Version::V1_1);
     if let Some(headers) = without_upgrade.headers.as_mut() {
         headers.remove("upgrade");
     }
-    assert!(websocket::verify_response(&without_upgrade, key).is_err());
+    assert!(websocket::Upgrade::verify_response(&without_upgrade, key).is_err());
 }
 
 #[test]
 fn an_extended_connect_carries_the_protocol() {
     for version in [Version::V2_0, Version::V3_0] {
-        let request = websocket::connect_request("example.test", "/chat", version);
+        let request = websocket::Connect::request("example.test", "/chat", version);
 
         assert_eq!(request.method, Some(Method::CONNECT));
-        assert!(websocket::upgrade_requested(&request));
-        assert!(websocket::verify_connect_request(&request).is_ok());
-        assert!(websocket::verify_upgrade(&request).is_ok());
+        assert!(websocket::Handshake::requested(&request));
+        assert!(websocket::Connect::verify_request(&request).is_ok());
+        assert!(websocket::Handshake::verify(&request).is_ok());
 
-        assert!(websocket::verify_connect_response(&websocket::connect_response(version)).is_ok());
+        assert!(websocket::Connect::verify_response(&websocket::Connect::response(version)).is_ok());
     }
 }
 
@@ -229,12 +230,12 @@ fn refuses_an_extended_connect_that_names_no_protocol() {
     let mut request = Message::request(Method::CONNECT, "/chat", Version::V2_0);
     request.headers = Some(Headers::new());
 
-    assert!(websocket::verify_connect_request(&request).is_err());
-    assert!(!websocket::upgrade_requested(&request));
+    assert!(websocket::Connect::verify_request(&request).is_err());
+    assert!(!websocket::Handshake::requested(&request));
 
     let mut refused = Message::response(403, Version::V2_0);
     refused.headers = Some(Headers::new());
-    assert!(websocket::verify_connect_response(&refused).is_err());
+    assert!(websocket::Connect::verify_response(&refused).is_err());
 }
 
 #[test]
@@ -242,8 +243,8 @@ fn a_token_is_matched_case_insensitively_inside_a_list() {
     let mut headers = Headers::new();
     headers.append("connection", "keep-alive, Upgrade");
 
-    assert!(websocket::token_present(&headers, "connection", "upgrade"));
-    assert!(!websocket::token_present(&headers, "connection", "close"));
+    assert!(websocket::Handshake::token_present(&headers, "connection", "upgrade"));
+    assert!(!websocket::Handshake::token_present(&headers, "connection", "close"));
 }
 
 fn connection() -> (tokio::io::DuplexStream, WebSocketConnection<tokio::io::DuplexStream>) {
@@ -413,4 +414,99 @@ async fn refuses_a_close_payload_that_breaks_the_rules() {
     let mut valid = 1000u16.to_be_bytes().to_vec();
     valid.extend_from_slice(b"bye");
     assert!(connection.verify_close(&valid).is_ok());
+}
+
+/// Each version's way in is enumerated, so neither is reached by default.
+///
+/// RFC 6455 §4.1 bootstraps WebSocket over HTTP/1.x with a `GET` carrying
+/// `Upgrade: websocket`; RFC 8441 and RFC 9220 replace that with an extended
+/// `CONNECT` for HTTP/2 and HTTP/3. Neither form may be accepted on a version
+/// that does not define it, whichever way round.
+#[test]
+fn each_version_accepts_only_its_own_handshake() {
+    let upgrade = websocket::Upgrade::request("example.test", "/chat", "dGhlIHNhbXBsZSBub25jZQ==", Version::V1_1);
+    assert_eq!(upgrade.version, Version::V1_1);
+    assert!(websocket::Handshake::requested(&upgrade), "HTTP/1.1 asks with the upgrade");
+
+    // The same upgrade request, relabelled as HTTP/2 or HTTP/3, is not a handshake there.
+    for version in [Version::V2_0, Version::V3_0] {
+        let mut relabelled = websocket::Upgrade::request("example.test", "/chat", "dGhlIHNhbXBsZSBub25jZQ==", Version::V1_1);
+        relabelled.version = version;
+
+        assert!(
+            !websocket::Handshake::requested(&relabelled),
+            "{version} must not accept the RFC 6455 upgrade, which it does not define",
+        );
+        assert!(websocket::Handshake::verify(&relabelled).is_err(), "{version} must refuse it too");
+    }
+
+    // ...and the extended CONNECT is not a handshake over HTTP/1.x.
+    for version in [Version::V1_0, Version::V1_1] {
+        let mut relabelled = websocket::Connect::request("example.test", "/chat", Version::V2_0);
+        relabelled.version = version;
+
+        assert!(
+            !websocket::Handshake::requested(&relabelled),
+            "{version} must not accept the extended CONNECT, which it does not define",
+        );
+        assert!(websocket::Handshake::verify(&relabelled).is_err(), "{version} must refuse it too");
+    }
+}
+
+#[test]
+fn a_websocket_handshake_needs_http_1_1_or_later() {
+    // RFC 6455 §1.7 and §4.1: the opening handshake is an HTTP/1.1 upgrade.
+    // HTTP/1.0 has no Upgrade to build on, so a request that asks for one over
+    // it must be turned away rather than taken for HTTP/1.1.
+    let mut request = websocket::Upgrade::request("example.test", "/chat", "dGhlIHNhbXBsZSBub25jZQ==", Version::V1_0);
+    request.version = Version::V1_0;
+
+    assert!(!websocket::Handshake::requested(&request), "an HTTP/1.0 request must not be routed to the WebSocket handshake");
+    assert!(websocket::Handshake::verify(&request).is_err(), "an HTTP/1.0 handshake must not verify");
+
+    // The same request over HTTP/1.1 is the one the RFC describes.
+    let mut later = websocket::Upgrade::request("example.test", "/chat", "dGhlIHNhbXBsZSBub25jZQ==", Version::V1_1);
+    later.version = Version::V1_1;
+
+    assert!(websocket::Handshake::requested(&later), "a well-formed HTTP/1.1 upgrade must be recognised");
+    assert!(websocket::Handshake::verify(&later).is_ok(), "a well-formed HTTP/1.1 upgrade must verify");
+}
+
+#[test]
+fn the_handshake_is_framed_with_the_version_it_is_carried_over() {
+    // Both halves of both handshakes take the version rather than assuming
+    // one, so an upgrade and an extended CONNECT stay interchangeable.
+    for version in [Version::V1_0, Version::V1_1] {
+        assert_eq!(websocket::Upgrade::request("example.test", "/chat", "a2V5", version).version, version);
+        assert_eq!(websocket::Upgrade::response("a2V5", version).version, version);
+    }
+
+    for version in [Version::V2_0, Version::V3_0] {
+        assert_eq!(websocket::Connect::request("example.test", "/chat", version).version, version);
+        assert_eq!(websocket::Connect::response(version).version, version);
+    }
+}
+
+#[test]
+fn an_extended_connect_does_not_assume_its_transport_was_secure() {
+    // RFC 8441 §4 frames the request as an ordinary one, so :scheme follows
+    // what the connection actually is. Assuming https would frame an h2c
+    // WebSocket as though it had crossed TLS.
+    let request = websocket::Connect::request("example.test", "/chat", Version::V2_0);
+    assert!(!request.security.secure, "an extended CONNECT must not claim a secure transport of its own accord");
+
+    let fields = Fields::of(&request).expect("a well-formed extended CONNECT did not frame");
+    assert!(
+        fields.iter().any(|field| field.name == ":scheme" && field.value == "http"),
+        "over a plaintext connection the scheme must be http",
+    );
+
+    let mut secure = websocket::Connect::request("example.test", "/chat", Version::V2_0);
+    secure.security.secure = true;
+
+    let fields = Fields::of(&secure).expect("a well-formed extended CONNECT did not frame");
+    assert!(
+        fields.iter().any(|field| field.name == ":scheme" && field.value == "https"),
+        "over a secure connection the scheme must be https",
+    );
 }
