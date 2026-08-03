@@ -1,6 +1,6 @@
 [package]
 name = "soyokaze"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "HTTP/1/2/3 Library Crate"
 readme = "README.md"
