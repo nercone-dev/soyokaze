@@ -1,27 +1,19 @@
-# soyokaze (Python bindings)
+# soyokaze.py
+Python bindings for Soyokaze, an HTTP/1, HTTP/2 and HTTP/3 library written in Rust.
 
-Python bindings for [soyokaze](https://github.com/nercone-dev/soyokaze/), an
-HTTP/1, HTTP/2 and HTTP/3 library, reached through the shared library's C ABI.
+## Requirements
 
-The shared library is found through, in order: the `SOYOKAZE_LIBRARY`
-environment variable, a copy inside the package, the crate's own
-`target/{release,debug}` directory when the package sits in the repository,
-and the system loader. Build it with `cargo build` (or `--release`) first.
+- Linux / macOS (x86_64, AArch64)
+- Python 3.9+
 
-```python
-import soyokaze
+## Installation
 
-client = soyokaze.Client()
-response = client.get("https://example.com/")
-print(response.status_code, response.body())
+```bash
+uv pip install soyokaze
 ```
 
-```python
-server = soyokaze.Server()
-handle = server.serve(lambda request: soyokaze.Message.text("hello"),
-                      [soyokaze.Port.TCP(8080)])
-...
-handle.close()
-```
+They locate the shared library through, in order: the `SOYOKAZE_LIBRARY` environment variable, the copy bundled with the package, the crate's own `target/{release,debug}` directory when run from within the repository, and the system loader.
 
-Run the tests with `python -m pytest` from this directory.
+## Links
+- [docs.rs](https://docs.rs/soyokaze/) - Documentation (for The Rust version)
+- [deepwiki.com](https://deepwiki.com/nercone-dev/soyokaze/) - Documentation; Automatically generated.

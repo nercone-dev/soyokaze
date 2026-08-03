@@ -1,4 +1,4 @@
-# Soyokaze
+# soyokaze.rs
 HTTP/1/2/3 Library Crate
 
 ## Overview
@@ -11,7 +11,7 @@ C FFI and Python bindings are also available.
 
 ## Requirements
 
-- Linux / macOS
+- Linux / macOS (x86_64, AArch64)
 - Rust 1.88+ (including dependencies, The crate itself is 1.85+)
 - CMake and C/C++ Toolchain (for building BoringSSL)
 
