@@ -1292,11 +1292,11 @@ where
     ///
     /// [`H2Connection::buffered`] walks every stream, and this is asked on
     /// every DATA frame, which would make one pass over the connection's
-    /// streams cost a walk per stream. So [`H2Connection::buffered_bound`] is
-    /// kept instead: it grows with every octet taken in and is never reduced as
-    /// octets are read away, so it can read high but never low. The exact sum
-    /// is taken only once the bound reaches the ceiling, which is at most once
-    /// per ceiling's worth of octets rather than once per frame.
+    /// streams cost a walk per stream. So `buffered_bound` is kept instead: it
+    /// grows with every octet taken in and is never reduced as octets are read
+    /// away, so it can read high but never low. The exact sum is taken only
+    /// once the bound reaches the ceiling, which is at most once per ceiling's
+    /// worth of octets rather than once per frame.
     pub fn overbuffered(&mut self) -> bool {
         let limit = self.limits.max_connection_buffer_size;
 
