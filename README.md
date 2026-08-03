@@ -5,7 +5,7 @@ HTTP/1/2/3 Library Crate
 
 An HTTP/1/2/3 implementation written in Rust.
 
-It uses BoringSSL (`boring`/`boring-sys`/`tokio-boring`) for TLS handling, and the BoringSSL-based Quiche (`quiche`/`tokio-quiche`) for QUIC handling.
+It uses BoringSSL for TLS handling, and the BoringSSL-based Quiche for QUIC handling.
 
 C FFI and Python bindings are also available.
 
