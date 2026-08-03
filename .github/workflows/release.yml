@@ -302,6 +302,10 @@ jobs:
           dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
           dnf install -y cmake clang clang-devel golang perl curl git gh
 
+      - name: Mark the workspace as a safe directory
+        if: runner.os == 'Linux'
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install cmake go
@@ -354,7 +358,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
 
   publish:
-    needs: [update, test, build]
+    needs: [update, test, doc, build, build-ffi, build-python]
     runs-on: ubuntu-latest
 
     steps:
@@ -377,7 +381,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   publish-python:
-    needs: [update, test, build-python]
+    needs: [update, test, doc, build, build-ffi, build-python]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
