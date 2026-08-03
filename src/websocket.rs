@@ -545,7 +545,6 @@ pub fn verify_upgrade(request: &Message) -> Result<(), Error> {
     }
 }
 
-
 impl AnyConnection {
     /// Accepts a WebSocket handshake and takes the connection over.
     ///

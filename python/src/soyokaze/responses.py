@@ -13,7 +13,6 @@ from .errors import InvalidError, error_out, raise_for
 from .ffi import library
 from .models import Version
 
-
 class ResponseMixin:
     """The response constructors and cookie methods that extend :class:`Message <models.Message>`."""
 

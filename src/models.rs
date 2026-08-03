@@ -27,6 +27,78 @@ pub struct TLSCipher(pub u16);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TLSGroup(pub u16);
 
+/// What the transport underneath a connection turned out to be.
+///
+/// Read off the handshake once, when the connection is assembled, and stamped
+/// onto every message that crosses it by [`Security::apply`] — which is how
+/// the matching fields on [`Message`] come to be filled in. A plaintext
+/// transport leaves every field at its default, so [`Security::default`] is
+/// exactly "nothing underneath".
+///
+/// [`tls::security`] reads one off a completed TLS handshake, and
+/// [`Security::quic`] builds the one a QUIC connection stands for.
+///
+/// [`tls::security`]: crate::tls::security
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Security {
+    /// Whether the transport was a secure one, as the `https` scheme and the
+    /// `:scheme` pseudo-header reflect it.
+    pub secure: bool,
+    /// Whether the request arrived in TLS early data, and so may be a replay.
+    pub early_data: bool,
+
+    /// Whether the transport underneath was TLS.
+    pub tls: bool,
+    /// The negotiated TLS version.
+    pub tls_version: Option<TLSVersion>,
+    /// The negotiated TLS named group.
+    pub tls_group: Option<TLSGroup>,
+    /// The negotiated TLS cipher suite.
+    pub tls_cipher: Option<TLSCipher>,
+
+    /// Whether the transport underneath was QUIC.
+    pub quic: bool,
+    /// The negotiated QUIC version.
+    pub quic_version: Option<u32>,
+}
+
+impl Security {
+    /// What a QUIC connection of `version` stands for.
+    ///
+    /// QUIC is secure by construction and carries TLS 1.3 within it, so both
+    /// are set. The cipher suite and named group are left absent: the QUIC
+    /// stack does not hand its TLS session out to be read.
+    pub fn quic(version: u32) -> Self {
+        Self {
+            secure: true,
+            tls: true,
+            tls_version: Some(TLSVersion(TLS_1_3)),
+            quic: true,
+            quic_version: Some(version),
+            ..Self::default()
+        }
+    }
+
+    /// Stamps these facts onto a message crossing the connection.
+    pub fn apply(&self, message: &mut Message) {
+        message.secure = self.secure;
+        message.early_data = self.early_data;
+
+        message.tls = self.tls;
+        message.tls_version = self.tls_version;
+        message.tls_group = self.tls_group;
+        message.tls_cipher = self.tls_cipher;
+
+        message.quic = self.quic;
+        message.quic_version = self.quic_version;
+    }
+}
+
+/// The wire code for TLS 1.3, which is the version QUIC carries.
+///
+/// RFC 9001 admits nothing older underneath QUIC version 1.
+pub const TLS_1_3: u16 = 0x0304;
+
 /// Somewhere a server listens or a client dials.
 ///
 /// The variant picks the transport, which in turn bounds the HTTP versions
@@ -736,6 +808,11 @@ pub struct Message {
     pub status_code: Option<u16>,
 
     // TLS
+    //
+    // These and the QUIC pair below describe the transport the message
+    // crossed, and are stamped on by whichever connection received it — see
+    // [`Security`], which is what carries them there. A message the caller
+    // built has crossed nothing, so they read as absent on one until it does.
     /// Whether the transport underneath was TLS.
     pub tls: bool,
     /// The negotiated TLS version.
@@ -743,6 +820,9 @@ pub struct Message {
     /// The negotiated TLS named group.
     pub tls_group: Option<TLSGroup>,
     /// The negotiated TLS cipher suite.
+    ///
+    /// A QUIC connection leaves this and [`Message::tls_group`] absent: the
+    /// QUIC stack does not hand its TLS session out to be read.
     pub tls_cipher: Option<TLSCipher>,
 
     // QUIC

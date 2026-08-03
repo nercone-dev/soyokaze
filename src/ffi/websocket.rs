@@ -12,6 +12,7 @@
 
 use crate::ffi::errors::{ErrorHandle, Status};
 use crate::ffi::{borrow, borrow_text, Buffer};
+use crate::models::Role;
 use crate::protocol::base::Transport;
 use crate::websocket::{CloseCode, Frame, Opcode, WebSocketConnection};
 
@@ -40,8 +41,11 @@ pub unsafe extern "C" fn soyokaze_websocket_free(socket: *mut WebSocket) {
     }
 }
 
-/// Which end of the connection this is: `0` when this end is a client and
-/// masks its frames, `1` when it is a server.
+/// What this end of the connection is doing on it, as a `soyokaze_role_t`.
+///
+/// A client role masks its frames and a server role does not, which is the
+/// difference that matters here. A null `socket` reads as
+/// [`Role::UserAgent`].
 ///
 /// # Safety
 ///
@@ -49,8 +53,8 @@ pub unsafe extern "C" fn soyokaze_websocket_free(socket: *mut WebSocket) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_websocket_role(socket: *const WebSocket) -> u32 {
     match unsafe { socket.as_ref() } {
-        Some(socket) if socket.connection.role().is_client() => 0,
-        _ => 1,
+        Some(socket) => crate::ffi::api::client::role(socket.connection.role()),
+        None => crate::ffi::api::client::role(Role::UserAgent),
     }
 }
 

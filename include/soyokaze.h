@@ -89,10 +89,15 @@ typedef struct {
     size_t path_len;
 } soyokaze_port_t;
 
-/* Which end of a connection this is. */
+/* What one end of a connection is doing on it. A user agent and a proxy send
+ * requests; an origin and a gateway answer them; a tunnel relays octets
+ * without reading the messages inside. */
 typedef enum {
-    SOYOKAZE_ROLE_CLIENT = 0,
-    SOYOKAZE_ROLE_SERVER = 1
+    SOYOKAZE_ROLE_USER_AGENT = 0,
+    SOYOKAZE_ROLE_ORIGIN = 1,
+    SOYOKAZE_ROLE_PROXY = 2,
+    SOYOKAZE_ROLE_GATEWAY = 3,
+    SOYOKAZE_ROLE_TUNNEL = 4
 } soyokaze_role_t;
 
 /* What one connection is allowed to spend on the peer's behalf. Every field
@@ -169,6 +174,12 @@ void soyokaze_runtime_free(soyokaze_runtime_t *runtime);
 void soyokaze_error_free(soyokaze_error_t *error);
 soyokaze_status_t soyokaze_error_status(const soyokaze_error_t *error);
 soyokaze_slice_t soyokaze_error_message(const soyokaze_error_t *error);
+
+/* Set on a SOYOKAZE_STREAM failure, which names the one stream that failed
+ * while the connection itself stays usable; -1 on every other failure. */
+int64_t soyokaze_error_stream_id(const soyokaze_error_t *error);
+int64_t soyokaze_error_code(const soyokaze_error_t *error);
+
 soyokaze_slice_t soyokaze_status_message(soyokaze_status_t status);
 
 /* --------------------------------------------------------------------- url */
@@ -236,6 +247,11 @@ bool soyokaze_message_remove_trailer(soyokaze_message_t *message,
 int64_t soyokaze_message_stream_id(const soyokaze_message_t *message); /* -1 when none */
 bool soyokaze_message_set_stream_id(soyokaze_message_t *message, int64_t stream_id);
 soyokaze_slice_t soyokaze_message_connection_id(const soyokaze_message_t *message);
+
+/* What the transport underneath turned out to be. Stamped on every message a
+ * connection receives, so these read as absent on one the caller built. A
+ * QUIC connection reports TLS 1.3, which is what it carries, but not the
+ * cipher suite or group: the QUIC stack does not hand its session out. */
 bool soyokaze_message_early_data(const soyokaze_message_t *message);
 bool soyokaze_message_tls(const soyokaze_message_t *message);
 int32_t soyokaze_message_tls_version(const soyokaze_message_t *message); /* wire code, -1 when none */

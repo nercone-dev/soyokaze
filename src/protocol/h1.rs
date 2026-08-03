@@ -23,7 +23,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use crate::api::common::Limits;
 use crate::helpers::scan;
 use crate::helpers::text::Text;
-use crate::models::{Body, ConnectionID, HeaderCase, Headers, Message, Method, Role, Version};
+use crate::models::{Body, ConnectionID, HeaderCase, Headers, Message, Method, Role, Security, Version};
 use crate::protocol::base::Connection;
 use crate::protocol::common::{self, Buffer, Error};
 
@@ -903,6 +903,7 @@ pub struct H1Connection<T> {
     pending: VecDeque<Method>,
     closing: bool,
     hsts: Option<crate::helpers::hsts::HstsPolicy>,
+    security: Security,
 }
 
 impl<T> H1Connection<T>
@@ -929,12 +930,20 @@ where
             pending: VecDeque::new(),
             closing: false,
             hsts: None,
+            security: Security::default(),
         }
     }
 
     /// Attaches an HSTS policy to be added to the responses this connection sends.
     pub fn with_hsts(mut self, hsts: Option<crate::helpers::hsts::HstsPolicy>) -> Self {
         self.hsts = hsts;
+        self
+    }
+
+    /// Attaches what the handshake settled, to be stamped on every message
+    /// this connection receives.
+    pub fn with_security(mut self, security: Security) -> Self {
+        self.security = security;
         self
     }
 
@@ -1191,6 +1200,7 @@ where
 
         message.headers = Some(headers);
         message.connection_id = Some(self.id.clone());
+        self.security.apply(&mut message);
 
         self.closing = self.closing || !crate::headers::keep_alive(message.headers.as_ref(), message.version);
 
@@ -1362,6 +1372,10 @@ where
 
     fn reusable(&self) -> bool {
         !self.closing
+    }
+
+    fn security(&self) -> Security {
+        self.security
     }
 
     async fn send(&mut self, message: Message) -> Result<(), Error> {

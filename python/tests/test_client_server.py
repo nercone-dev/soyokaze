@@ -11,7 +11,6 @@ import pytest
 import soyokaze
 from soyokaze import Client, ClientConfig, Limits, Message, Method, Port, Server, ServerConfig, ServerLimits, Url, Version
 
-
 def echo(request):
     """Answers with the request's own target, so the round trip proves the
     request reached the handler intact."""
@@ -21,14 +20,12 @@ def echo(request):
         response.insert_header("x-probe-echo", request.header("x-probe"))
     return response
 
-
 def serve(handler=echo, on_websocket=None, config=None):
     """A server on a kernel-chosen port, and the origin to reach it by."""
     server = Server(config)
     handle = server.serve(handler, [Port.TCP(0)], on_websocket=on_websocket)
     assert handle.port != 0, "a port of zero must report the one the kernel chose"
     return server, handle, f"http://127.0.0.1:{handle.port}"
-
 
 def test_a_request_crosses_to_the_handler_and_its_answer_crosses_back():
     server, handle, origin = serve()
@@ -42,7 +39,6 @@ def test_a_request_crosses_to_the_handler_and_its_answer_crosses_back():
         assert response.body() == b"/hello"
     finally:
         handle.close(5)
-
 
 def test_every_shorthand_reaches_the_server():
     seen = []
@@ -66,7 +62,6 @@ def test_every_shorthand_reaches_the_server():
     finally:
         handle.close(5)
 
-
 def test_a_handler_that_raises_answers_with_a_bare_500(capsys):
     def broken(request):
         raise ValueError("deliberate")
@@ -79,7 +74,6 @@ def test_a_handler_that_raises_answers_with_a_bare_500(capsys):
     finally:
         handle.close(5)
 
-
 def test_several_messages_go_over_one_connection():
     server, handle, origin = serve()
     try:
@@ -87,7 +81,8 @@ def test_several_messages_go_over_one_connection():
         connection = client.connect("127.0.0.1", Port.TCP(handle.port))
 
         assert connection.version == Version.V1_1
-        assert connection.role == soyokaze.Role.CLIENT
+        assert connection.role == soyokaze.Role.USER_AGENT
+        assert connection.role.is_client(), "a connection the client opened sends requests"
 
         for index in range(3):
             response = client.request(connection, Message.request(Method.GET, f"/turn/{index}"))
@@ -97,7 +92,6 @@ def test_several_messages_go_over_one_connection():
         connection.close()
     finally:
         handle.close(5)
-
 
 def test_send_and_receive_expose_the_raw_exchange():
     server, handle, origin = serve()
@@ -114,7 +108,6 @@ def test_send_and_receive_expose_the_raw_exchange():
     finally:
         handle.close(5)
 
-
 def test_a_pinned_version_and_ceilinged_limits_still_serve():
     limits = ServerLimits(message=Limits(max_header_count=32), max_connections=16)
     config = ServerConfig(versions=[Version.V1_1], limits=limits)
@@ -125,7 +118,6 @@ def test_a_pinned_version_and_ceilinged_limits_still_serve():
         assert client.get(f"{origin}/pinned").status_code == 200
     finally:
         handle.close(5)
-
 
 def test_the_cluster_spreads_the_same_server_across_workers():
     server = Server()
@@ -139,14 +131,13 @@ def test_the_cluster_spreads_the_same_server_across_workers():
     finally:
         cluster.close(5)
 
-
 def test_the_websocket_callback_runs_the_socket_both_ways():
     received = []
 
     def on_websocket(socket):
         opcode, payload = socket.receive_message()
         received.append((opcode, payload))
-        socket.send_message(payload.decode().upper())
+        socket.send_message(opcode, payload.decode().upper())
         socket.close(soyokaze.CloseCode.NORMAL, "done")
 
     server, handle, origin = serve(on_websocket=on_websocket)
@@ -154,9 +145,9 @@ def test_the_websocket_callback_runs_the_socket_both_ways():
         client = Client()
         socket = client.websocket(f"ws://127.0.0.1:{handle.port}/chat")
 
-        socket.send_message("hello")
+        socket.send_message(soyokaze.Opcode.TEXT, "hello")
         opcode, payload = socket.receive_message()
-        assert (opcode, payload) == (soyokaze.Opcode.TEXT, b"HELLO")
+        assert (opcode, payload) == (soyokaze.Opcode.TEXT, b"HELLO"), "receive_message hands back what send_message takes, in that order"
 
         opcode, payload = socket.receive_message()
         assert opcode == soyokaze.Opcode.CLOSE, "the server's close reaches the client"
@@ -164,7 +155,6 @@ def test_the_websocket_callback_runs_the_socket_both_ways():
         assert received == [(soyokaze.Opcode.TEXT, b"hello")]
     finally:
         handle.close(5)
-
 
 def test_the_client_keeps_cookies_across_requests():
     def set_then_expect(request):
@@ -188,7 +178,6 @@ def test_the_client_keeps_cookies_across_requests():
         assert response.header("x-got-cookie") == "none"
     finally:
         handle.close(5)
-
 
 def test_dialling_nothing_raises_rather_than_hanging():
     client = Client()

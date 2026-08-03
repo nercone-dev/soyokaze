@@ -13,7 +13,6 @@ from ..errors import InvalidError, error_out, raise_for
 from ..ffi import library
 from .hpack import fields_argument, fields_taken
 
-
 class Encoder:
     """A QPACK encoder with its dynamic table and instruction stream."""
 
@@ -67,7 +66,6 @@ class Encoder:
     def cancel(self, stream_id):
         """Forgets the outstanding sections of a stream that was reset."""
         library.soyokaze_qpack_encoder_cancel(self.handle, stream_id)
-
 
 class Decoder:
     """A QPACK decoder with its dynamic table and instruction stream."""

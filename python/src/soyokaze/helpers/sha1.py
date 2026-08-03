@@ -7,7 +7,6 @@ general-purpose hash to build anything new on.
 from .. import ffi
 from ..ffi import library
 
-
 def sha1(data):
     """The SHA-1 digest of ``data``. Always 20 octets."""
     data = ffi.encoded(data)

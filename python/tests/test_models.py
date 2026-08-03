@@ -7,7 +7,6 @@ import pytest
 import soyokaze
 from soyokaze import Message, Method, Url, Version
 
-
 def test_a_url_is_taken_apart_into_the_pieces_a_request_needs():
     url = Url("https://example.test:8443/a/b?q=1")
 
@@ -18,18 +17,15 @@ def test_a_url_is_taken_apart_into_the_pieces_a_request_needs():
     assert url.secure()
     assert url.authority() == "example.test:8443"
 
-
 def test_a_url_defaults_its_port_and_target_from_the_scheme():
     assert Url("http://example.test").port == 80
     assert Url("https://example.test").port == 443
     assert Url("wss://example.test").port == 443
     assert Url("http://example.test").target == "/"
 
-
 def test_a_url_that_will_not_parse_raises_a_protocol_error():
     with pytest.raises(soyokaze.ProtocolError):
         Url("not a url")
-
 
 def test_a_request_and_a_response_each_carry_only_what_belongs_to_them():
     request = Message.request(Method.GET, "/index.html", Version.V1_1)
@@ -45,7 +41,6 @@ def test_a_request_and_a_response_each_carry_only_what_belongs_to_them():
     assert response.target is None
     assert response.version == Version.V2_0
 
-
 def test_appending_keeps_every_field_and_inserting_keeps_one():
     response = Message.response(200)
     response.append_header("Set-Cookie", "a=1")
@@ -59,14 +54,12 @@ def test_appending_keeps_every_field_and_inserting_keeps_one():
     assert response.remove_header("set-cookie")
     assert not response.remove_header("set-cookie"), "removing twice finds nothing"
 
-
 def test_an_absent_field_is_told_apart_from_an_empty_one():
     response = Message.response(200)
     response.append_header("x-empty", "")
 
     assert response.header("x-empty") == ""
     assert response.header("x-missing") is None
-
 
 def test_trailers_mirror_headers():
     message = Message.response(200)
@@ -79,7 +72,6 @@ def test_trailers_mirror_headers():
     assert message.trailers() == [("checksum", "ghi")]
     assert message.remove_trailer("checksum")
     assert message.trailers() == []
-
 
 def test_a_body_reads_back_whichever_way_it_was_set(tmp_path):
     message = Message.response(200)
@@ -103,7 +95,6 @@ def test_a_body_reads_back_whichever_way_it_was_set(tmp_path):
     with pytest.raises(soyokaze.IoError):
         message.body()
 
-
 def test_stream_and_connection_facts_default_to_absent():
     message = Message.response(200)
     assert message.stream_id is None
@@ -120,7 +111,6 @@ def test_stream_and_connection_facts_default_to_absent():
     message.secure = True
     assert message.secure
 
-
 def test_the_response_constructors_set_their_content_type():
     assert Message.text("hi").header("content-type") == "text/plain"
     assert Message.html("<p>").header("content-type") == "text/html"
@@ -133,14 +123,41 @@ def test_the_response_constructors_set_their_content_type():
     assert redirect.status_code == 307
     assert redirect.header("location") == "/elsewhere"
 
-
 def test_a_consumed_message_refuses_further_use():
     message = Message.response(200)
     message.take()
     with pytest.raises(soyokaze.InvalidError):
         message.take()
 
-
 def test_http_date_renders_the_imf_fixdate():
     assert soyokaze.http_date(784111777) == "Sun, 06 Nov 1994 08:49:37 GMT"
     assert len(soyokaze.http_date(0)) == 29
+
+def test_every_role_carries_the_number_the_c_abi_gives_it():
+    assert (soyokaze.Role.USER_AGENT, soyokaze.Role.ORIGIN) == (0, 1)
+    assert (soyokaze.Role.PROXY, soyokaze.Role.GATEWAY, soyokaze.Role.TUNNEL) == (2, 3, 4)
+
+    assert soyokaze.Role.USER_AGENT.is_client() and soyokaze.Role.PROXY.is_client()
+    assert soyokaze.Role.ORIGIN.is_server() and soyokaze.Role.GATEWAY.is_server()
+
+    assert not soyokaze.Role.TUNNEL.is_client(), "a tunnel originates nothing"
+    assert not soyokaze.Role.TUNNEL.is_server(), "a tunnel answers nothing either"
+
+def test_a_message_that_crossed_nothing_reports_no_transport_underneath():
+    message = Message.response(200)
+
+    assert message.tls is False
+    assert message.tls_version is None
+    assert message.tls_group is None
+    assert message.tls_cipher is None
+    assert message.quic is False
+    assert message.quic_version is None
+    assert message.early_data is False
+
+def test_a_failure_that_names_no_stream_leaves_its_stream_fields_unset():
+    with pytest.raises(soyokaze.ProtocolError) as raised:
+        Url("not a url")
+
+    assert raised.value.status == soyokaze.Status.PROTOCOL
+    assert raised.value.stream_id is None, "a failure that took the whole connection names no stream"
+    assert raised.value.code is None, "and carries no code to reset one with"

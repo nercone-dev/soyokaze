@@ -11,13 +11,11 @@ from .. import ffi
 from ..errors import error_out, raise_for
 from ..ffi import library
 
-
 def fields_argument(fields):
     """A C array of ``soyokaze_field_t`` and the slices keeping it alive."""
     slices = [(ffi.slice_of(ffi.encoded(name)), ffi.slice_of(ffi.encoded(value))) for name, value in fields]
     array = (ffi.Field * len(slices))(*[ffi.Field(name, value) for name, value in slices])
     return array, slices
-
 
 def fields_taken(handle):
     """The pairs a ``soyokaze_fields_t`` holds, releasing it as they are read."""
@@ -28,7 +26,6 @@ def fields_taken(handle):
     ]
     library.soyokaze_fields_free(handle)
     return pairs
-
 
 class Encoder:
     """An HPACK encoder with its dynamic table."""
@@ -49,7 +46,6 @@ class Encoder:
         """Encodes one field section — pairs of name and value — as a block."""
         array, slices = fields_argument(fields)
         return ffi.take(library.soyokaze_hpack_encode(self.handle, array, len(fields)))
-
 
 class Decoder:
     """An HPACK decoder with its dynamic table."""

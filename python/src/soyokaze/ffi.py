@@ -43,12 +43,10 @@ class Buffer(Structure):
 
     _fields_ = [("data", POINTER(c_uint8)), ("len", c_size_t), ("capacity", c_size_t)]
 
-
 class Port(Structure):
     """A port to dial or bind: ``soyokaze_port_t``."""
 
     _fields_ = [("kind", c_int32), ("number", c_uint16), ("path", c_char_p), ("path_len", c_size_t)]
-
 
 class Limits(Structure):
     """What one connection may spend on the peer's behalf: ``soyokaze_limits_t``."""
@@ -79,18 +77,15 @@ class Limits(Structure):
         ("max_hsts_entries", c_uint32),
     ]
 
-
 class ClientLimits(Structure):
     """The limits a client adds on top: ``soyokaze_client_limits_t``."""
 
     _fields_ = [("message", Limits), ("connection_timeout", c_double)]
 
-
 class Rate(Structure):
     """One sliding-window rate limit: ``soyokaze_rate_t``."""
 
     _fields_ = [("period", c_double), ("count", c_uint32)]
-
 
 class ServerLimits(Structure):
     """The limits a server adds on top: ``soyokaze_server_limits_t``."""
@@ -104,12 +99,10 @@ class ServerLimits(Structure):
         ("max_connection_history", c_size_t),
     ]
 
-
 class EchEntry(Structure):
     """One host's ECH configuration list: ``soyokaze_ech_entry_t``."""
 
     _fields_ = [("host", Slice), ("config_list", Slice)]
-
 
 class ClientConfig(Structure):
     """How a client is configured: ``soyokaze_client_config_t``."""
@@ -127,12 +120,10 @@ class ClientConfig(Structure):
         ("ech_count", c_size_t),
     ]
 
-
 class HstsPolicy(Structure):
     """One Strict-Transport-Security policy: ``soyokaze_hsts_policy_t``."""
 
     _fields_ = [("max_age", c_int64), ("include_subdomains", c_bool), ("preload", c_bool)]
-
 
 class ServerConfig(Structure):
     """How a server is configured: ``soyokaze_server_config_t``."""
@@ -149,16 +140,13 @@ class ServerConfig(Structure):
         ("reuseport", c_bool),
     ]
 
-
 class Field(Structure):
     """One field going into an encoder: ``soyokaze_field_t``."""
 
     _fields_ = [("name", Slice), ("value", Slice)]
 
-
 ON_REQUEST = CFUNCTYPE(c_void_p, c_void_p, c_void_p)
 ON_WEBSOCKET = CFUNCTYPE(None, c_void_p, c_void_p)
-
 
 def slice_of(octets):
     """A :class:`Slice` viewing ``octets``, which must stay alive alongside it."""
@@ -168,7 +156,6 @@ def slice_of(octets):
     view = Slice(ctypes.cast(array, POINTER(c_uint8)) if array else None, len(octets))
     view.keepalive = array
     return view
-
 
 def locate():
     """Every path or name the shared library might load from, in order.
@@ -202,7 +189,6 @@ def locate():
 
     return located
 
-
 def load():
     """The shared library, tried candidate by candidate.
 
@@ -223,9 +209,7 @@ def load():
         + ("".join(f"\n  - {failure}" for failure in failures))
     )
 
-
 library = load()
-
 
 def declare(name, restype, *argtypes):
     """Declares one exported function's signature and returns it."""
@@ -233,7 +217,6 @@ def declare(name, restype, *argtypes):
     function.restype = restype
     function.argtypes = list(argtypes)
     return function
-
 
 # ------------------------------------------------------------------- common
 declare("soyokaze_buffer_free", None, Buffer)
@@ -246,6 +229,8 @@ declare("soyokaze_runtime_free", None, c_void_p)
 declare("soyokaze_error_free", None, c_void_p)
 declare("soyokaze_error_status", c_int32, c_void_p)
 declare("soyokaze_error_message", Slice, c_void_p)
+declare("soyokaze_error_stream_id", c_int64, c_void_p)
+declare("soyokaze_error_code", c_int64, c_void_p)
 declare("soyokaze_status_message", Slice, c_int32)
 
 # ---------------------------------------------------------------------- url
@@ -465,13 +450,11 @@ declare("soyokaze_qpack_decoder_set_max_capacity", c_bool, c_void_p, c_size_t)
 declare("soyokaze_qpack_decoder_on_encoder_instructions", c_int32, c_void_p, c_char_p, c_size_t, POINTER(Buffer), POINTER(c_void_p))
 declare("soyokaze_qpack_decode", c_int32, c_void_p, c_uint64, c_char_p, c_size_t, POINTER(c_void_p), POINTER(Buffer), POINTER(c_void_p))
 
-
 def take(buffer):
     """The octets a :class:`Buffer` holds, releasing it as they are read."""
     octets = ctypes.string_at(buffer.data, buffer.len) if buffer.data else b""
     library.soyokaze_buffer_free(buffer)
     return octets
-
 
 def taken(buffer):
     """As :func:`take`, but ``None`` when the buffer's pointer was null.
@@ -482,13 +465,11 @@ def taken(buffer):
         return None
     return take(buffer)
 
-
 def encoded(text):
     """Octets for an argument that may be ``str`` or ``bytes``."""
     if isinstance(text, str):
         return text.encode()
     return bytes(text)
-
 
 def version():
     """The crate's version, as ``MAJOR.MINOR.PATCH``."""

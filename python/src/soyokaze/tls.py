@@ -11,7 +11,6 @@ from . import ffi
 from .errors import InvalidError, error_out, raise_for
 from .ffi import library
 
-
 class Identity:
     """A certificate chain and the private key that goes with it.
 
@@ -46,7 +45,6 @@ class Identity:
         passphrase = ffi.encoded(passphrase)
         raise_for(library.soyokaze_identity_from_pkcs12(data, len(data), passphrase, len(passphrase), ctypes.byref(handle), ctypes.byref(error)), error)
         return cls(handle=handle)
-
 
 class EchKeys:
     """A server's ECH key pair, and the config that publishes its public half."""
@@ -95,7 +93,6 @@ class EchKeys:
         """
         return ffi.take(library.soyokaze_ech_keys_config_list(self.handle))
 
-
 class EchConfig:
     """One ECH configuration, as far as a client needs to read it."""
 
@@ -106,7 +103,6 @@ class EchConfig:
 
     def __repr__(self):
         return f"EchConfig({self.public_name!r})"
-
 
 class EchConfigList:
     """A list of ECH configurations, as published for a host."""

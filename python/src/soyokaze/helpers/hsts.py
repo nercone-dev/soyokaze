@@ -12,7 +12,6 @@ from ..api.common import limits_argument, limits_pointer
 from ..errors import ProtocolError
 from ..ffi import library
 
-
 class HstsPolicy:
     """One ``Strict-Transport-Security`` policy."""
 
@@ -37,7 +36,6 @@ class HstsPolicy:
 
     def __repr__(self):
         return f"HstsPolicy({self.build()!r})"
-
 
 class HstsStore:
     """A client-side record of which hosts insist on TLS.

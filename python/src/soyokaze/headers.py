@@ -14,14 +14,12 @@ from .api.common import limits_argument, limits_pointer
 from .errors import InvalidError, error_out, raise_for
 from .ffi import library
 
-
 class SameSite(enum.IntEnum):
     """The ``SameSite`` attribute of a cookie, as the C ABI numbers it."""
 
     STRICT = 0
     LAX = 1
     NONE = 2
-
 
 class Cookie:
     """The contents of a ``Cookie`` field: the pairs a client sends back."""
@@ -73,7 +71,6 @@ class Cookie:
 
     def __repr__(self):
         return f"Cookie({self.build()!r})"
-
 
 class SetCookie:
     """One ``Set-Cookie`` field: the cookie a server asks a client to keep."""
@@ -195,7 +192,6 @@ class SetCookie:
 
     def __repr__(self):
         return f"SetCookie({self.name!r})"
-
 
 class CookieJar:
     """A client-side cookie store.

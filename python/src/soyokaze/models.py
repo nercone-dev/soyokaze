@@ -16,7 +16,6 @@ from .errors import InvalidError, error_out, raise_for
 from .ffi import library
 from .runtime import default_runtime
 
-
 class Version(enum.IntEnum):
     """An HTTP version."""
 
@@ -31,7 +30,6 @@ class Version(enum.IntEnum):
 
     def __str__(self):
         return {Version.V1_0: "HTTP/1.0", Version.V1_1: "HTTP/1.1", Version.V2_0: "HTTP/2", Version.V3_0: "HTTP/3"}[self]
-
 
 class Method(enum.IntEnum):
     """A request method."""
@@ -54,13 +52,22 @@ class Method(enum.IntEnum):
         """Whether repeating the method has the same effect as issuing it once."""
         return self.safe() or self in (Method.PUT, Method.DELETE)
 
-
 class Role(enum.IntEnum):
-    """Which end of a connection this is, as the C ABI reports it."""
+    """What one end of a connection is doing on it."""
 
-    CLIENT = 0
-    SERVER = 1
+    USER_AGENT = 0
+    ORIGIN = 1
+    PROXY = 2
+    GATEWAY = 3
+    TUNNEL = 4
 
+    def is_client(self):
+        """Whether this role sends requests and reads responses."""
+        return self in (Role.USER_AGENT, Role.PROXY)
+
+    def is_server(self):
+        """Whether this role reads requests and sends responses."""
+        return self in (Role.ORIGIN, Role.GATEWAY)
 
 class PortKind(enum.IntEnum):
     """Which transport a port names."""
@@ -68,7 +75,6 @@ class PortKind(enum.IntEnum):
     UDS = 0
     TCP = 1
     QUIC = 2
-
 
 class Port:
     """Somewhere a server listens or a client dials.
@@ -123,13 +129,11 @@ class Port:
             return f"Port.UDS({self.path!r})"
         return f"Port.{self.kind.name}({self.number})"
 
-
 def ports_argument(ports):
     """A C array of ``soyokaze_port_t`` and the structs keeping it alive."""
     structs = [port.build() for port in ports]
     array = (ffi.Port * len(structs))(*structs)
     return array, structs
-
 
 class Url:
     """An absolute URL, split into the parts a request needs."""
@@ -178,7 +182,6 @@ class Url:
     def __repr__(self):
         return f"Url({self.scheme}://{self.authority()}{self.target})"
 
-
 def body_setter(message, body):
     """Sets a message body from whatever Python value stands for one.
 
@@ -199,11 +202,9 @@ def body_setter(message, body):
     if not accepted:
         raise InvalidError("the body was refused")
 
-
 # Imported here, after Version, since responses.py needs it and would
 # otherwise see this module only partially initialized.
 from .responses import ResponseMixin
-
 
 class Message(ResponseMixin):
     """One HTTP request or response, whichever version framed it.

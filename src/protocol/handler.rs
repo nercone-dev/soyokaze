@@ -102,11 +102,12 @@ impl Negotiation {
 
         let stream = tokio_boring::accept(acceptor, transport).await.map_err(|err| Error::Tls(err.to_string()))?;
         let version = tls::negotiated(stream.ssl().selected_alpn_protocol(), &self.versions)?;
+        let security = tls::security(stream.ssl());
 
         let transport = Box::new(stream) as Box<dyn Transport>;
         Ok(match version {
-            Version::V2_0 => AnyConnection::H2(H2Connection::new(transport, Role::Origin, id, self.limits).with_hsts(self.hsts)),
-            _ => AnyConnection::H1(H1Connection::new(transport, Role::Origin, id, self.limits).with_hsts(self.hsts)),
+            Version::V2_0 => AnyConnection::H2(H2Connection::new(transport, Role::Origin, id, self.limits).with_hsts(self.hsts).with_security(security)),
+            _ => AnyConnection::H1(H1Connection::new(transport, Role::Origin, id, self.limits).with_hsts(self.hsts).with_security(security)),
         })
     }
 

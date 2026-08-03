@@ -11,7 +11,6 @@ from ..ffi import library
 
 FIELDS = [name for name, kind in ffi.Limits._fields_]
 
-
 class Limits:
     """What one connection is allowed to spend on the peer's behalf.
 
@@ -38,7 +37,6 @@ class Limits:
             setattr(struct, name, getattr(self, name))
         return struct
 
-
 def limits_argument(limits):
     """The ``soyokaze_limits_t`` for an optional :class:`Limits`, or ``None``.
 
@@ -46,7 +44,6 @@ def limits_argument(limits):
     keep it alive for as long as the call needs it.
     """
     return limits.build() if limits is not None else None
-
 
 def limits_pointer(struct):
     """A pointer to an optional struct from :func:`limits_argument`."""

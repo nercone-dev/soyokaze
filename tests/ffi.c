@@ -62,12 +62,20 @@ static void check_url(void) {
     assert(bad == NULL);
     assert(error != NULL);
     assert(soyokaze_error_message(error).data != NULL);
+
+    /* A failure that took the whole connection names no stream. */
+    assert(soyokaze_error_stream_id(error) == -1);
+    assert(soyokaze_error_code(error) == -1);
     soyokaze_error_free(error);
 }
 
 static void check_null_handles(void) {
     assert(soyokaze_error_status(NULL) == SOYOKAZE_INVALID);
     assert(soyokaze_error_message(NULL).data == NULL);
+    assert(soyokaze_error_stream_id(NULL) == -1);
+    assert(soyokaze_error_code(NULL) == -1);
+    assert(soyokaze_connection_role(NULL) == SOYOKAZE_ROLE_USER_AGENT);
+    assert(soyokaze_websocket_role(NULL) == SOYOKAZE_ROLE_USER_AGENT);
     assert(soyokaze_url_host(NULL).data == NULL);
     assert(soyokaze_url_port(NULL) == 0);
     assert(soyokaze_message_method(NULL) == -1);
@@ -204,6 +212,16 @@ int main(void) {
     assert(soyokaze_message_body(runtime, response, &body, &error) == SOYOKAZE_OK);
     assert(body.len == strlen(BODY) && memcmp(body.data, BODY, body.len) == 0);
     soyokaze_buffer_free(body);
+
+    /* Nothing was underneath this plaintext exchange, and it says so rather
+     * than reporting a TLS version that was never negotiated. */
+    assert(!soyokaze_message_tls(response));
+    assert(soyokaze_message_tls_version(response) == -1);
+    assert(soyokaze_message_tls_group(response) == -1);
+    assert(soyokaze_message_tls_cipher(response) == -1);
+    assert(!soyokaze_message_quic(response));
+    assert(soyokaze_message_quic_version(response) == -1);
+    assert(!soyokaze_message_early_data(response));
 
     soyokaze_message_free(response);
     soyokaze_client_free(client);

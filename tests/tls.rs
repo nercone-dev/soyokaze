@@ -2,7 +2,7 @@ use bytes::Bytes;
 
 use soyokaze::tls;
 use soyokaze::helpers::base64;
-use soyokaze::models::{Body, ConnectionID, Message, Method, Port, Version};
+use soyokaze::models::{Body, ConnectionID, Message, Method, Port, Security, Version};
 use soyokaze::protocol::base::{AnyConnection, Connection};
 use soyokaze::{Client, ClientConfig, Format, Handler, Identity, Server, ServerConfig};
 
@@ -392,6 +392,141 @@ fn a_pem_identity_and_a_pem_root_serve_quic() {
 
     assert_eq!(response.status_code, Some(200));
     assert_eq!(response.body.as_ref().and_then(Body::inline), Some(Bytes::from_static(b"Hello, World!")));
+}
+
+/// RFC 8446 §4.1.2: TLS 1.3 puts 0x0304 in the `supported_versions` extension,
+/// which is what a session reports as its version.
+const TLS_1_3: u16 = 0x0304;
+
+#[test]
+fn a_message_over_tls_carries_what_the_handshake_settled() {
+    for version in [Version::V1_1, Version::V2_0] {
+        let issued = issue("localhost");
+        let identity = Identity::new(vec![issued.certificate_pem.into_bytes()], issued.key_pem.into_bytes());
+        let response = exchange(identity, vec![issued.certificate_der], version, Port::TCP(0));
+
+        assert!(response.tls, "{version}: a message over TLS must say so");
+        assert!(response.secure, "{version}: a message over TLS is a secure one");
+        assert!(!response.quic, "{version}: TLS over TCP is not QUIC");
+        assert_eq!(response.quic_version, None, "{version}: there is no QUIC version without QUIC");
+
+        assert_eq!(
+            response.tls_version.map(|version| version.0),
+            Some(TLS_1_3),
+            "{version}: the negotiated TLS version must be reported as its wire code",
+        );
+        assert!(response.tls_cipher.is_some(), "{version}: the negotiated cipher suite must be reported");
+        assert!(response.tls_group.is_some(), "{version}: the negotiated named group must be reported");
+
+        assert!(!response.early_data, "{version}: nothing was sent as early data");
+    }
+}
+
+#[test]
+fn a_message_over_quic_carries_the_quic_version_and_the_tls_it_mandates() {
+    let issued = issue("localhost");
+    let identity = Identity::new(vec![issued.certificate_pem.clone().into_bytes()], issued.key_pem.into_bytes());
+    let response = exchange(identity, vec![issued.certificate_pem.into_bytes()], Version::V3_0, Port::QUIC(0));
+
+    assert!(response.quic, "a message over QUIC must say so");
+    assert!(response.secure, "QUIC is secure by construction");
+    assert_eq!(response.quic_version, Some(quiche::PROTOCOL_VERSION), "the negotiated QUIC version must be reported");
+
+    // RFC 9001 §4.2: QUIC version 1 admits no TLS older than 1.3.
+    assert!(response.tls, "QUIC carries TLS within it");
+    assert_eq!(response.tls_version.map(|version| version.0), Some(TLS_1_3));
+}
+
+#[test]
+fn a_message_over_plaintext_carries_nothing_underneath() {
+    let server = Server::new(ServerConfig { versions: vec![Version::V1_1], ..ServerConfig::default() });
+    let cluster = server.run(Echo, &[Port::TCP(0)], 1).expect("the port did not open");
+    let port = cluster.address().expect("the cluster has no address").port();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("no runtime");
+
+    let response = runtime.block_on(async move {
+        let client = Client::new(ClientConfig { versions: vec![Version::V1_1], secure: false, ..ClientConfig::default() });
+        let mut connection = client.connect("127.0.0.1", Port::TCP(port)).await.expect("the client could not reach the server");
+
+        let response = client
+            .request(&mut connection, Message::request(Method::GET, "/index.html", Version::V1_1))
+            .await
+            .expect("the exchange failed");
+
+        connection.close().await;
+        response
+    });
+
+    cluster.close(Some(1.0));
+
+    assert!(!response.tls, "there is no TLS under a plaintext connection");
+    assert!(!response.secure);
+    assert!(!response.quic);
+    assert_eq!(response.tls_version, None);
+    assert_eq!(response.tls_group, None);
+    assert_eq!(response.tls_cipher, None);
+    assert_eq!(response.quic_version, None);
+    assert!(!response.early_data);
+}
+
+#[test]
+fn a_connection_reports_the_same_facts_it_stamps_on_its_messages() {
+    let issued = issue("localhost");
+    let identity = Identity::new(vec![issued.certificate_pem.into_bytes()], issued.key_pem.into_bytes());
+
+    let server = Server::new(ServerConfig { versions: vec![Version::V1_1], identity: Some(identity), ..ServerConfig::default() });
+    let cluster = server.run(Echo, &[Port::TCP(0)], 1).expect("the port did not open");
+    let port = cluster.address().expect("the cluster has no address").port();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("no runtime");
+
+    let (security, response) = runtime.block_on(async move {
+        let client = Client::new(ClientConfig {
+            versions: vec![Version::V1_1],
+            roots: Some(vec![issued.certificate_der]),
+            ..ClientConfig::default()
+        });
+
+        let mut connection = client.connect("localhost", Port::TCP(port)).await.expect("the client could not reach the server");
+        let security = connection.security();
+
+        let response = client
+            .request(&mut connection, Message::request(Method::GET, "/index.html", Version::V1_1))
+            .await
+            .expect("the exchange failed");
+
+        connection.close().await;
+        (security, response)
+    });
+
+    cluster.close(Some(1.0));
+
+    let mut stamped = Message::response(0, Version::V1_1);
+    security.apply(&mut stamped);
+
+    assert_eq!(stamped.tls, response.tls);
+    assert_eq!(stamped.secure, response.secure);
+    assert_eq!(stamped.tls_version, response.tls_version);
+    assert_eq!(stamped.tls_group, response.tls_group);
+    assert_eq!(stamped.tls_cipher, response.tls_cipher);
+    assert_eq!(stamped.quic, response.quic);
+    assert_eq!(stamped.quic_version, response.quic_version);
+    assert_eq!(stamped.early_data, response.early_data);
+}
+
+#[test]
+fn a_plaintext_transport_is_what_the_default_security_stands_for() {
+    let mut message = Message::response(200, Version::V1_1);
+    message.tls = true;
+    message.secure = true;
+    message.quic = true;
+
+    Security::default().apply(&mut message);
+
+    assert!(!message.tls, "the default stands for nothing underneath, and says so");
+    assert!(!message.secure);
+    assert!(!message.quic);
 }
 
 #[test]

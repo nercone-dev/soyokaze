@@ -10,7 +10,7 @@ use crate::ffi::errors::{ErrorHandle, Status};
 use crate::ffi::models::Port;
 use crate::ffi::websocket::WebSocket;
 use crate::ffi::{borrow, borrow_text, Buffer, Runtime, Slice};
-use crate::models::{Message, Method, Url, Version};
+use crate::models::{Message, Method, Role, Url, Version};
 use crate::protocol::base::{AnyConnection, Connection};
 
 /// Reads a version list out of a C array of `soyokaze_version_t` values.
@@ -454,7 +454,11 @@ pub unsafe extern "C" fn soyokaze_connection_version(connection: *const AnyConne
     unsafe { connection.as_ref() }.map_or(Version::V1_1, |connection| connection.version())
 }
 
-/// Which end of the connection this is: `0` for a client, `1` for a server.
+/// What this end of the connection is doing on it.
+///
+/// One of the `soyokaze_role_t` numbers; a null `connection` reads as
+/// [`Role::UserAgent`], which is what a connection this library hands a C
+/// caller from the client side is.
 ///
 /// # Safety
 ///
@@ -462,8 +466,23 @@ pub unsafe extern "C" fn soyokaze_connection_version(connection: *const AnyConne
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_connection_role(connection: *const AnyConnection) -> u32 {
     match unsafe { connection.as_ref() } {
-        Some(connection) if connection.role().is_client() => 0,
-        _ => 1,
+        Some(connection) => role(connection.role()),
+        None => role(Role::UserAgent),
+    }
+}
+
+/// The `soyokaze_role_t` number for a [`Role`].
+///
+/// The two enums are kept in the same order, so this is the crate's own
+/// grading rather than a narrowing of it: a caller can still tell a proxy from
+/// a user agent, and a tunnel from either.
+pub fn role(role: Role) -> u32 {
+    match role {
+        Role::UserAgent => 0,
+        Role::Origin => 1,
+        Role::Proxy => 2,
+        Role::Gateway => 3,
+        Role::Tunnel => 4,
     }
 }
 

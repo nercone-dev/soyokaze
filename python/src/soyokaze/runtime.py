@@ -8,7 +8,6 @@ is handed another, so most code never touches this module.
 from .errors import RuntimeError
 from .ffi import library
 
-
 class Runtime:
     """A multi-threaded runtime.
 
@@ -32,9 +31,7 @@ class Runtime:
     def __del__(self):
         self.close()
 
-
 shared = None
-
 
 def default_runtime():
     """The runtime used when a call is not handed one, built on first use."""

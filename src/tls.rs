@@ -5,6 +5,10 @@
 //! where negotiation happens: [`client_config`] and [`server_config`] offer
 //! the versions, and [`negotiated`] reads back what was chosen.
 //!
+//! What the handshake settled is read back here too: [`negotiated`] gives the
+//! HTTP version, and [`security`] the TLS version, group and cipher suite that
+//! every message crossing the connection is then stamped with.
+//!
 //! Encrypted Client Hello encrypts the server name in the handshake, so a
 //! watcher sees only the public name. [`EchKeys`] is what a server holds,
 //! [`EchConfigList`] is what a client is given, and [`EchStatus`] is how
@@ -23,10 +27,10 @@ use boring::ssl::{AlpnError, SslAcceptor, SslConnector, SslContextBuilder, SslEc
 use boring::stack::Stack;
 use boring::x509::store::X509StoreBuilder;
 use boring::x509::X509;
-use foreign_types::ForeignType;
+use foreign_types::{ForeignType, ForeignTypeRef};
 
 use crate::errors::Error;
-use crate::models::Version;
+use crate::models::{Security, TLSCipher, TLSGroup, TLSVersion, Version};
 
 /// Wraps a BoringSSL failure as an [`Error`].
 pub fn tls_error(error: impl std::fmt::Display) -> Error {
@@ -100,6 +104,30 @@ pub fn negotiated(alpn: Option<&[u8]>, versions: &[Version]) -> Result<Version, 
     Version::from_alpn(alpn)
         .filter(|version| versions.contains(version))
         .ok_or_else(|| Error::Version(format!("the peer selected {:?}", String::from_utf8_lossy(alpn))))
+}
+
+/// Reads the transport facts off a completed handshake.
+///
+/// The counterpart of [`negotiated`]: that reads back which HTTP version was
+/// chosen, this reads back everything else the handshake settled — the TLS
+/// version, named group and cipher suite as their wire codes, and whether the
+/// peer's first flight was accepted as early data. A code the session does not
+/// report is left absent rather than guessed at.
+pub fn security(ssl: &boring::ssl::SslRef) -> Security {
+    let version = unsafe { boring_sys::SSL_version(ssl.as_ptr()) };
+    let group = unsafe { boring_sys::SSL_get_curve_id(ssl.as_ptr()) };
+
+    Security {
+        secure: true,
+        early_data: unsafe { boring_sys::SSL_early_data_accepted(ssl.as_ptr()) } != 0,
+
+        tls: true,
+        tls_version: u16::try_from(version).ok().filter(|version| *version != 0).map(TLSVersion),
+        tls_group: (group != 0).then_some(TLSGroup(group)),
+        tls_cipher: ssl.current_cipher().map(|cipher| TLSCipher(cipher.protocol_id())),
+
+        ..Security::default()
+    }
 }
 
 /// How a certificate or a private key was encoded.

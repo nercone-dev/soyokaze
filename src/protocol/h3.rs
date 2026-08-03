@@ -29,7 +29,7 @@ use tokio_quiche::{ApplicationOverQuic, BoxError, QuicResult};
 use crate::api::common::Limits;
 use crate::helpers::hpack::HeaderField;
 use crate::helpers::qpack::{self, Decoder, DecoderInstruction, Encoder, EncoderInstruction};
-use crate::models::{Body, ConnectionID, Headers, Message, Method, Role, StreamID, Version};
+use crate::models::{Body, ConnectionID, Headers, Message, Method, Role, Security, StreamID, Version};
 use crate::protocol::base::Connection;
 use crate::protocol::common::{self, Error};
 
@@ -639,6 +639,10 @@ pub struct H3Session {
 
     /// The next bidirectional stream this end will open.
     pub next_stream_id: u64,
+
+    /// What the transport underneath turned out to be, stamped on every
+    /// message this session hands over.
+    pub security: Security,
 }
 
 impl H3Session {
@@ -673,6 +677,7 @@ impl H3Session {
             decoder_recv: BytesMut::new(),
             control_recv: BytesMut::new(),
             next_stream_id,
+            security: Security::quic(quiche::PROTOCOL_VERSION),
         }
     }
 
@@ -1146,8 +1151,7 @@ impl H3Session {
         let mut message = common::message_from(fields, Version::V3_0).map_err(|err| err.on_stream(stream_id, H3_MESSAGE_ERROR))?;
         message.stream_id = Some(stream_id);
         message.connection_id = Some(id);
-        message.quic = true;
-        message.secure = true;
+        self.security.apply(&mut message);
 
         if message.is_request() {
             state.method = message.method;
@@ -1281,6 +1285,8 @@ pub struct H3Connection {
     pub guard: Option<std::sync::Arc<tokio_quiche::QuicConnection>>,
     /// The HSTS policy to attach to responses, if any.
     pub hsts: Option<crate::helpers::hsts::HstsPolicy>,
+    /// What the transport underneath turned out to be, as the session sees it.
+    pub security: Security,
 }
 
 impl H3Connection {
@@ -1302,6 +1308,7 @@ impl H3Connection {
             limits: session.limits,
             guard: None,
             hsts,
+            security: session.security,
         };
 
         (connection, H3Worker::new(session, commands_receiver, events_sender, raw_receiver))
@@ -1577,6 +1584,10 @@ impl Connection for H3Connection {
 
     fn id(&self) -> ConnectionID {
         self.id.clone()
+    }
+
+    fn security(&self) -> Security {
+        self.security
     }
 
     async fn send(&mut self, message: Message) -> Result<(), Error> {

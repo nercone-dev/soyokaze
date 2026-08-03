@@ -24,7 +24,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::api::common::Limits;
 use crate::helpers::hpack::{Decoder as HPACKDecoder, Encoder as HPACKEncoder, HeaderField};
-use crate::models::{Body, ConnectionID, Headers, Message, Method, Role, StreamID, Version};
+use crate::models::{Body, ConnectionID, Headers, Message, Method, Role, Security, StreamID, Version};
 use crate::protocol::base::{Connection, Stream};
 use crate::protocol::common::{self, Buffer, Error};
 
@@ -918,6 +918,7 @@ pub struct H2Connection<T> {
     premature_resets: u32,
     idle_frames: u32,
     hsts: Option<crate::helpers::hsts::HstsPolicy>,
+    security: Security,
 }
 
 impl<T> H2Connection<T>
@@ -964,12 +965,20 @@ where
             premature_resets: 0,
             idle_frames: 0,
             hsts: None,
+            security: Security::default(),
         }
     }
 
     /// Attaches an HSTS policy to be added to the responses this connection sends.
     pub fn with_hsts(mut self, hsts: Option<crate::helpers::hsts::HstsPolicy>) -> Self {
         self.hsts = hsts;
+        self
+    }
+
+    /// Attaches what the handshake settled, to be stamped on every message
+    /// this connection receives.
+    pub fn with_security(mut self, security: Security) -> Self {
+        self.security = security;
         self
     }
 
@@ -1698,6 +1707,7 @@ where
         }
 
         let connection_id = self.id.clone();
+        let security = self.security;
         let stream = self.open_stream(stream_id)?;
 
         if let Some(message) = &mut stream.headers {
@@ -1716,6 +1726,7 @@ where
             let mut message = common::message_from(decoded, Version::V2_0)?;
             message.stream_id = Some(stream_id);
             message.connection_id = Some(connection_id);
+            security.apply(&mut message);
 
             if message.is_request() {
                 stream.method = message.method;
@@ -1988,6 +1999,10 @@ where
 
     fn id(&self) -> ConnectionID {
         self.id.clone()
+    }
+
+    fn security(&self) -> Security {
+        self.security
     }
 
     async fn send(&mut self, message: Message) -> Result<(), Error> {

@@ -11,7 +11,7 @@
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::errors::Error;
-use crate::models::{ConnectionID, Message, Role, StreamID, Version};
+use crate::models::{ConnectionID, Message, Role, Security, StreamID, Version};
 use crate::protocol::{h1::H1Connection, h2::H2Connection, h3::H3Connection};
 
 /// What every HTTP connection can do, whichever version it speaks.
@@ -38,6 +38,17 @@ pub trait Connection {
     /// connection is being wound down.
     fn reusable(&self) -> bool {
         true
+    }
+
+    /// What the transport underneath this connection turned out to be.
+    ///
+    /// Every message the connection receives is stamped with these, which is
+    /// where [`Message::tls`] and the fields beside it come from. A connection
+    /// over a plaintext transport reports [`Security::default`].
+    ///
+    /// [`Message::tls`]: crate::models::Message::tls
+    fn security(&self) -> Security {
+        Security::default()
     }
 
     /// Sends a message.
@@ -102,6 +113,22 @@ pub enum AnyConnection {
     H3(H3Connection),
 }
 
+impl AnyConnection {
+    /// Attaches what the TLS handshake settled, for a caller holding a
+    /// connection that has already been negotiated.
+    ///
+    /// An HTTP/3 connection is left alone: QUIC carries its own TLS, so the
+    /// session already knows what it is running over and there is nothing for
+    /// an outside handshake to tell it.
+    pub fn with_security(self, security: Security) -> Self {
+        match self {
+            Self::H1(connection) => Self::H1(connection.with_security(security)),
+            Self::H2(connection) => Self::H2(connection.with_security(security)),
+            Self::H3(connection) => Self::H3(connection),
+        }
+    }
+}
+
 impl Connection for AnyConnection {
     fn version(&self) -> Version {
         match self {
@@ -132,6 +159,14 @@ impl Connection for AnyConnection {
             Self::H1(connection) => connection.reusable(),
             Self::H2(connection) => connection.reusable(),
             Self::H3(connection) => connection.reusable(),
+        }
+    }
+
+    fn security(&self) -> Security {
+        match self {
+            Self::H1(connection) => connection.security(),
+            Self::H2(connection) => connection.security(),
+            Self::H3(connection) => connection.security(),
         }
     }
 

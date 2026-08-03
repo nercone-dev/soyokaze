@@ -20,11 +20,9 @@ from ..runtime import default_runtime
 from ..websocket import WebSocketConnection
 from .common import Limits
 
-
 def cores():
     """How many threads the machine can run at once, or 1 if that cannot be found."""
     return library.soyokaze_cores()
-
 
 class ServerLimits:
     """The limits a server applies on top of the per-message :class:`Limits`.
@@ -60,7 +58,6 @@ class ServerLimits:
             struct.keepalive = rates
 
         return struct
-
 
 class ServerConfig:
     """How a :class:`Server` is configured.
@@ -134,7 +131,6 @@ class ServerConfig:
         struct.keepalive = keepalive
         return struct
 
-
 def request_callback(handler):
     """The C callback that hands each request to ``handler``.
 
@@ -151,7 +147,6 @@ def request_callback(handler):
             return None
 
     return ffi.ON_REQUEST(answer)
-
 
 def websocket_callback(handler):
     """The C callback that hands each accepted WebSocket to ``handler``.
@@ -173,7 +168,6 @@ def websocket_callback(handler):
                 connection.close()
 
     return ffi.ON_WEBSOCKET(run)
-
 
 class ServerHandle:
     """A running server, as :meth:`Server.serve` returns it.
@@ -212,7 +206,6 @@ class ServerHandle:
             library.soyokaze_server_handle_close(self.runtime.handle, self.handle, -1.0 if timeout is None else timeout)
             self.handle = None
 
-
 class Cluster:
     """A server running across several threads, as :meth:`Server.run` returns it."""
 
@@ -239,7 +232,6 @@ class Cluster:
         if self.handle:
             library.soyokaze_cluster_close(self.handle, -1.0 if timeout is None else timeout)
             self.handle = None
-
 
 class Server:
     """An HTTP server.

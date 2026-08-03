@@ -10,12 +10,10 @@ from .. import ffi
 from ..errors import InvalidError
 from ..ffi import library
 
-
 def encode(data):
     """Encodes octets as base64 text."""
     data = ffi.encoded(data)
     return ffi.take(library.soyokaze_base64_encode(data, len(data))).decode()
-
 
 def decode(text):
     """Decodes base64 text, raising :class:`InvalidError` when it is not valid."""

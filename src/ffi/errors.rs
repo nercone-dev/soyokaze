@@ -80,17 +80,30 @@ impl Status {
 /// Produced through the `error` out parameter of a fallible call, and freed
 /// with [`soyokaze_error_free`]. The message is rendered once, when the handle
 /// is built, so [`soyokaze_error_message`] borrows rather than allocates.
+///
+/// [`Error::Stream`] is the one failure that carries more than a message, so
+/// the stream it names and the code to reset it by are kept alongside rather
+/// than left to be read out of the text.
 pub struct ErrorHandle {
     /// What kind of failure it was.
     pub status: Status,
     /// What went wrong, as [`Error`] renders it.
     pub message: String,
+    /// The stream that failed, on an [`Error::Stream`].
+    pub stream_id: Option<crate::models::StreamID>,
+    /// The protocol error code to reset that stream with.
+    pub code: Option<u64>,
 }
 
 impl ErrorHandle {
     /// The handle that stands for `error`.
     pub fn new(error: &Error) -> Self {
-        Self { status: Status::of(error), message: error.to_string() }
+        let (stream_id, code) = match error {
+            Error::Stream { id, code, .. } => (Some(*id), Some(*code)),
+            _ => (None, None),
+        };
+
+        Self { status: Status::of(error), message: error.to_string(), stream_id, code }
     }
 
     /// Writes `error` through an out parameter, and returns its status.
@@ -121,7 +134,8 @@ impl ErrorHandle {
     /// As [`ErrorHandle::report`].
     pub unsafe fn raise(out: *mut *mut ErrorHandle, status: Status) -> Status {
         if !out.is_null() {
-            unsafe { *out = Box::into_raw(Box::new(Self { status, message: status.message().to_owned() })) };
+            let handle = Self { status, message: status.message().to_owned(), stream_id: None, code: None };
+            unsafe { *out = Box::into_raw(Box::new(handle)) };
         }
 
         status
@@ -165,6 +179,39 @@ pub unsafe extern "C" fn soyokaze_error_message(error: *const ErrorHandle) -> Sl
     match unsafe { error.as_ref() } {
         Some(error) => Slice::text(&error.message),
         None => Slice::ABSENT,
+    }
+}
+
+/// The stream that failed, or `-1` when the failure names none.
+///
+/// Only a [`Status::Stream`] failure names one; everything else took the whole
+/// connection with it. This is the stream identifier a message carries, so it
+/// matches what `soyokaze_message_stream_id` reports.
+///
+/// # Safety
+///
+/// As [`soyokaze_error_status`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_error_stream_id(error: *const ErrorHandle) -> i64 {
+    match unsafe { error.as_ref() }.and_then(|error| error.stream_id) {
+        Some(stream_id) => stream_id.0 as i64,
+        None => -1,
+    }
+}
+
+/// The protocol error code the stream was reset with, or `-1` when there is
+/// none.
+///
+/// Reads as the HTTP/2 or HTTP/3 error code, whichever version raised it.
+///
+/// # Safety
+///
+/// As [`soyokaze_error_status`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_error_code(error: *const ErrorHandle) -> i64 {
+    match unsafe { error.as_ref() }.and_then(|error| error.code) {
+        Some(code) => code as i64,
+        None => -1,
     }
 }
 

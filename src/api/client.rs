@@ -220,8 +220,9 @@ impl Client {
 
         let stream = tokio_boring::connect(config, host, transport).await.map_err(|err| Error::Tls(err.to_string()))?;
         let version = tls::negotiated(stream.ssl().selected_alpn_protocol(), &versions)?;
+        let security = tls::security(stream.ssl());
 
-        self.assemble(version, Box::new(stream), id).await
+        Ok(self.assemble(version, Box::new(stream), id).await?.with_security(security))
     }
 
     /// Opens an HTTP/3 connection over QUIC.

@@ -9,12 +9,10 @@ from .. import ffi
 from ..errors import ProtocolError
 from ..ffi import library
 
-
 def encode(data):
     """Huffman-encodes octets."""
     data = ffi.encoded(data)
     return ffi.take(library.soyokaze_huffman_encode(data, len(data)))
-
 
 def decode(data):
     """Huffman-decodes octets, raising :class:`ProtocolError` on a bad sequence."""

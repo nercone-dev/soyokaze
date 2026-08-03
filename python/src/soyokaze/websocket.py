@@ -14,7 +14,6 @@ from .errors import InvalidError, error_out, raise_for
 from .ffi import library
 from .models import Role
 
-
 class Opcode(enum.IntEnum):
     """What a frame is, as its wire number."""
 
@@ -29,7 +28,6 @@ class Opcode(enum.IntEnum):
         """Whether this is a control frame, which must be short and unfragmented."""
         return bool(self.value & 0x8)
 
-
 class CloseCode(enum.IntEnum):
     """Why a connection is being closed, as its wire number."""
 
@@ -43,7 +41,6 @@ class CloseCode(enum.IntEnum):
     MANDATORY_EXTENSION = 1010
     INTERNAL_ERROR = 1011
 
-
 class Frame:
     """One WebSocket frame, with its payload always unmasked."""
 
@@ -54,7 +51,6 @@ class Frame:
 
     def __repr__(self):
         return f"Frame({self.opcode.name}, {len(self.payload)} octets{'' if self.fin else ', continued'})"
-
 
 class WebSocketConnection:
     """A WebSocket connection.
@@ -101,11 +97,13 @@ class WebSocketConnection:
         raise_for(library.soyokaze_websocket_receive(self.handle, ctypes.byref(fin), ctypes.byref(opcode), ctypes.byref(out), ctypes.byref(error)), error)
         return Frame(Opcode(opcode.value), ffi.take(out), fin.value)
 
-    def send_message(self, payload, opcode=None):
+    def send_message(self, opcode, payload):
         """Sends a whole message as one unfragmented frame.
 
-        ``str`` payloads go as text and ``bytes`` as binary, unless
-        ``opcode`` says otherwise.
+        The mirror of :meth:`receive_message`, which hands back the same pair
+        in the same order, so what one returns the other takes. An ``opcode``
+        of ``None`` takes it from the payload: ``str`` goes as text and
+        ``bytes`` as binary.
         """
         if opcode is None:
             opcode = Opcode.TEXT if isinstance(payload, str) else Opcode.BINARY

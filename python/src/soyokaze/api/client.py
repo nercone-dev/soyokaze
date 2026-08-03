@@ -16,7 +16,6 @@ from ..runtime import default_runtime
 from ..websocket import WebSocketConnection
 from .common import Limits
 
-
 class ClientLimits:
     """The limits a client applies on top of the per-message :class:`Limits`."""
 
@@ -28,7 +27,6 @@ class ClientLimits:
     def build(self):
         """The ``soyokaze_client_limits_t`` this stands for."""
         return ffi.ClientLimits(self.message.build(), self.connection_timeout)
-
 
 class ClientConfig:
     """How a :class:`Client` is configured.
@@ -88,7 +86,6 @@ class ClientConfig:
 
         struct.keepalive = keepalive
         return struct
-
 
 class Connection:
     """A connection of whichever version was negotiated.
@@ -165,7 +162,6 @@ class Connection:
         if self.handle:
             library.soyokaze_connection_close(self.runtime.handle, self.handle)
 
-
 def request_argument(headers, body, version):
     """The consumed request handle for a fetch, or ``None`` when both are absent."""
     if headers is None and body is None:
@@ -178,7 +174,6 @@ def request_argument(headers, body, version):
         message.set_body(body)
 
     return message.take()
-
 
 class Client:
     """An HTTP client.

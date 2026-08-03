@@ -89,9 +89,64 @@ fn every_status_carries_a_description() {
 
 #[test]
 fn a_null_error_reads_as_invalid_rather_than_faulting() {
+    use soyokaze::ffi::errors::{soyokaze_error_code, soyokaze_error_stream_id};
+
     assert_eq!(unsafe { soyokaze_error_status(ptr::null()) }, Status::Invalid);
     assert!(unsafe { soyokaze_error_message(ptr::null()) }.is_absent());
+    assert_eq!(unsafe { soyokaze_error_stream_id(ptr::null()) }, -1);
+    assert_eq!(unsafe { soyokaze_error_code(ptr::null()) }, -1);
     unsafe { soyokaze_error_free(ptr::null_mut()) };
+}
+
+#[test]
+fn a_stream_failure_carries_the_stream_it_names_and_the_code_to_reset_it_by() {
+    use soyokaze::ffi::errors::{soyokaze_error_code, soyokaze_error_stream_id, ErrorHandle};
+    use soyokaze::models::StreamID;
+
+    let failure = soyokaze::Error::stream(StreamID(9), 0x0105, "the peer sent a pseudo-header twice");
+
+    let mut error = ptr::null_mut();
+    assert_eq!(unsafe { ErrorHandle::report(&mut error, &failure) }, Status::Stream);
+    assert!(!error.is_null());
+
+    assert_eq!(unsafe { soyokaze_error_status(error) }, Status::Stream);
+    assert_eq!(unsafe { soyokaze_error_stream_id(error) }, 9, "the stream that failed must cross as a number");
+    assert_eq!(unsafe { soyokaze_error_code(error) }, 0x0105, "the code to reset it by must cross as a number");
+
+    let message = read(unsafe { soyokaze_error_message(error) }).expect("a failure always describes itself");
+    assert!(!message.is_empty());
+
+    unsafe { soyokaze_error_free(error) };
+}
+
+#[test]
+fn a_failure_that_names_no_stream_reads_as_absent_rather_than_zero() {
+    use soyokaze::ffi::errors::{soyokaze_error_code, soyokaze_error_stream_id, ErrorHandle};
+
+    for failure in [
+        soyokaze::Error::Closed,
+        soyokaze::Error::Protocol("bad".into()),
+        soyokaze::Error::Limit("too much".into()),
+        soyokaze::Error::Timeout("too slow".into()),
+        soyokaze::Error::Tls("no handshake".into()),
+        soyokaze::Error::Version("no version".into()),
+        soyokaze::Error::Io(std::io::Error::other("broken")),
+    ] {
+        let mut error = ptr::null_mut();
+        unsafe { ErrorHandle::report(&mut error, &failure) };
+
+        assert_eq!(unsafe { soyokaze_error_stream_id(error) }, -1, "{failure:?} took the whole connection, not one stream");
+        assert_eq!(unsafe { soyokaze_error_code(error) }, -1, "{failure:?} carries no stream error code");
+
+        unsafe { soyokaze_error_free(error) };
+    }
+
+    // A failure the boundary itself raises has no stream behind it either.
+    let mut error = ptr::null_mut();
+    unsafe { ErrorHandle::raise(&mut error, Status::Invalid) };
+    assert_eq!(unsafe { soyokaze_error_stream_id(error) }, -1);
+    assert_eq!(unsafe { soyokaze_error_code(error) }, -1);
+    unsafe { soyokaze_error_free(error) };
 }
 
 #[test]
@@ -620,6 +675,76 @@ fn the_connection_facts_read_as_absent_until_a_connection_sets_them() {
     assert!(unsafe { soyokaze::ffi::models::soyokaze_message_secure(message) });
 
     unsafe { soyokaze_message_free(message) };
+}
+
+#[test]
+fn the_connection_facts_cross_as_the_wire_codes_the_handshake_settled() {
+    use soyokaze::ffi::models::{
+        soyokaze_message_early_data, soyokaze_message_quic, soyokaze_message_quic_version, soyokaze_message_secure,
+        soyokaze_message_tls, soyokaze_message_tls_cipher, soyokaze_message_tls_group, soyokaze_message_tls_version,
+    };
+    use soyokaze::models::{Security, TLSCipher, TLSGroup, TLSVersion};
+
+    let security = Security {
+        secure: true,
+        early_data: true,
+        tls: true,
+        // TLS 1.3, TLS_AES_128_GCM_SHA256 and x25519, as RFC 8446 numbers them.
+        tls_version: Some(TLSVersion(0x0304)),
+        tls_cipher: Some(TLSCipher(0x1301)),
+        tls_group: Some(TLSGroup(0x001d)),
+        quic: false,
+        quic_version: None,
+    };
+
+    let message = soyokaze_message_response(200, Version::V1_1);
+    security.apply(unsafe { &mut *message });
+
+    assert!(unsafe { soyokaze_message_secure(message) });
+    assert!(unsafe { soyokaze_message_early_data(message) });
+    assert!(unsafe { soyokaze_message_tls(message) });
+    assert_eq!(unsafe { soyokaze_message_tls_version(message) }, 0x0304);
+    assert_eq!(unsafe { soyokaze_message_tls_cipher(message) }, 0x1301);
+    assert_eq!(unsafe { soyokaze_message_tls_group(message) }, 0x001d);
+    assert!(!unsafe { soyokaze_message_quic(message) });
+    assert_eq!(unsafe { soyokaze_message_quic_version(message) }, -1);
+
+    unsafe { soyokaze_message_free(message) };
+
+    // A QUIC connection reports itself, and the TLS 1.3 that RFC 9001 makes
+    // the only version it can be carrying.
+    let message = soyokaze_message_response(200, Version::V3_0);
+    Security::quic(1).apply(unsafe { &mut *message });
+
+    assert!(unsafe { soyokaze_message_quic(message) });
+    assert_eq!(unsafe { soyokaze_message_quic_version(message) }, 1);
+    assert!(unsafe { soyokaze_message_tls(message) });
+    assert_eq!(unsafe { soyokaze_message_tls_version(message) }, 0x0304);
+    assert!(unsafe { soyokaze_message_secure(message) });
+
+    unsafe { soyokaze_message_free(message) };
+}
+
+#[test]
+fn every_role_crosses_as_the_number_the_header_gives_it() {
+    use soyokaze::ffi::api::client::role;
+    use soyokaze::models::Role;
+
+    assert_eq!(role(Role::UserAgent), 0);
+    assert_eq!(role(Role::Origin), 1);
+    assert_eq!(role(Role::Proxy), 2);
+    assert_eq!(role(Role::Gateway), 3);
+    assert_eq!(role(Role::Tunnel), 4, "a tunnel is neither a client nor a server, and must not read as one");
+
+    let numbers: Vec<u32> = [Role::UserAgent, Role::Origin, Role::Proxy, Role::Gateway, Role::Tunnel]
+        .into_iter()
+        .map(role)
+        .collect();
+
+    let mut distinct = numbers.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), numbers.len(), "no two roles may share a number");
 }
 
 #[test]
