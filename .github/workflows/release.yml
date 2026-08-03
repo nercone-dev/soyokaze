@@ -337,11 +337,11 @@ jobs:
 
       - name: Copy the shared library into the package (Linux)
         if: runner.os == 'Linux'
-        run: cp target/release/libsoyokaze.so python/soyokaze/
+        run: cp target/release/libsoyokaze.so python/src/soyokaze/
 
       - name: Copy the shared library into the package (macOS)
         if: runner.os == 'macOS'
-        run: cp target/release/libsoyokaze.dylib python/soyokaze/
+        run: cp target/release/libsoyokaze.dylib python/src/soyokaze/
 
       - name: Make a CPython interpreter available
         if: runner.os == 'Linux'
