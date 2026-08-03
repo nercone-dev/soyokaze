@@ -14,6 +14,18 @@ uv pip install soyokaze
 
 They locate the shared library through, in order: the `SOYOKAZE_LIBRARY` environment variable, the copy bundled with the package, the crate's own `target/{release,debug}` directory when run from within the repository, and the system loader.
 
+## Examples
+
+[`examples/`](examples/) holds a server and a client in one process over loopback TCP, which needs no network access and no certificate, and its WebSocket counterpart:
+
+```bash
+uv run examples/loopback.py
+```
+
+```bash
+uv run examples/websocket_loopback.py
+```
+
 ## Links
 - [docs.rs](https://docs.rs/soyokaze/) - Documentation (for The Rust version)
 - [deepwiki.com](https://deepwiki.com/nercone-dev/soyokaze/) - Documentation; Automatically generated.

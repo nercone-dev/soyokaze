@@ -31,6 +31,26 @@ uv pip install soyokaze
 
 They locate the shared library through, in order: the `SOYOKAZE_LIBRARY` environment variable, the copy bundled with the package, the crate's own `target/{release,debug}` directory when run from within the repository, and the system loader.
 
+## Examples
+
+[`examples/`](examples/) holds the same program in each language: a server and a client in one process over loopback TCP, which needs no network access and no certificate.
+
+```bash
+cargo run --example loopback
+```
+
+```bash
+cargo build --lib
+cc -std=c11 -Iinclude examples/loopback.c -Ltarget/debug -lsoyokaze -o loopback
+LD_LIBRARY_PATH=target/debug ./loopback  # DYLD_LIBRARY_PATH=target/debug on macOS
+```
+
+```bash
+cd python && uv run examples/loopback.py
+```
+
+[`websocket_loopback.rs`](examples/websocket_loopback.rs), [`websocket_loopback.c`](examples/websocket_loopback.c) and [`python/examples/websocket_loopback.py`](python/examples/websocket_loopback.py) do the same for a WebSocket echo server.
+
 ## Development
 
 ```bash
