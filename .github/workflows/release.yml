@@ -16,7 +16,40 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  update:
+    runs-on: ubuntu-latest
+    if: "!github.event.release.prerelease"
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Update version in Cargo.toml and pyproject.toml
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
+          sed -i "s/^version = .*/version = \"${VERSION}\"/" Cargo.toml
+          sed -i "s/^version = .*/version = \"${VERSION}\"/" python/pyproject.toml
+          echo "Updated Cargo.toml and python/pyproject.toml for releasing [Soyokaze ${VERSION}]"
+
+      - name: Commit and push version update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add Cargo.toml python/pyproject.toml
+          if git diff --cached --quiet; then
+            echo "Cargo.toml already at ${{ github.event.release.tag_name }}, skipping commit"
+          else
+            git commit -m "Release ${{ github.event.release.tag_name }}"
+            git push origin main
+          fi
+
   test:
+    needs: update
     runs-on: ${{ matrix.os }}
     if: "!github.event.release.prerelease"
     strategy:
@@ -52,65 +85,8 @@ jobs:
       - name: Run tests
         run: cargo test --all-features
 
-  ffi:
-    runs-on: ${{ matrix.os }}
-    if: "!github.event.release.prerelease"
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install system dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
-
-      - name: Install system dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: brew install cmake go
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ffi-${{ matrix.target }}
-
-      - name: Build every library form
-        run: cargo build --lib
-
-      - name: Build and run the C test against the shared library
-        run: |
-          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c -Ltarget/debug -lsoyokaze -o ffi-shared
-          case "$RUNNER_OS" in
-            Linux) LD_LIBRARY_PATH=target/debug ./ffi-shared ;;
-            macOS) DYLD_LIBRARY_PATH=target/debug ./ffi-shared ;;
-          esac
-
-      - name: Build and run the C test against the static library
-        env:
-          CARGO_TERM_COLOR: never
-        run: |
-          libs=$(cargo rustc --lib --crate-type staticlib -- --print native-static-libs 2>&1 \
-                 | sed -n 's/^note: native-static-libs: //p' | tail -n1)
-          if [ -z "$libs" ]; then
-            echo "::error::rustc reported no native static libs; the link would fail obscurely"
-            exit 1
-          fi
-          echo "native static libs: $libs"
-          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c target/debug/libsoyokaze.a $libs -o ffi-static
-          ./ffi-static
-
   doc:
+    needs: [update, test]
     runs-on: ubuntu-latest
     if: "!github.event.release.prerelease"
 
@@ -132,41 +108,8 @@ jobs:
       - name: Build the documentation
         run: cargo doc --no-deps --all-features
 
-  update:
-    needs: [test, ffi, doc]
-    runs-on: ubuntu-latest
-    if: "!github.event.release.prerelease"
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: main
-
-      - name: Update version in Cargo.toml and pyproject.toml
-        run: |
-          TAG="${{ github.event.release.tag_name }}"
-          VERSION="${TAG#v}"
-          sed -i "s/^version = .*/version = \"${VERSION}\"/" Cargo.toml
-          sed -i "s/^version = .*/version = \"${VERSION}\"/" python/pyproject.toml
-          echo "Updated Cargo.toml and python/pyproject.toml for releasing [Soyokaze ${VERSION}]"
-
-      - name: Commit and push version update
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git add Cargo.toml python/pyproject.toml
-          if git diff --cached --quiet; then
-            echo "Cargo.toml already at ${{ github.event.release.tag_name }}, skipping commit"
-          else
-            git commit -m "Release ${{ github.event.release.tag_name }}"
-            git push origin main
-          fi
-
-  assets:
-    needs: update
+  build:
+    needs: [update, test]
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -261,31 +204,67 @@ jobs:
           TAG: ${{ github.event.release.tag_name }}
           GH_TOKEN: ${{ github.token }}
 
-  publish:
-    needs: assets
-    runs-on: ubuntu-latest
+  build-ffi:
+    needs: [update, test]
+    runs-on: ${{ matrix.os }}
+    if: "!github.event.release.prerelease"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
 
     steps:
       - uses: actions/checkout@v5
-        with:
-          ref: main
 
-      - name: Install system dependencies
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake go
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: publish
+          key: ffi-${{ matrix.target }}
 
-      - name: Publish to crates.io
-        run: cargo publish
+      - name: Build every library form
+        run: cargo build --lib
+
+      - name: Build and run the C test against the shared library
+        run: |
+          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c -Ltarget/debug -lsoyokaze -o ffi-shared
+          case "$RUNNER_OS" in
+            Linux) LD_LIBRARY_PATH=target/debug ./ffi-shared ;;
+            macOS) DYLD_LIBRARY_PATH=target/debug ./ffi-shared ;;
+          esac
+
+      - name: Build and run the C test against the static library
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_TERM_COLOR: never
+        run: |
+          libs=$(cargo rustc --lib --crate-type staticlib -- --print native-static-libs 2>&1 \
+                 | sed -n 's/^note: native-static-libs: //p' | tail -n1)
+          if [ -z "$libs" ]; then
+            echo "::error::rustc reported no native static libs; the link would fail obscurely"
+            exit 1
+          fi
+          echo "native static libs: $libs"
+          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c target/debug/libsoyokaze.a $libs -o ffi-static
+          ./ffi-static
 
-  python-wheels:
-    needs: update
+  build-python:
+    needs: [update, test]
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
     permissions:
@@ -318,7 +297,10 @@ jobs:
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
-        run: dnf install -y cmake clang clang-devel golang perl curl git
+        run: |
+          dnf install -y 'dnf-command(config-manager)'
+          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf install -y cmake clang clang-devel golang perl curl git gh
 
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
@@ -371,8 +353,31 @@ jobs:
           TAG: ${{ github.event.release.tag_name }}
           GH_TOKEN: ${{ github.token }}
 
-  python-publish:
-    needs: python-wheels
+  publish:
+    needs: [update, test, build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: publish
+
+      - name: Publish to crates.io
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-python:
+    needs: [update, test, build-python]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

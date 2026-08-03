@@ -50,7 +50,28 @@ jobs:
       - name: Run tests
         run: cargo test --all-features
 
-  ffi:
+  doc:
+    runs-on: ubuntu-latest
+
+    env:
+      RUSTDOCFLAGS: -D warnings
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: doc
+
+      - name: Build the documentation
+        run: cargo doc --no-deps --all-features
+
+  build-ffi:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -107,7 +128,7 @@ jobs:
           cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c target/debug/libsoyokaze.a $libs -o ffi-static
           ./ffi-static
 
-  python:
+  build-python:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -148,24 +169,3 @@ jobs:
       - name: Run the Python test suite
         working-directory: python
         run: uv run pytest
-
-  doc:
-    runs-on: ubuntu-latest
-
-    env:
-      RUSTDOCFLAGS: -D warnings
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: doc
-
-      - name: Build the documentation
-        run: cargo doc --no-deps --all-features
