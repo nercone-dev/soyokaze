@@ -3,20 +3,11 @@ HTTP/1/2/3 Library Crate
 
 ## Overview
 
-Soyokaze speaks HTTP/1.1, HTTP/2 and HTTP/3 through one set of types. A `Message` carries a request or a response regardless of the version that framed it, and every connection implements the same `Connection` trait, so code written once runs unchanged over any of the three. `Client` dials an origin and `Server` binds ports and accepts connections, negotiating the version by ALPN over TLS, by sniffing the HTTP/2 preface on plaintext, or by the port itself for QUIC — a handler never has to care which it was.
+An HTTP/1/2/3 implementation written in Rust.
 
-The crate is arranged in layers, each usable on its own: `api` for the entry points, `protocol` for the per-version connections over a shared vocabulary, and `helpers` for the codecs (Huffman, HPACK, QPACK) and small utilities the versions share. TLS runs on BoringSSL throughout, and a C ABI (`ffi`) exposes the same surface to callers outside Rust.
+It uses BoringSSL (`boring`/`boring-sys`/`tokio-boring`) for TLS handling, and the BoringSSL-based Quiche (`quiche`/`tokio-quiche`) for QUIC handling.
 
-## Highlights
-
-- **One API across three protocol versions** — HTTP/1.1, HTTP/2 and HTTP/3 (over QUIC) are driven through the same `Connection` and `AnyConnection` traits, with version negotiated automatically and corresponding pieces (client/server, request/response, encoder/decoder) kept as drop-in replacements for one another wherever the protocol allows it.
-- **WebSocket over any version** — the handshake differs (`Upgrade` on HTTP/1.1, extended `CONNECT` on HTTP/2 and HTTP/3) but both hand back the same `WebSocketConnection`, with masking, control-frame and UTF-8 rules enforced in both directions.
-- **TLS with Encrypted Client Hello** — built on BoringSSL, with ECH support so a watcher sees only the public server name, plus certificate/key loading that detects DER vs. PEM and unwraps PKCS#12 archives automatically.
-- **Built-in admission control** — a `Gate` bounds total and per-address connection counts and sliding-window rate limits before a handler is ever reached, and `Cluster` runs one runtime per core under `SO_REUSEPORT` so the kernel spreads connections between them.
-- **Cookies and HSTS handled for you** — `Client` keeps a `CookieJar` and an `HstsStore` by default, consulting and updating both automatically on every request.
-- **A C ABI for other languages** — every symbol is `extern "C"` and prefixed `soyokaze_`, built as `libsoyokaze.so`/`.dylib`/`.dll` with a matching `include/soyokaze.h`, so the crate is usable from outside Rust without a second implementation to keep in sync.
-- **Python bindings over that same ABI** — the `python/` package wraps the shared library through `ctypes`, mirroring the crate module for module (`soyokaze.Client`, `soyokaze.Server`, cookies, HSTS, TLS identities and ECH, WebSocket, and the HPACK/QPACK/Huffman codecs), so Python exercises exactly the surface the header promises.
-- **Tested for both correctness and performance** — fuzz targets cover HPACK, QPACK, Huffman and full connection handling end to end, and dedicated benchmarks track the codecs and protocol pipeline.
+C FFI and Python bindings are also available.
 
 ## Requirements
 
