@@ -16,59 +16,74 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  test-linux:
-    runs-on: ubuntu-latest
+  test:
+    runs-on: ${{ matrix.os }}
     if: "!github.event.release.prerelease"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
 
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install system dependencies
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: test-linux
-
-      - name: Run tests
-        run: cargo test --all-features
-
-  test-macos:
-    runs-on: macos-latest
-    if: "!github.event.release.prerelease"
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install system dependencies
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
         run: brew install cmake go
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test-macos
+          key: test-${{ matrix.target }}
 
       - name: Run tests
         run: cargo test --all-features
 
-  ffi-linux:
-    runs-on: ubuntu-latest
+  ffi:
+    runs-on: ${{ matrix.os }}
     if: "!github.event.release.prerelease"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
 
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install system dependencies
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake go
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ffi-linux
+          key: ffi-${{ matrix.target }}
 
       - name: Build every library form
         run: cargo build --lib
@@ -76,45 +91,10 @@ jobs:
       - name: Build and run the C test against the shared library
         run: |
           cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c -Ltarget/debug -lsoyokaze -o ffi-shared
-          LD_LIBRARY_PATH=target/debug ./ffi-shared
-
-      - name: Build and run the C test against the static library
-        env:
-          CARGO_TERM_COLOR: never
-        run: |
-          libs=$(cargo rustc --lib --crate-type staticlib -- --print native-static-libs 2>&1 \
-                 | sed -n 's/^note: native-static-libs: //p' | tail -n1)
-          if [ -z "$libs" ]; then
-            echo "::error::rustc reported no native static libs; the link would fail obscurely"
-            exit 1
-          fi
-          echo "native static libs: $libs"
-          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c target/debug/libsoyokaze.a $libs -o ffi-static
-          ./ffi-static
-
-  ffi-macos:
-    runs-on: macos-latest
-    if: "!github.event.release.prerelease"
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install system dependencies
-        run: brew install cmake go
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ffi-macos
-
-      - name: Build every library form
-        run: cargo build --lib
-
-      - name: Build and run the C test against the shared library
-        run: |
-          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c -Ltarget/debug -lsoyokaze -o ffi-shared
-          DYLD_LIBRARY_PATH=target/debug ./ffi-shared
+          case "$RUNNER_OS" in
+            Linux) LD_LIBRARY_PATH=target/debug ./ffi-shared ;;
+            macOS) DYLD_LIBRARY_PATH=target/debug ./ffi-shared ;;
+          esac
 
       - name: Build and run the C test against the static library
         env:
@@ -153,7 +133,7 @@ jobs:
         run: cargo doc --no-deps --all-features
 
   update:
-    needs: [test-linux, test-macos, ffi-linux, ffi-macos, doc]
+    needs: [test, ffi, doc]
     runs-on: ubuntu-latest
     if: "!github.event.release.prerelease"
     permissions:
@@ -196,6 +176,8 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: macos-15-intel
@@ -302,69 +284,24 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  python-wheels-linux:
-    needs: update
-    runs-on: ubuntu-latest
-    container: quay.io/pypa/manylinux_2_28_x86_64
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: main
-
-      - name: Install system dependencies
-        run: dnf install -y cmake clang clang-devel golang perl curl git
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: python-wheels-linux
-
-      - name: Build the shared library
-        run: cargo build --release --lib
-
-      - name: Copy the shared library into the package
-        run: cp target/release/libsoyokaze.so python/soyokaze/
-
-      - name: Make a CPython interpreter available
-        run: echo "/opt/python/cp312-cp312/bin" >> "$GITHUB_PATH"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
-
-      - name: Build the wheel
-        working-directory: python
-        run: uv build --wheel
-
-      - name: Tag the wheel for manylinux
-        working-directory: python
-        run: uvx --from wheel wheel tags --platform-tag manylinux_2_28_x86_64 --remove dist/*.whl
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: python-wheel-x86_64-unknown-linux-gnu
-          path: python/dist/*.whl
-          if-no-files-found: error
-
-      - name: Attach to the release
-        run: gh release upload "$TAG" python/dist/*.whl --clobber
-        env:
-          TAG: ${{ github.event.release.tag_name }}
-          GH_TOKEN: ${{ github.token }}
-
-  python-wheels-macos:
+  python-wheels:
     needs: update
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            container: quay.io/pypa/manylinux_2_28_x86_64
+            wheel_tag: manylinux_2_28_x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            container: quay.io/pypa/manylinux_2_28_aarch64
+            wheel_tag: manylinux_2_28_aarch64
           - os: macos-latest
             target: aarch64-apple-darwin
             deployment_target: "11.0"
@@ -379,7 +316,12 @@ jobs:
         with:
           ref: main
 
-      - name: Install system dependencies
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: dnf install -y cmake clang clang-devel golang perl curl git
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
         run: brew install cmake go
 
       - uses: dtolnay/rust-toolchain@stable
@@ -393,8 +335,17 @@ jobs:
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
 
-      - name: Copy the shared library into the package
+      - name: Copy the shared library into the package (Linux)
+        if: runner.os == 'Linux'
+        run: cp target/release/libsoyokaze.so python/soyokaze/
+
+      - name: Copy the shared library into the package (macOS)
+        if: runner.os == 'macOS'
         run: cp target/release/libsoyokaze.dylib python/soyokaze/
+
+      - name: Make a CPython interpreter available
+        if: runner.os == 'Linux'
+        run: echo "/opt/python/cp312-cp312/bin" >> "$GITHUB_PATH"
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -421,7 +372,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
 
   python-publish:
-    needs: [python-wheels-linux, python-wheels-macos]
+    needs: python-wheels
     runs-on: ubuntu-latest
 
     steps:
