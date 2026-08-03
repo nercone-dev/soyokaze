@@ -3,7 +3,8 @@ use tokio::io::AsyncWriteExt;
 
 use soyokaze::helpers::hpack::HeaderField;
 use soyokaze::api::common::Limits;
-use soyokaze::models::{Body, ConnectionID, Headers, Message, Method, Role, StreamID, Version};
+use soyokaze::helpers::hsts::HstsPolicy;
+use soyokaze::models::{Body, ConnectionID, Headers, Message, Method, Role, Security, StreamID, Version};
 use soyokaze::protocol::base::Connection;
 use soyokaze::protocol::common;
 use soyokaze::protocol::h2::{self, Frame, FrameHeader, FrameType, H2Connection, Settings, StreamState};
@@ -369,6 +370,40 @@ async fn a_request_and_response_cross_a_connection() {
     let answer = client.receive().await.expect("the response did not arrive");
     assert_eq!(answer.status_code, Some(200));
     assert_eq!(answer.body, Some(Body::Data(bytes::Bytes::from_static(b"thanks"))));
+}
+
+#[tokio::test]
+async fn a_configured_hsts_policy_rides_only_on_a_secure_transport() {
+    for secure in [false, true] {
+        let (client_pipe, server_pipe) = tokio::io::duplex(256 * 1024);
+
+        let mut client = H2Connection::new(client_pipe, Role::UserAgent, id(), limits());
+        let mut server = H2Connection::new(server_pipe, Role::Origin, id(), limits())
+            .with_hsts(Some(HstsPolicy::new(600)))
+            .with_security(Security { secure, ..Security::default() });
+
+        client.start().await.expect("the client preface did not send");
+        server.start().await.expect("the server did not accept the preface");
+
+        let mut request = Message::request(Method::GET, "/", Version::V2_0);
+        request.headers = Some(Headers::new());
+        request.secure = true;
+        client.send(request).await.expect("the request did not send");
+
+        let received = server.receive().await.expect("the request did not arrive");
+
+        let mut response = Message::text("ok", Version::V2_0);
+        response.stream_id = received.stream_id;
+        server.send(response).await.expect("the response did not send");
+
+        let answer = client.receive().await.expect("the response did not arrive");
+        let policy = answer.headers.as_ref().and_then(|headers| headers.get("strict-transport-security"));
+
+        match secure {
+            false => assert_eq!(policy, None, "a plaintext response must not advertise HSTS"),
+            true => assert_eq!(policy, Some("max-age=600"), "a secure response must advertise the configured policy"),
+        }
+    }
 }
 
 #[tokio::test]

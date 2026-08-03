@@ -1332,9 +1332,7 @@ impl H3Connection {
     pub async fn send_message(&mut self, message: Message) -> Result<(), Error> {
         let mut message = message;
         if self.role.is_server() && message.is_response() {
-            if self.hsts.is_some() {
-                message.secure = true;
-            }
+            message.secure = self.security.secure;
             crate::finalizer::finalize_response(&mut message, crate::finalizer::date_cache(), self.hsts.as_ref());
         }
 

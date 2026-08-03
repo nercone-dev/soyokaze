@@ -934,7 +934,8 @@ where
         }
     }
 
-    /// Attaches an HSTS policy to be added to the responses this connection sends.
+    /// Attaches an HSTS policy to be added to the responses this connection
+    /// sends, if the transport underneath it is a secure one.
     pub fn with_hsts(mut self, hsts: Option<crate::helpers::hsts::HstsPolicy>) -> Self {
         self.hsts = hsts;
         self
@@ -1029,11 +1030,14 @@ where
 
     /// Writes one whole message: start line, fields, and body.
     ///
-    /// A server-side response is finalised first, so `Date`, `Server` and the
-    /// HSTS policy are attached. The body is framed as the fields already say,
-    /// and `Content-Length` is added when neither `Transfer-Encoding` nor an
-    /// existing `Content-Length` says otherwise and the status admits a body.
-    /// Bodies up to [`INLINE_BODY_LIMIT`] go out together with the head.
+    /// A server-side response is stamped with what the transport turned out to
+    /// be and then finalised, so `Date`, `Server` and — over a secure transport
+    /// alone — the HSTS policy are attached.
+    ///
+    /// The body is framed as the fields already say, and `Content-Length` is
+    /// added when neither `Transfer-Encoding` nor an existing `Content-Length`
+    /// says otherwise and the status admits a body. Bodies up to
+    /// [`INLINE_BODY_LIMIT`] go out together with the head.
     ///
     /// # Errors
     ///
@@ -1049,9 +1053,7 @@ where
 
         let mut message = message;
         if self.role.is_server() && message.is_response() {
-            if self.hsts.is_some() {
-                message.secure = true;
-            }
+            message.secure = self.security.secure;
             crate::finalizer::finalize_response(&mut message, crate::finalizer::date_cache(), self.hsts.as_ref());
         }
 

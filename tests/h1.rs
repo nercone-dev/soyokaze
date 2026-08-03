@@ -2,7 +2,8 @@ use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use soyokaze::api::common::Limits;
-use soyokaze::models::{Body, ConnectionID, HeaderCase, Headers, Message, Method, Role, Version};
+use soyokaze::helpers::hsts::HstsPolicy;
+use soyokaze::models::{Body, ConnectionID, HeaderCase, Headers, Message, Method, Role, Security, Version};
 use soyokaze::protocol::base::Connection;
 use soyokaze::protocol::common::{self, Buffer, IDLE_CAPACITY};
 use soyokaze::protocol::h1::{self, BodyLength, H1Connection};
@@ -274,6 +275,31 @@ async fn a_request_and_response_cross_a_connection() {
     assert_eq!(answer.status_code, Some(200));
     assert_eq!(answer.body, Some(Body::Data(bytes::Bytes::from_static(b"thanks"))));
     assert!(answer.headers.as_ref().is_some_and(|headers| headers.contains("date")), "a server must send a Date");
+}
+
+#[tokio::test]
+async fn a_configured_hsts_policy_rides_only_on_a_secure_transport() {
+    for secure in [false, true] {
+        let (client_pipe, server_pipe) = tokio::io::duplex(64 * 1024);
+
+        let mut client = H1Connection::new(client_pipe, Role::UserAgent, id(), limits());
+        let mut server = H1Connection::new(server_pipe, Role::Origin, id(), limits())
+            .with_hsts(Some(HstsPolicy::new(600)))
+            .with_security(Security { secure, ..Security::default() });
+
+        client.send(Message::request(Method::GET, "/", Version::V1_1)).await.expect("the request did not send");
+        server.receive().await.expect("the request did not arrive");
+
+        server.send(Message::text("ok", Version::V1_1)).await.expect("the response did not send");
+
+        let answer = client.receive().await.expect("the response did not arrive");
+        let policy = answer.headers.as_ref().and_then(|headers| headers.get("strict-transport-security"));
+
+        match secure {
+            false => assert_eq!(policy, None, "a plaintext response must not advertise HSTS"),
+            true => assert_eq!(policy, Some("max-age=600"), "a secure response must advertise the configured policy"),
+        }
+    }
 }
 
 #[tokio::test]
