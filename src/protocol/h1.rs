@@ -362,8 +362,9 @@ pub fn is_token(text: &str) -> bool {
 }
 
 /// [`is_token`] over raw octets.
+#[inline]
 pub fn is_token_bytes(text: &[u8]) -> bool {
-    !text.is_empty() && text.iter().all(|byte| OCTETS[*byte as usize] & TOKEN != 0)
+    !text.is_empty() && scan::all_in_class(text, &OCTETS, TOKEN)
 }
 
 /// Whether octets may be sent as a field value; see [`scan::is_field_value`].
@@ -495,32 +496,29 @@ pub struct FieldSpans {
 
 /// The offset of the colon that ends a field name.
 ///
+/// The colon is found first and the name checked afterwards, since both go
+/// [`scan::LANES`] octets at a time that way, where walking the line once
+/// looking for either would have to stop on every octet.
+///
 /// # Errors
 ///
 /// Returns [`Error::Protocol`] when the name is empty, carries a non-token
 /// octet, or the line has no colon at all.
 #[inline]
 pub fn name_end(line: &[u8]) -> Result<usize, Error> {
-    let mut at = 0;
+    let Some(at) = scan::find(line, b':') else {
+        return Err(Error::Protocol(format!("field line {:?} has no colon", String::from_utf8_lossy(line))));
+    };
 
-    while let Some(octet) = line.get(at) {
-        if *octet == b':' {
-            if at == 0 {
-                return Err(Error::Protocol("field line has an empty name".into()));
-            }
-
-            return Ok(at);
-        }
-
-        if OCTETS[*octet as usize] & TOKEN == 0 {
-            let name = scan::find(line, b':').unwrap_or(line.len());
-            return Err(Error::Protocol(format!("field name {:?} is not a token", String::from_utf8_lossy(&line[..name]))));
-        }
-
-        at += 1;
+    if at == 0 {
+        return Err(Error::Protocol("field line has an empty name".into()));
     }
 
-    Err(Error::Protocol(format!("field line {:?} has no colon", String::from_utf8_lossy(line))))
+    if !scan::all_in_class(&line[..at], &OCTETS, TOKEN) {
+        return Err(Error::Protocol(format!("field name {:?} is not a token", String::from_utf8_lossy(&line[..at]))));
+    }
+
+    Ok(at)
 }
 
 /// Locates the name and value within a field line, and classifies the value.
@@ -1106,7 +1104,7 @@ where
             return Err(error);
         }
 
-        match (chunked, body) {
+        let trailing = match (chunked, body) {
             (true, body) => {
                 if let Some(body) = body.filter(|body| !body.is_empty()) {
                     write_chunk_into(&body, &mut out);
@@ -1118,27 +1116,32 @@ where
                 }
                 out.extend_from_slice(b"\r\n");
 
-                self.write_flushed(&out).await?;
+                None
             }
 
-            (false, Some(body)) => {
-                if inline {
-                    out.extend_from_slice(&body);
-                    self.write_flushed(&out).await?;
-                } else {
-                    self.write(&out).await?;
-                    self.write_flushed(&body).await?;
-                }
+            (false, Some(body)) if inline => {
+                out.extend_from_slice(&body);
+                None
             }
 
-            (false, None) => self.write_flushed(&out).await?,
+            (false, body) => body,
+        };
+
+        let method = message.method;
+        drop(message);
+
+        if let Some(body) = trailing {
+            self.write(&out).await?;
+            self.write_flushed(&body).await?;
+        } else {
+            self.write_flushed(&out).await?;
         }
 
         out.clear();
         common::reclaim(&mut out);
         self.scratch = out;
 
-        if let Some(method) = message.method {
+        if let Some(method) = method {
             self.pending.push_back(method);
         }
 

@@ -32,14 +32,24 @@ pub fn random(out: &mut [u8]) -> Result<(), Error> {
     boring::rand::rand_bytes(out).map_err(|_| Error::Tls("BoringSSL has no source of randomness".into()))
 }
 
-/// A timeout in seconds as a [`Duration`], or `None` when it means "wait forever".
+/// Whether a timeout in seconds asks for a deadline at all.
 ///
 /// Zero, negative and non-finite values all disable the timeout, which is what
 /// the [`Limits`] fields are documented to do.
 ///
 /// [`Limits`]: crate::api::common::Limits
+#[inline]
+pub fn timed(seconds: f64) -> bool {
+    seconds.is_finite() && seconds > 0.0
+}
+
+/// A timeout in seconds as a [`Duration`], or `None` when it means "wait forever".
+///
+/// Values [`timed`] rejects yield `None`. A value too large for a [`Duration`]
+/// is capped at [`Duration::MAX`] rather than panicking — a deadline that far
+/// out and no deadline at all are the same thing to a connection.
 pub fn duration(seconds: f64) -> Option<Duration> {
-    (seconds.is_finite() && seconds > 0.0).then(|| Duration::from_secs_f64(seconds))
+    timed(seconds).then(|| Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX))
 }
 
 /// Runs an operation under a deadline.
@@ -58,15 +68,17 @@ pub fn duration(seconds: f64) -> Option<Duration> {
 ///
 /// Returns [`Error::Timeout`] when the deadline passes first.
 pub async fn within<T>(seconds: f64, operation: impl Future<Output = T>) -> Result<T, Error> {
-    let Some(wait) = duration(seconds) else {
+    if !timed(seconds) {
         return Ok(operation.await);
-    };
+    }
 
     let mut operation = std::pin::pin!(operation);
 
     if let Poll::Ready(value) = std::future::poll_fn(|cx| Poll::Ready(operation.as_mut().poll(cx))).await {
         return Ok(value);
     }
+
+    let wait = duration(seconds).unwrap_or(Duration::MAX);
 
     tokio::time::timeout(wait, operation)
         .await

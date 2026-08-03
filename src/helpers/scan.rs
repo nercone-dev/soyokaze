@@ -135,16 +135,22 @@ pub fn classify_field_value(text: &[u8]) -> u8 {
     let mut obs_text = 0u64;
     let mut offset = 0;
 
-    while offset + LANES <= text.len() {
-        let word = word_at(text, offset);
-
+    let classify = |word: u64, control: &mut u64, obs_text: &mut u64| {
         let tab = marks_zero(word ^ LOW.wrapping_mul(b'\t' as u64));
         let del = marks_zero(word ^ LOW.wrapping_mul(0x7f));
 
-        control |= (holds_less(word, 0x20) & !tab) | del;
-        obs_text |= word & HIGH;
+        *control |= (holds_less(word, 0x20) & !tab) | del;
+        *obs_text |= word & HIGH;
+    };
 
+    while offset + LANES <= text.len() {
+        classify(word_at(text, offset), &mut control, &mut obs_text);
         offset += LANES;
+    }
+
+    if offset < text.len() && text.len() >= LANES {
+        classify(word_at(text, text.len() - LANES), &mut control, &mut obs_text);
+        offset = text.len();
     }
 
     let (control, obs_text) = text[offset..].iter().fold((control != 0, obs_text != 0), |(control, obs_text), octet| {
@@ -163,4 +169,36 @@ pub fn classify_field_value(text: &[u8]) -> u8 {
 #[inline]
 pub fn is_field_value(text: &[u8]) -> bool {
     classify_field_value(text) & VALUE_CONTROL == 0
+}
+
+/// Whether every octet of `text` is one `table` marks with `mask`.
+///
+/// The classes a scattered set of octets forms — a token, say — are not
+/// something the bit-twiddling above can express, so this stays a table
+/// lookup. What it does do is take [`LANES`] octets at a time and combine the
+/// answers rather than branch on each one, which lets the loads run ahead of
+/// each other instead of the loop stalling on every octet.
+///
+/// An empty `text` is vacuously all of anything, and answers `true`.
+#[inline]
+pub fn all_in_class(text: &[u8], table: &[u8; 256], mask: u8) -> bool {
+    let mut held = mask;
+    let mut chunks = text.chunks_exact(LANES);
+
+    for chunk in &mut chunks {
+        held &= table[chunk[0] as usize]
+            & table[chunk[1] as usize]
+            & table[chunk[2] as usize]
+            & table[chunk[3] as usize]
+            & table[chunk[4] as usize]
+            & table[chunk[5] as usize]
+            & table[chunk[6] as usize]
+            & table[chunk[7] as usize];
+    }
+
+    for octet in chunks.remainder() {
+        held &= table[*octet as usize];
+    }
+
+    held & mask != 0
 }

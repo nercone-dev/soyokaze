@@ -4,7 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use soyokaze::api::common::Limits;
 use soyokaze::models::{Body, ConnectionID, HeaderCase, Headers, Message, Method, Role, Version};
 use soyokaze::protocol::base::Connection;
-use soyokaze::protocol::common::{Buffer, IDLE_CAPACITY};
+use soyokaze::protocol::common::{self, Buffer, IDLE_CAPACITY};
 use soyokaze::protocol::h1::{self, BodyLength, H1Connection};
 use soyokaze::Error;
 
@@ -605,4 +605,45 @@ async fn a_small_request_does_not_reserve_a_large_read_buffer() {
         "a keep-alive connection carrying small requests holds {} octets of read buffer",
         server.buffer_capacity()
     );
+}
+
+#[test]
+fn a_field_name_is_taken_up_to_its_colon() {
+    assert_eq!(h1::name_end(b"host: example.com").ok(), Some(4), "a well-formed name did not end at its colon");
+    assert_eq!(h1::name_end(b"x:").ok(), Some(1), "a name followed by an empty value did not end at its colon");
+
+    assert_eq!(h1::name_end(b"host: a:b").ok(), Some(4), "a colon in the value moved the end of the name");
+
+    assert!(matches!(h1::name_end(b":empty"), Err(Error::Protocol(_))), "an empty name was accepted");
+    assert!(matches!(h1::name_end(b"no-colon"), Err(Error::Protocol(_))), "a line with no colon was accepted");
+
+    for octet in (0..=255u8).filter(|octet| *octet != b':') {
+        let token = octet.is_ascii_alphanumeric()
+            || matches!(octet, b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~');
+
+        for at in 0..14usize {
+            let mut line = vec![b'x'; 14];
+            line[at] = octet;
+            line.extend_from_slice(b": value");
+
+            let end = h1::name_end(&line).ok();
+            assert_eq!(end.is_some(), token, "{octet:#04x} at {at} of a field name");
+
+            if token {
+                assert_eq!(end, Some(14), "a valid name did not end at its colon");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_timeout_only_means_a_deadline_when_it_names_one() {
+    for seconds in [0.0, -1.0, -0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(!common::timed(seconds), "{seconds} was read as a deadline");
+        assert_eq!(common::duration(seconds), None, "{seconds} yielded a deadline");
+    }
+
+    assert_eq!(common::duration(1.5), Some(std::time::Duration::from_millis(1500)), "a plain timeout was not converted");
+
+    assert_eq!(common::duration(f64::MAX), Some(std::time::Duration::MAX), "an enormous timeout did not cap");
 }

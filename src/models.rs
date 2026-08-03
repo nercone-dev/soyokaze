@@ -537,11 +537,13 @@ impl Headers {
     }
 
     /// The number of fields, counting repeats separately.
+    #[inline]
     pub fn len(&self) -> usize {
         self.fields.len()
     }
 
     /// Whether the section holds no fields at all.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.fields.is_empty()
     }
@@ -572,11 +574,13 @@ impl Headers {
     }
 
     /// Whether any field carries this name.
+    #[inline]
     pub fn contains(&self, name: &str) -> bool {
         !self.absent(name) && self.fields.iter().any(|(stored, _)| Self::named(stored, name))
     }
 
     /// The value of the first field with this name.
+    #[inline]
     pub fn get(&self, name: &str) -> Option<&str> {
         if self.absent(name) {
             return None;
@@ -586,6 +590,7 @@ impl Headers {
     }
 
     /// The values of every field with this name, in order.
+    #[inline]
     pub fn get_all<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> {
         let fields = if self.absent(name) { &self.fields[..0] } else { &self.fields[..] };
 
@@ -649,6 +654,7 @@ impl Headers {
     }
 
     /// Every field in order, as name and value pairs.
+    #[inline]
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
         self.fields.iter().map(|(name, value)| (name.as_str(), value.as_str()))
     }

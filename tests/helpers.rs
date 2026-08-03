@@ -379,3 +379,43 @@ fn a_field_value_carrying_obs_text_still_parses() {
     assert_eq!(headers.get("x-note"), Some("café"), "valid UTF-8 obs-text was not kept");
     assert_eq!(headers.get("x-broken"), Some("caf\u{fffd}"), "invalid UTF-8 obs-text was not replaced");
 }
+
+#[test]
+fn the_octet_class_check_agrees_with_a_byte_at_a_time_reading() {
+    let mut table = [0u8; 256];
+    for (value, slot) in table.iter_mut().enumerate() {
+        let byte = value as u8;
+        *slot = (byte.is_ascii_lowercase() as u8) | (byte.is_ascii_alphabetic() as u8) << 1;
+    }
+
+    let naive = |text: &[u8], mask: u8| text.iter().all(|octet| table[*octet as usize] & mask != 0);
+
+    assert!(scan::all_in_class(&[], &table, 1), "an empty run was not accepted");
+    assert!(scan::all_in_class(&[], &table, 2), "an empty run was not accepted");
+
+    for mask in [1u8, 2] {
+        for octet in 0..=255u8 {
+            for length in 1..24usize {
+                for at in 0..length {
+                    let mut text = vec![b'a'; length];
+                    text[at] = octet;
+
+                    assert_eq!(
+                        scan::all_in_class(&text, &table, mask),
+                        naive(&text, mask),
+                        "{octet:#04x} at {at} of {length} octets, mask {mask}"
+                    );
+                }
+            }
+        }
+    }
+
+    let mut rng = harness::rng::Rng::new(0x2c1b_57ea_9048_d3f7);
+
+    for _ in 0..4_000 {
+        for length in [1usize, 7, 8, 9, 15, 16, 17, 31, 64] {
+            let text = rng.bytes(length);
+            assert_eq!(scan::all_in_class(&text, &table, 1), naive(&text, 1), "{text:?}");
+        }
+    }
+}
