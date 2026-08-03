@@ -33,6 +33,14 @@ use crate::tls::{self, Identity};
 /// The listen backlog for a TCP socket.
 pub const BACKLOG: i32 = 1024;
 
+/// The stack size for a [`Server::run`] worker thread.
+///
+/// Handlers run on the worker's own runtime, so every future they nest is
+/// polled on this stack. The platform default for spawned threads (commonly
+/// 2 MiB) is too tight for handlers with deeply nested futures, so workers get
+/// the same 8 MiB a main thread usually has.
+pub const WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+
 /// How many threads the machine can run at once, or 1 if that cannot be found.
 ///
 /// Useful as the worker count for [`Server::run`].
@@ -1001,7 +1009,7 @@ impl Server {
                 });
             };
 
-            match std::thread::Builder::new().name(format!("soyokaze-{index}")).spawn(worker) {
+            match std::thread::Builder::new().name(format!("soyokaze-{index}")).stack_size(WORKER_STACK_SIZE).spawn(worker) {
                 Ok(thread) => threads.push(thread),
                 Err(error) => {
                     failure = Some(Error::Io(error));
