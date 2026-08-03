@@ -30,6 +30,16 @@ The crate is arranged in layers, each usable on its own: `api` for the entry poi
 cargo add soyokaze
 ```
 
+The C ABI ships as part of the same crate. Prebuilt shared and static libraries, plus the matching [`include/soyokaze.h`](include/soyokaze.h), are attached to each [release](https://github.com/nercone-dev/soyokaze/releases) for Linux and macOS on x86_64 and aarch64 — or build them yourself with `cargo build --release --lib`.
+
+The Python bindings in [`python/`](python/) wrap that same shared library through `ctypes` and are published on PyPI with the library bundled into the wheel:
+
+```bash
+uv pip install soyokaze
+```
+
+They locate the shared library through, in order: the `SOYOKAZE_LIBRARY` environment variable, the copy bundled with the package, the crate's own `target/{release,debug}` directory when run from within the repository, and the system loader.
+
 ## Development
 
 ```bash
@@ -42,6 +52,19 @@ cargo bench
 
 ```bash
 cargo +nightly fuzz run everything
+```
+
+The C ABI and Python bindings each have their own test suite. [`tests/ffi.c`](tests/ffi.c) links against the shared library through the header the way an external C caller would, checked alongside [`tests/ffi.rs`](tests/ffi.rs), which drives the same surface from Rust:
+
+```bash
+cargo build --lib
+cc -std=c11 -Iinclude tests/ffi.c -Ltarget/debug -lsoyokaze -o ffi-test
+LD_LIBRARY_PATH=target/debug ./ffi-test  # DYLD_LIBRARY_PATH=target/debug on macOS
+```
+
+```bash
+cd python
+uv run pytest
 ```
 
 ## Links
