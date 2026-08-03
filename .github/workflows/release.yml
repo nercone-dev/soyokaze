@@ -374,6 +374,9 @@ jobs:
   python-publish:
     needs: python-wheels
     runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
 
     steps:
       - name: Download the built wheels
@@ -387,4 +390,3 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
-          password: ${{ secrets.PYPI_API_TOKEN }}
