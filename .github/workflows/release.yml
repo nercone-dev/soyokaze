@@ -134,24 +134,24 @@ jobs:
 
       - name: Build and run the C test against the shared library
         run: |
-          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c -Ltarget/debug -lsoyokaze -o ffi-shared
+          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c -Ltarget/release -lsoyokaze -o ffi-shared
           case "$RUNNER_OS" in
-            Linux) LD_LIBRARY_PATH=target/debug ./ffi-shared ;;
-            macOS) DYLD_LIBRARY_PATH=target/debug ./ffi-shared ;;
+            Linux) LD_LIBRARY_PATH=target/release ./ffi-shared ;;
+            macOS) DYLD_LIBRARY_PATH=target/release ./ffi-shared ;;
           esac
 
       - name: Build and run the C test against the static library
         env:
           CARGO_TERM_COLOR: never
         run: |
-          libs=$(cargo rustc --lib --crate-type staticlib -- --print native-static-libs 2>&1 \
+          libs=$(cargo rustc --lib --release --all-features --crate-type staticlib -- --print native-static-libs 2>&1 \
                  | sed -n 's/^note: native-static-libs: //p' | tail -n1)
           if [ -z "$libs" ]; then
             echo "::error::rustc reported no native static libs; the link would fail obscurely"
             exit 1
           fi
           echo "native static libs: $libs"
-          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c target/debug/libsoyokaze.a $libs -o ffi-static
+          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c target/release/libsoyokaze.a $libs -o ffi-static
           ./ffi-static
 
   test-python:
@@ -401,10 +401,10 @@ jobs:
 
       - name: Build and run the C test against the shared library
         run: |
-          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c -Ltarget/debug -lsoyokaze -o ffi-shared
+          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c -Ltarget/release -lsoyokaze -o ffi-shared
           case "$RUNNER_OS" in
-            Linux) LD_LIBRARY_PATH=target/debug ./ffi-shared ;;
-            macOS) DYLD_LIBRARY_PATH=target/debug ./ffi-shared ;;
+            Linux) LD_LIBRARY_PATH=target/release ./ffi-shared ;;
+            macOS) DYLD_LIBRARY_PATH=target/release ./ffi-shared ;;
           esac
 
       - name: Build and run the C test against the static library
@@ -418,7 +418,7 @@ jobs:
             exit 1
           fi
           echo "native static libs: $libs"
-          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c target/debug/libsoyokaze.a $libs -o ffi-static
+          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c target/release/libsoyokaze.a $libs -o ffi-static
           ./ffi-static
 
   build-python:
