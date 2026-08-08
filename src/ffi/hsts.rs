@@ -9,7 +9,7 @@
 use std::time::Instant;
 
 use crate::ffi::models::Limits;
-use crate::ffi::{borrow_text, Buffer};
+use crate::ffi::{Buffer, Slice};
 use crate::hsts::HstsStore;
 
 /// One `Strict-Transport-Security` policy.
@@ -67,7 +67,7 @@ pub unsafe extern "C" fn soyokaze_hsts_policy_parse(value: *const u8, value_len:
         return false;
     }
 
-    let Some(value) = (unsafe { borrow_text(value, value_len) }) else {
+    let Some(value) = (unsafe { Slice::borrow_text(value, value_len) }) else {
         return false;
     };
 
@@ -130,7 +130,7 @@ pub unsafe extern "C" fn soyokaze_hsts_store_free(store: *mut HstsStore) {
 /// must point to their stated number of readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_hsts_store_learn(store: *const HstsStore, host: *const u8, host_len: usize, header: *const u8, header_len: usize, secure: bool) -> bool {
-    let (Some(store), Some(host), Some(header)) = (unsafe { store.as_ref() }, unsafe { borrow_text(host, host_len) }, unsafe { borrow_text(header, header_len) })
+    let (Some(store), Some(host), Some(header)) = (unsafe { store.as_ref() }, unsafe { Slice::borrow_text(host, host_len) }, unsafe { Slice::borrow_text(header, header_len) })
     else {
         return false;
     };
@@ -147,9 +147,21 @@ pub unsafe extern "C" fn soyokaze_hsts_store_learn(store: *const HstsStore, host
 /// `host` must point to `host_len` readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_hsts_store_secure(store: *const HstsStore, host: *const u8, host_len: usize) -> bool {
-    let (Some(store), Some(host)) = (unsafe { store.as_ref() }, unsafe { borrow_text(host, host_len) }) else {
+    let (Some(store), Some(host)) = (unsafe { store.as_ref() }, unsafe { Slice::borrow_text(host, host_len) }) else {
         return false;
     };
 
     store.secure(host, Instant::now())
+}
+
+/// Drops every entry that has expired.
+///
+/// # Safety
+///
+/// `store` must either be null or be a handle that has not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_hsts_store_prune(store: *const HstsStore) {
+    if let Some(store) = unsafe { store.as_ref() } {
+        store.prune(Instant::now());
+    }
 }

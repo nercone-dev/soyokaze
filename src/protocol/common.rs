@@ -393,9 +393,11 @@ impl Fields {
     /// Returns [`Error::Protocol`] when the field list breaks any of the rules
     /// both versions impose: an uppercase field name; a [`Fields::CONNECTION_SPECIFIC`]
     /// field; a `TE` asking for anything but trailers; a pseudo-header after a
-    /// regular field, repeated, undefined, or belonging to the other kind of
-    /// message; neither `:method` nor `:status`; a request without both a scheme
-    /// and a non-empty path; or a `CONNECT` carrying more than an authority.
+    /// regular field, undefined, repeated, or belonging to the other kind of
+    /// message; a `:method` that is not recognised; a `:status` that is not
+    /// three digits; neither `:method` nor `:status`; a request without both a
+    /// scheme and a non-empty path; or a `CONNECT` carrying more than an
+    /// authority.
     pub fn into_message(fields: Vec<HeaderField>, version: Version) -> Result<Message, Error> {
         // Seen-bits for each pseudo-header, so a repeat can be caught.
         const PSEUDO_METHOD: u8 = 1 << 0;

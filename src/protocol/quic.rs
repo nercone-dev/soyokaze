@@ -68,9 +68,12 @@ impl Varint {
     ///
     /// # Panics
     ///
-    /// A value above [`Varint::MAXIMUM`] does not fit the encoding, and the
-    /// two high bits that carry the length would overwrite it.
+    /// Debug builds assert that `value` does not go past [`Varint::MAXIMUM`]:
+    /// anything larger does not fit the encoding, and the two high bits that
+    /// carry the length would overwrite it.
     pub fn encode(out: &mut impl bytes::BufMut, value: u64) {
+        debug_assert!(value <= Varint::MAXIMUM, "{value} does not fit a variable-length integer");
+
         match Varint::len(value) {
             1 => out.put_u8(value as u8),
             2 => out.put_slice(&(value as u16 | 0x4000).to_be_bytes()),
@@ -320,8 +323,9 @@ impl Handshake {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Version`] when the peer selected nothing or selected
-    /// something outside `versions`.
+    /// Returns [`Error::Version`] when the peer selected something outside
+    /// `versions`, or selected nothing and `versions` offers no HTTP/1.x
+    /// fallback.
     pub fn negotiated(&self, versions: &[Version]) -> Result<Version, Error> {
         Alpn::negotiated((!self.alpn.is_empty()).then_some(&self.alpn), versions)
     }
@@ -392,7 +396,7 @@ impl QuicListener {
     /// # Errors
     ///
     /// Returns [`Error::Io`] when the socket cannot be read or the endpoint
-    /// cannot be stood up.
+    /// cannot be stood up, and [`Error::Closed`] when no listener comes back.
     pub fn bind(udp: std::net::UdpSocket, config: &QuicConfig, hook: Arc<dyn tokio_quiche::quic::ConnectionHook + Send + Sync>) -> Result<(QuicIncomingStream, std::net::SocketAddr), Error> {
         let address = udp.local_addr()?;
 

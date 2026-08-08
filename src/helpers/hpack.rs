@@ -102,6 +102,20 @@ impl StaticTable {
         static INDEX: OnceLock<StaticIndex> = OnceLock::new();
         INDEX.get_or_init(|| StaticIndex::new(StaticTable::entries(), 1))
     }
+
+    /// Finds a field in the static table.
+    ///
+    /// The flag says whether the value matched too; `false` means the index
+    /// names the field name only.
+    pub fn find(field: &HeaderField) -> Option<(usize, bool)> {
+        let (named, exact) = StaticTable::index().lookup(&field.name, &field.value);
+
+        match (exact, named) {
+            (Some(index), _) => Some((index, true)),
+            (None, Some(index)) => Some((index, false)),
+            (None, None) => None,
+        }
+    }
 }
 
 
@@ -180,18 +194,13 @@ impl DynamicTable {
         self.entries.is_empty()
     }
 
-    /// Finds the best index for a field, across both tables.
+    /// Finds the best offset for a field in the dynamic table.
     ///
-    /// The flag says whether the value matched too; `false` means the index
-    /// names the field name only, and the value has to be sent as a literal.
+    /// The flag says whether the value matched too. Offsets count from the
+    /// most recent insertion, which is how the wire indexes the table once
+    /// the static entries are stepped over.
     pub fn find(&self, field: &HeaderField) -> Option<(usize, bool)> {
-        let (named, exact) = StaticTable::index().lookup(&field.name, &field.value);
-        if let Some(index) = exact {
-            return Some((index, true));
-        }
-
-        let base = StaticTable::entries().len() + 1;
-        let mut name_only = named;
+        let mut name_only = None;
 
         for (offset, entry) in self.entries.iter().enumerate() {
             if entry.name != field.name {
@@ -199,13 +208,13 @@ impl DynamicTable {
             }
 
             if entry.value == field.value {
-                return Some((base + offset, true));
+                return Some((offset, true));
             }
 
-            name_only.get_or_insert(base + offset);
+            name_only.get_or_insert(offset);
         }
 
-        name_only.map(|index| (index, false))
+        name_only.map(|offset| (offset, false))
     }
 }
 
@@ -267,6 +276,7 @@ impl From<fields::Error> for Error {
 /// two tables part ways.
 pub struct Encoder {
     dynamic_table: DynamicTable,
+    max_capacity: usize,
     capacity_limit: usize,
     pending_size_update: Option<usize>,
 }
@@ -279,6 +289,7 @@ impl Encoder {
     pub fn new() -> Self {
         Self {
             dynamic_table: DynamicTable::new(DynamicTable::DEFAULT_CAPACITY),
+            max_capacity: DynamicTable::DEFAULT_CAPACITY,
             capacity_limit: Self::DEFAULT_CAPACITY_LIMIT,
             pending_size_update: None,
         }
@@ -307,6 +318,26 @@ impl Encoder {
         }
     }
 
+    /// Picks the reference to use for a field.
+    ///
+    /// Returns the best index across both tables and whether the value
+    /// matched as well as the name; `false` means the index names the field
+    /// name only, and the value has to be sent as a literal.
+    pub fn reference(&self, field: &HeaderField) -> Option<(usize, bool)> {
+        let in_static = StaticTable::find(field);
+        if let Some((index, true)) = in_static {
+            return Some((index, true));
+        }
+
+        let base = StaticTable::entries().len() + 1;
+        let in_dynamic = self.dynamic_table.find(field).map(|(offset, exact)| (base + offset, exact));
+        if let Some((index, true)) = in_dynamic {
+            return Some((index, true));
+        }
+
+        in_static.or(in_dynamic)
+    }
+
     /// Encodes one field, and inserts it into the table unless it is sensitive.
     ///
     /// A field already in a table is sent as a bare index. Otherwise it goes
@@ -314,7 +345,7 @@ impl Encoder {
     /// fields use the never-indexed form, which also asks intermediaries not
     /// to index them.
     pub fn encode_field(&mut self, out: &mut Vec<u8>, field: &HeaderField) {
-        let found = self.dynamic_table.find(field);
+        let found = self.reference(field);
         if let Some((index, true)) = found {
             Integer::encode(out, index as u64, 7, 0x80);
             return;
@@ -346,6 +377,8 @@ impl Encoder {
     /// capacity actually used is the smaller of what the peer permits and
     /// [`Encoder::capacity_limit`].
     pub fn set_max_capacity(&mut self, max_capacity: usize) {
+        self.max_capacity = max_capacity;
+
         let capacity = max_capacity.min(self.capacity_limit);
         self.dynamic_table.set_capacity(capacity);
         self.pending_size_update = Some(capacity);
@@ -363,6 +396,11 @@ impl Encoder {
     /// The capacity this encoder is willing to keep.
     pub fn capacity_limit(&self) -> usize {
         self.capacity_limit
+    }
+
+    /// The ceiling the peer advertised.
+    pub fn max_capacity(&self) -> usize {
+        self.max_capacity
     }
 
     /// The table as the encoder believes the peer's decoder holds it.
@@ -514,7 +552,8 @@ impl Decoder {
     /// # Errors
     ///
     /// Returns [`Error::IndexOutOfRange`] when a name index addresses nothing,
-    /// and whatever [`StringLiteral::decode_into_ascii`] rejects the strings with.
+    /// and otherwise as [`Integer::decode`] and
+    /// [`StringLiteral::decode_into_ascii`].
     pub fn decode_literal(&self, input: &[u8], prefix_bits: u8, scratch: &mut Vec<u8>) -> Result<(usize, HeaderField), Error> {
         let (mut consumed, index) = Integer::decode(input, prefix_bits)?;
 

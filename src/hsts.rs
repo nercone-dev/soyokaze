@@ -51,8 +51,12 @@ impl HstsPolicy {
 
     /// The field value.
     ///
-    /// A negative `max_age` is written as zero. The value is built without
-    /// allocating, since a server writes one on every secure response.
+    /// A negative `max_age` is written as zero. The value is formatted on the
+    /// stack, since a server writes one on every secure response; the returned
+    /// [`Text`] stays inline while it fits [`INLINE`] and allocates only past
+    /// that.
+    ///
+    /// [`INLINE`]: crate::helpers::text::INLINE
     pub fn value(&self) -> Text {
         let mut out = [0u8; 64];
         let mut written = 0;
@@ -157,8 +161,8 @@ impl From<Limits> for HstsLimits {
 ///
 /// The store is shared and internally locked, so a [`Client`] can consult the
 /// same store from every request. It holds at most
-/// [`Limits::max_hsts_entries`] hosts, evicting whichever expires soonest to
-/// make room.
+/// [`HstsLimits::max_hsts_entries`] hosts, evicting whichever expires soonest
+/// to make room.
 ///
 /// [`Client`]: crate::api::client::Client
 pub struct HstsStore {
@@ -169,7 +173,7 @@ pub struct HstsStore {
 }
 
 impl HstsStore {
-    /// An empty store with the default [`Limits`].
+    /// An empty store with the default [`HstsLimits`].
     pub fn new() -> Self {
         Self { entries: Mutex::new(HashMap::new()), limits: HstsLimits::default() }
     }
@@ -252,6 +256,11 @@ impl HstsStore {
         entries.iter().any(|(stored, (_, include_subdomains))| {
             &name == stored || (*include_subdomains && name.ends_with(&format!(".{stored}")))
         })
+    }
+
+    /// Drops every entry that has expired by `now`.
+    pub fn prune(&self, now: Instant) {
+        lock(&self.entries).retain(|_, (expiry, _)| *expiry > now);
     }
 }
 

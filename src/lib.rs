@@ -14,8 +14,9 @@
 //! - [`helpers`] holds the codecs the versions share — [`helpers::huffman`],
 //!   [`helpers::hpack`] for HTTP/2 and [`helpers::qpack`] for HTTP/3, over
 //!   the shared vocabulary in [`helpers::fields`] — plus the small pieces
-//!   ([`helpers::base64`], [`helpers::sha1`], [`helpers::sync`]) everything
-//!   else leans on. Nothing here knows about connections or transports.
+//!   ([`helpers::base64`], [`helpers::sha1`], [`helpers::text`],
+//!   [`helpers::scan`], [`helpers::sync`]) everything else leans on. Nothing
+//!   here knows about connections or transports.
 //! - [`models`] is the vocabulary: [`Message`], [`Headers`], [`Version`],
 //!   [`Port`], [`Limits`]. [`tls`] holds the TLS side of it — [`Security`]
 //!   and the BoringSSL contexts — and [`cookies`], [`hsts`], [`responses`]

@@ -5,7 +5,7 @@
 //! these, the way [`crate::helpers::hpack`] and [`crate::helpers::qpack`]
 //! share [`crate::helpers::fields`].
 
-use crate::ffi::{borrow_text, Slice};
+use crate::ffi::Slice;
 use crate::helpers::fields::HeaderField;
 
 /// One field going in: a name and a value.
@@ -18,30 +18,32 @@ pub struct Field {
     pub value: Slice,
 }
 
-/// Reads `count` fields out of a C array.
-///
-/// `None` when the array is null with a non-zero count, or any name or value
-/// is null or not UTF-8.
-///
-/// # Safety
-///
-/// `fields` must either be null or point to `count` readable [`Field`] values
-/// whose own pointers are valid.
-pub unsafe fn parse_fields(fields: *const Field, count: usize) -> Option<Vec<HeaderField>> {
-    if fields.is_null() {
-        return (count == 0).then(Vec::new);
+impl Field {
+    /// Reads `count` fields out of a C array.
+    ///
+    /// `None` when the array is null with a non-zero count, or any name or
+    /// value is null or not UTF-8.
+    ///
+    /// # Safety
+    ///
+    /// `fields` must either be null or point to `count` readable [`Field`]
+    /// values whose own pointers are valid.
+    pub unsafe fn parse_all(fields: *const Field, count: usize) -> Option<Vec<HeaderField>> {
+        if fields.is_null() {
+            return (count == 0).then(Vec::new);
+        }
+
+        let mut parsed = Vec::with_capacity(count);
+
+        for index in 0..count {
+            let field = unsafe { *fields.add(index) };
+            let name = unsafe { Slice::borrow_text(field.name.data, field.name.len) }?;
+            let value = unsafe { Slice::borrow_text(field.value.data, field.value.len) }?;
+            parsed.push(HeaderField::new(name, value));
+        }
+
+        Some(parsed)
     }
-
-    let mut parsed = Vec::with_capacity(count);
-
-    for index in 0..count {
-        let field = unsafe { *fields.add(index) };
-        let name = unsafe { borrow_text(field.name.data, field.name.len) }?;
-        let value = unsafe { borrow_text(field.value.data, field.value.len) }?;
-        parsed.push(HeaderField::new(name, value));
-    }
-
-    Some(parsed)
 }
 
 /// A decoded field section, as a decoder hands it back.

@@ -346,8 +346,8 @@ impl From<Limits> for CookieLimits {
 ///
 /// The jar is shared and internally locked, so a [`Client`] can hand the same
 /// jar to every request it makes. Its size is bounded by
-/// [`Limits::max_cookies`] and [`Limits::max_cookies_per_domain`], and the
-/// oldest entry is evicted when either ceiling is reached.
+/// [`CookieLimits::max_cookies`] and [`CookieLimits::max_cookies_per_domain`],
+/// and the oldest entry is evicted when either ceiling is reached.
 ///
 /// [`Client`]: crate::api::client::Client
 #[derive(Default)]
@@ -359,12 +359,11 @@ pub struct CookieJar {
 }
 
 impl CookieJar {
-
     /// Makes room for one more cookie in `domain`.
     ///
     /// Drops the oldest cookie for the domain when it is at
-    /// [`Limits::max_cookies_per_domain`], and then the oldest cookies overall
-    /// until the jar is under [`Limits::max_cookies`].
+    /// [`CookieLimits::max_cookies_per_domain`], and then the oldest cookies
+    /// overall until the jar is under [`CookieLimits::max_cookies`].
     pub fn evict(entries: &mut Vec<StoredCookie>, domain: &str, limits: &CookieLimits) {
         if entries.iter().filter(|stored| stored.domain == domain).count() >= limits.max_cookies_per_domain as usize
             && let Some(oldest) = entries.iter().position(|stored| stored.domain == domain)
@@ -376,7 +375,8 @@ impl CookieJar {
             entries.remove(0);
         }
     }
-    /// An empty jar with the default [`Limits`].
+
+    /// An empty jar with the default [`CookieLimits`].
     pub fn new() -> Self {
         Self { entries: Mutex::new(Vec::new()), limits: CookieLimits::default() }
     }

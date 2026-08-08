@@ -256,7 +256,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// As [`Client::connect_stream_tls`] and [`Client::assemble`].
+    /// As [`Client::prior_version`], [`Client::assemble`] and
+    /// [`Client::connect_stream_tls`].
     pub async fn connect_stream(&self, host: &str, transport: Box<dyn Transport>, id: ConnectionID, authority: &str) -> Result<AnyConnection, Error> {
         if !self.config.secure {
             return self.assemble(self.prior_version()?, transport, id, authority).await;
@@ -587,7 +588,8 @@ impl Client {
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] when the URL will not parse or the server's
-    /// handshake does not check out, and otherwise as [`Client::open`].
+    /// handshake does not check out, and otherwise as [`Client::open`] and
+    /// [`AnyConnection::open_websocket`].
     pub async fn websocket(&self, url: &str) -> Result<crate::websocket::WebSocketConnection<Box<dyn Transport>>, Error> {
         let mut url = Url::parse(url)?;
         self.apply_hsts(&mut url, Instant::now());

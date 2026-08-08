@@ -14,7 +14,7 @@ use crate::helpers::sync::lock;
 pub struct GateState {
     /// How many connections each address currently holds.
     pub per_ip: std::collections::HashMap<std::net::IpAddr, u32>,
-    /// When each address last connected, within the rate window.
+    /// Every time each address connected, within the rate window.
     pub history: std::collections::HashMap<std::net::IpAddr, std::collections::VecDeque<std::time::Instant>>,
 }
 

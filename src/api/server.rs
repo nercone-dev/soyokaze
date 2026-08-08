@@ -178,10 +178,10 @@ impl Server {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when a QUIC port has no identity or a TLS
-    /// context cannot be built, [`Error::Version`] when the port is offered no
-    /// version it can carry, and [`Error::Io`] when the socket cannot be
-    /// adopted.
+    /// Returns [`Error::Version`] when the port is offered no version it can
+    /// carry, [`Error::Io`] when the socket cannot be adopted, and
+    /// [`Error::Tls`] when a QUIC port has no identity or a TLS context
+    /// cannot be built.
     pub async fn attach(&self, target: &Port, socket: RawSocket) -> Result<Listener, Error> {
         let versions = target.offers(&self.config.versions);
         if versions.is_empty() {
@@ -708,8 +708,10 @@ impl Server {
     ///
     /// Returns [`Error::Io`] when a QUIC port is asked for more than one
     /// worker without reuseport, when a socket cannot be opened, or when a
-    /// thread or runtime cannot be created. On failure every thread already
-    /// started is wound down first.
+    /// thread or runtime cannot be created, [`Error::Closed`] when a worker
+    /// dies before reporting, and otherwise as [`Server::attach`], whose
+    /// failure on any worker is returned here. On failure every thread
+    /// already started is wound down first.
     pub fn run<H: Handler>(&self, handler: H, ports: &[Port], workers: usize) -> Result<Cluster, Error> {
         let workers = workers.max(1);
 

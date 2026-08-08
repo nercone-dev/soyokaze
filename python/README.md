@@ -27,5 +27,5 @@ uv run examples/websocket_loopback.py
 ```
 
 ## Links
-- [docs.rs](https://docs.rs/soyokaze/) - Documentation (for The Rust version)
+- [docs.rs](https://docs.rs/soyokaze/) - Documentation (for the Rust crate)
 - [deepwiki.com](https://deepwiki.com/nercone-dev/soyokaze/) - Documentation; Automatically generated.

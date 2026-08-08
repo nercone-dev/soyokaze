@@ -255,8 +255,8 @@ impl Frame {
     ///
     /// Returns [`Error::Protocol`] when a reserved bit is set with no
     /// extension negotiated, when the opcode is reserved, when the length has
-    /// its high bit set, or when a control frame is fragmented or longer than
-    /// [`MAXIMUM_CONTROL_PAYLOAD`].
+    /// its high bit set, or when a control frame is longer than
+    /// [`MAXIMUM_CONTROL_PAYLOAD`] or fragmented.
     pub fn decode(data: &[u8]) -> Result<Option<(usize, Self)>, Error> {
         if data.len() < 2 {
             return Ok(None);
@@ -663,8 +663,8 @@ impl AnyConnection {
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] when the handshake does not check out or
-    /// the request names no stream, and otherwise as
-    /// [`Connection::send`].
+    /// the request names no stream, and otherwise as [`Connection::send`] and
+    /// [`AnyConnection::into_transport`].
     pub async fn accept_websocket(self, request: &Message, limits: impl Into<WebSocketLimits>) -> Result<WebSocketConnection<Box<dyn Transport>>, Error> {
         let id = self.id();
         let limits = limits.into();
@@ -706,10 +706,10 @@ impl AnyConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Protocol`] when the server's answer does not check out
-    /// or names no stream, [`Error::Tls`] when no randomness is available for
-    /// the nonce, and otherwise as [`Connection::send`] and
-    /// [`Connection::receive`].
+    /// Returns [`Error::Tls`] when no randomness is available for the nonce,
+    /// [`Error::Protocol`] when the server's answer does not check out or
+    /// names no stream, and otherwise as [`Connection::send`],
+    /// [`Connection::receive`] and [`AnyConnection::into_transport`].
     pub async fn open_websocket(self, authority: &str, target: &str, limits: impl Into<WebSocketLimits>) -> Result<WebSocketConnection<Box<dyn Transport>>, Error> {
         let id = self.id();
         let limits = limits.into();
@@ -895,8 +895,8 @@ where
     ///
     /// Returns [`Error::Protocol`] when the frame is malformed or masked the
     /// wrong way round for the peer's role, [`Error::Limit`] when it grows
-    /// past [`Limits::max_message_size`], and [`Error::Closed`] when the
-    /// transport ends mid-frame.
+    /// past [`WebSocketLimits::max_message_size`], and [`Error::Closed`] when
+    /// the transport ends mid-frame. Otherwise as [`Buffer::fill`].
     pub async fn receive(&mut self) -> Result<Frame, Error> {
         loop {
             if let Some((consumed, frame)) = Frame::decode(self.buffer.as_slice())? {
@@ -940,13 +940,15 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Protocol`] when fragmentation is misused — a new
-    /// message beginning inside one, or a continuation beginning one — or when
-    /// a text message is not valid UTF-8, in which case the connection is
-    /// closed with [`CloseCode::InvalidPayload`] first. Returns
-    /// [`Error::Limit`] when the message goes past
-    /// [`Limits::max_message_size`] or spans more than
-    /// [`Limits::ws_max_fragments`] frames.
+    /// Returns [`Error::Limit`] when the message goes past
+    /// [`WebSocketLimits::max_message_size`] or spans more than
+    /// [`WebSocketLimits::ws_max_fragments`] frames, and [`Error::Protocol`]
+    /// when fragmentation is misused — a new message beginning inside one, or
+    /// a continuation beginning one — or when a text message is not valid
+    /// UTF-8, in which case the connection is closed with
+    /// [`CloseCode::InvalidPayload`] first. Otherwise as
+    /// [`WebSocketConnection::receive`], [`WebSocketConnection::verify_close`]
+    /// and [`WebSocketConnection::send`].
     pub async fn receive_message(&mut self) -> Result<(Opcode, Bytes), Error> {
         loop {
             let frame = self.receive().await?;
@@ -1058,8 +1060,8 @@ where
     /// Closes the connection, running the closing handshake.
     ///
     /// Sends a close frame and then waits, for up to
-    /// [`Limits::ws_linger_timeout`], for the peer to echo one back, so both
-    /// ends agree the exchange ended rather than the transport simply
+    /// [`WebSocketLimits::ws_linger_timeout`], for the peer to echo one back,
+    /// so both ends agree the exchange ended rather than the transport simply
     /// vanishing. The reason is truncated to fit
     /// [`MAXIMUM_CONTROL_PAYLOAD`].
     ///

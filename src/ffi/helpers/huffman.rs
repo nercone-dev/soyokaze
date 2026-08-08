@@ -3,7 +3,7 @@
 //! One code serves both compression formats, as in
 //! [`crate::helpers::huffman`].
 
-use crate::ffi::{borrow, Buffer};
+use crate::ffi::{Buffer, Slice};
 
 /// Huffman-encodes octets, owned by the caller.
 ///
@@ -14,7 +14,7 @@ use crate::ffi::{borrow, Buffer};
 /// `data` must either be null or point to `data_len` readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_huffman_encode(data: *const u8, data_len: usize) -> Buffer {
-    match unsafe { borrow(data, data_len) } {
+    match unsafe { Slice::borrow(data, data_len) } {
         Some(data) => Buffer::new(crate::helpers::huffman::encode(data).to_vec()),
         None => Buffer::EMPTY,
     }
@@ -35,7 +35,7 @@ pub unsafe extern "C" fn soyokaze_huffman_decode(data: *const u8, data_len: usiz
         return false;
     }
 
-    let Some(data) = (unsafe { borrow(data, data_len) }) else {
+    let Some(data) = (unsafe { Slice::borrow(data, data_len) }) else {
         return false;
     };
 

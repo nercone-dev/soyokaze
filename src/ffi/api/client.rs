@@ -5,12 +5,12 @@
 //! instead, so several messages may go over one.
 
 use crate::api::client::Client;
-use crate::ffi::models::{parse_versions, role, Limits};
+use crate::ffi::models::Limits;
 use crate::ffi::errors::{ErrorHandle, Status};
 use crate::ffi::models::Port;
 use crate::ffi::tls::{EchEntry, TlsConfig};
 use crate::ffi::websocket::WebSocket;
-use crate::ffi::{borrow, borrow_text, Buffer, Runtime, Slice};
+use crate::ffi::{Buffer, Runtime, Slice};
 use crate::models::{Message, Method, Role, Url, Version};
 use crate::protocol::base::{AnyConnection, Connection};
 
@@ -37,6 +37,11 @@ impl ClientLimits {
     pub fn parse(&self) -> crate::api::client::ClientLimits {
         crate::api::client::ClientLimits { message: self.message.parse(), connection_timeout: self.connection_timeout }
     }
+
+    /// The C half of `limits`, field for field.
+    pub fn build(limits: &crate::api::client::ClientLimits) -> Self {
+        Self { message: Limits::build(&limits.message), connection_timeout: limits.connection_timeout }
+    }
 }
 
 /// The default [`ClientLimits`], to be adjusted and passed back.
@@ -44,8 +49,7 @@ impl ClientLimits {
 /// [`ClientLimits`]: crate::api::client::ClientLimits
 #[unsafe(no_mangle)]
 pub extern "C" fn soyokaze_client_limits_default() -> ClientLimits {
-    let limits = crate::api::client::ClientLimits::default();
-    ClientLimits { message: Limits::build(&limits.message), connection_timeout: limits.connection_timeout }
+    ClientLimits::build(&crate::api::client::ClientLimits::default())
 }
 
 
@@ -125,7 +129,7 @@ impl ClientConfig {
             ..crate::api::client::ClientConfig::default()
         };
 
-        let versions = unsafe { parse_versions(self.versions, self.version_count) }?;
+        let versions = unsafe { Version::parse_all(self.versions, self.version_count) }?;
         if !versions.is_empty() {
             config.versions = versions;
         }
@@ -138,7 +142,7 @@ impl ClientConfig {
             let mut roots = Vec::with_capacity(self.root_count);
             for index in 0..self.root_count {
                 let slice = unsafe { *self.roots.add(index) };
-                roots.push(unsafe { borrow(slice.data, slice.len) }?.to_vec());
+                roots.push(unsafe { Slice::borrow(slice.data, slice.len) }?.to_vec());
             }
             config.roots = Some(roots);
         }
@@ -150,8 +154,8 @@ impl ClientConfig {
         if !self.ech.is_null() {
             for index in 0..self.ech_count {
                 let entry = unsafe { *self.ech.add(index) };
-                let host = unsafe { borrow_text(entry.host.data, entry.host.len) }?;
-                let list = unsafe { borrow(entry.config_list.data, entry.config_list.len) }?;
+                let host = unsafe { Slice::borrow_text(entry.host.data, entry.host.len) }?;
+                let list = unsafe { Slice::borrow(entry.config_list.data, entry.config_list.len) }?;
                 config.ech.insert(host.to_owned(), list.to_vec());
             }
         }
@@ -210,7 +214,7 @@ pub unsafe extern "C" fn soyokaze_client_free(client: *mut Client) {
 pub unsafe extern "C" fn soyokaze_client_fetch(runtime: *mut Runtime, client: *const Client, method: Method, url: *const u8, url_len: usize, request: *mut Message, out: *mut *mut Message, error: *mut *mut ErrorHandle) -> Status {
     let request = (!request.is_null()).then(|| *unsafe { Box::from_raw(request) });
 
-    let (Some(runtime), Some(client), Some(url)) = (unsafe { runtime.as_ref() }, unsafe { client.as_ref() }, unsafe { borrow_text(url, url_len) })
+    let (Some(runtime), Some(client), Some(url)) = (unsafe { runtime.as_ref() }, unsafe { client.as_ref() }, unsafe { Slice::borrow_text(url, url_len) })
     else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
@@ -323,7 +327,7 @@ pub unsafe extern "C" fn soyokaze_client_connect(runtime: *mut Runtime, client: 
     let (Some(runtime), Some(client), Some(host), Some(port)) = (
         unsafe { runtime.as_ref() },
         unsafe { client.as_ref() },
-        unsafe { borrow_text(host, host_len) },
+        unsafe { Slice::borrow_text(host, host_len) },
         unsafe { port.as_ref() },
     ) else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
@@ -394,7 +398,7 @@ pub unsafe extern "C" fn soyokaze_client_request(runtime: *mut Runtime, client: 
 /// must point to `url_len` readable octets, and `out` must be writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_client_websocket(runtime: *mut Runtime, client: *const Client, url: *const u8, url_len: usize, out: *mut *mut WebSocket, error: *mut *mut ErrorHandle) -> Status {
-    let (Some(runtime), Some(client), Some(url)) = (unsafe { runtime.as_ref() }, unsafe { client.as_ref() }, unsafe { borrow_text(url, url_len) })
+    let (Some(runtime), Some(client), Some(url)) = (unsafe { runtime.as_ref() }, unsafe { client.as_ref() }, unsafe { Slice::borrow_text(url, url_len) })
     else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
@@ -436,8 +440,8 @@ pub unsafe extern "C" fn soyokaze_connection_version(connection: *const AnyConne
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_connection_role(connection: *const AnyConnection) -> u32 {
     match unsafe { connection.as_ref() } {
-        Some(connection) => role(connection.role()),
-        None => role(Role::UserAgent),
+        Some(connection) => Role::build(connection.role()),
+        None => Role::build(Role::UserAgent),
     }
 }
 
@@ -537,8 +541,8 @@ pub unsafe extern "C" fn soyokaze_connection_open_websocket(runtime: *mut Runtim
 
     let (Some(runtime), Some(authority), Some(target)) = (
         unsafe { runtime.as_ref() },
-        unsafe { borrow_text(authority, authority_len) },
-        unsafe { borrow_text(target, target_len) },
+        unsafe { Slice::borrow_text(authority, authority_len) },
+        unsafe { Slice::borrow_text(target, target_len) },
     ) else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };

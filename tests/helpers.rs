@@ -175,6 +175,19 @@ fn hsts_forgets_an_expired_or_withdrawn_policy() {
 }
 
 #[test]
+fn hsts_prunes_expired_entries_and_keeps_live_ones() {
+    let store = HstsStore::new();
+    let now = Instant::now();
+
+    store.learn("brief.test", "max-age=60", true, now);
+    store.learn("lasting.test", "max-age=600", true, now);
+
+    store.prune(now + Duration::from_secs(61));
+    assert!(!store.secure("brief.test", now));
+    assert!(store.secure("lasting.test", now));
+}
+
+#[test]
 fn hsts_never_applies_to_an_address_literal() {
     let store = HstsStore::new();
     let now = Instant::now();

@@ -3,7 +3,7 @@
 //! The standard alphabet with padding, as [`crate::helpers::base64`]
 //! implements it for the WebSocket handshake.
 
-use crate::ffi::{borrow, borrow_text, Buffer};
+use crate::ffi::{Buffer, Slice};
 
 /// Encodes octets as base64, owned by the caller.
 ///
@@ -14,7 +14,7 @@ use crate::ffi::{borrow, borrow_text, Buffer};
 /// `data` must either be null or point to `data_len` readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_base64_encode(data: *const u8, data_len: usize) -> Buffer {
-    match unsafe { borrow(data, data_len) } {
+    match unsafe { Slice::borrow(data, data_len) } {
         Some(data) => Buffer::new(crate::helpers::base64::encode(data).into_bytes()),
         None => Buffer::EMPTY,
     }
@@ -34,7 +34,7 @@ pub unsafe extern "C" fn soyokaze_base64_decode(text: *const u8, text_len: usize
         return false;
     }
 
-    let Some(text) = (unsafe { borrow_text(text, text_len) }) else {
+    let Some(text) = (unsafe { Slice::borrow_text(text, text_len) }) else {
         return false;
     };
 

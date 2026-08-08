@@ -399,7 +399,7 @@ impl H3Session {
     ///
     /// Returns [`Error::Limit`] when a single instruction grows past
     /// [`Limits::max_headers_size`], and otherwise as
-    /// [`qpack::Decoder::on_encoder_stream`].
+    /// [`qpack::Decoder::on_encoder_stream`] and [`H3Session::advance`].
     pub fn on_encoder_bytes(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.decoder.on_encoder_stream(bytes).map_err(|err| match err {
             qpack::Error::InstructionTooLarge => {
@@ -449,7 +449,7 @@ impl H3Session {
     /// Returns [`Error::Limit`] when a frame grows past
     /// [`Limits::max_headers_size`], and [`Error::Protocol`] when a second
     /// SETTINGS arrives or a frame appears that does not belong on the control
-    /// stream.
+    /// stream. Otherwise as [`Frame::parse`] and [`Settings::apply`].
     pub fn on_control_bytes(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.control_recv.extend_from_slice(bytes);
 
@@ -505,7 +505,8 @@ impl H3Session {
     /// goes past [`Limits::max_message_size`] — either resets that stream and
     /// leaves the connection running — and [`Error::Limit`] when the
     /// connection as a whole goes past
-    /// [`Limits::max_connection_buffer_size`].
+    /// [`Limits::max_connection_buffer_size`]. Otherwise as
+    /// [`H3Session::advance`].
     pub fn on_stream_bytes(&mut self, stream_id: StreamID, bytes: &[u8], fin: bool) -> Result<(), Error> {
         let created = !self.streams.contains_key(&stream_id);
 
@@ -579,10 +580,12 @@ impl H3Session {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Protocol`] when DATA arrives before HEADERS or a
-    /// control frame appears on a request stream, [`Error::Stream`] when the
-    /// field section or body goes past its limit or the stream ends with no
-    /// field section at all, and otherwise as the QPACK decoder.
+    /// Returns [`Error::Protocol`] when DATA arrives before HEADERS, a
+    /// control frame appears on a request stream, or PUSH_PROMISE arrives with
+    /// push disabled, [`Error::Stream`] when the field section or body goes
+    /// past its limit or the stream ends with no field section at all, and
+    /// otherwise as the QPACK decoder, [`H3Session::absorb_headers`] and
+    /// [`Frame::parse`].
     pub fn advance(&mut self, stream_id: StreamID) -> Result<(), Error> {
         loop {
             if self.streams.get(&stream_id).is_some_and(|state| state.raw) {
@@ -1545,7 +1548,8 @@ impl H3Worker {
     /// # Errors
     ///
     /// Returns [`Error::Stream`] when a tunnel cannot take the octets, and
-    /// otherwise as [`H3Session::on_stream_bytes`] and [`H3Worker::feed_uni`].
+    /// otherwise as [`H3Worker::reject`], [`H3Session::on_stream_bytes`],
+    /// [`H3Worker::goaway`] and [`H3Worker::feed_uni`].
     pub fn dispatch(&mut self, transport: &mut impl QuicTransport, stream_id: u64, data: &[u8], fin: bool) -> Result<(), Error> {
         if let Some(sink) = self.tunnels.get(&stream_id) {
             if sink.try_send((Bytes::copy_from_slice(data), fin)).is_err() {
@@ -1767,9 +1771,10 @@ impl H3Worker {
 
     /// Sends whatever QPACK has queued on one side channel.
     ///
-    /// The buffer is kept and reused, and given back with
-    /// [`common::Buffer::reclaim_octets`] once it has grown past what an idle
-    /// connection should hold.
+    /// The buffer is kept and reused, and given back through
+    /// [`qpack::Encoder::reclaim_encoder_stream`] and
+    /// [`qpack::Decoder::reclaim_decoder_stream`], which shrink it once it has
+    /// grown past what an idle codec should hold.
     ///
     /// # Errors
     ///

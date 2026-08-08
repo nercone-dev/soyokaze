@@ -6,8 +6,8 @@
 //! lifetime, blocks fed in the order they travel.
 
 use crate::ffi::errors::{ErrorHandle, Status};
-use crate::ffi::helpers::fields::{parse_fields, Field, Fields};
-use crate::ffi::{borrow, Buffer};
+use crate::ffi::helpers::fields::{Field, Fields};
+use crate::ffi::{Buffer, Slice};
 use crate::helpers::hpack::{Decoder, Encoder};
 
 /// Builds an HPACK encoder with the default dynamic table capacity.
@@ -74,7 +74,7 @@ pub unsafe extern "C" fn soyokaze_hpack_encoder_set_capacity_limit(encoder: *mut
 /// valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_hpack_encode(encoder: *mut Encoder, fields: *const Field, field_count: usize) -> Buffer {
-    let (Some(encoder), Some(fields)) = (unsafe { encoder.as_mut() }, unsafe { parse_fields(fields, field_count) }) else {
+    let (Some(encoder), Some(fields)) = (unsafe { encoder.as_mut() }, unsafe { Field::parse_all(fields, field_count) }) else {
         return Buffer::EMPTY;
     };
 
@@ -149,7 +149,7 @@ pub unsafe extern "C" fn soyokaze_hpack_decode(decoder: *mut Decoder, block: *co
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     }
 
-    let Some(block) = (unsafe { borrow(block, block_len) }) else {
+    let Some(block) = (unsafe { Slice::borrow(block, block_len) }) else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 

@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use crate::ffi::models::Limits;
 use crate::ffi::errors::{ErrorHandle, Status};
-use crate::ffi::{borrow_text, Buffer, Slice};
+use crate::ffi::{Buffer, Slice};
 use crate::cookies::{Cookie, CookieJar, SameSite, SetCookie};
 use crate::models::Url;
 
@@ -30,7 +30,7 @@ pub extern "C" fn soyokaze_cookie_new() -> *mut Cookie {
 /// `value` must either be null or point to `value_len` readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_cookie_parse(value: *const u8, value_len: usize) -> *mut Cookie {
-    match unsafe { borrow_text(value, value_len) } {
+    match unsafe { Slice::borrow_text(value, value_len) } {
         Some(value) => Box::into_raw(Box::new(Cookie::parse(value))),
         None => std::ptr::null_mut(),
     }
@@ -89,7 +89,7 @@ pub unsafe extern "C" fn soyokaze_cookie_value(cookie: *const Cookie, index: usi
 /// `name` must point to `name_len` readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_cookie_get(cookie: *const Cookie, name: *const u8, name_len: usize) -> Slice {
-    let Some(name) = (unsafe { borrow_text(name, name_len) }) else {
+    let Some(name) = (unsafe { Slice::borrow_text(name, name_len) }) else {
         return Slice::ABSENT;
     };
 
@@ -107,7 +107,7 @@ pub unsafe extern "C" fn soyokaze_cookie_get(cookie: *const Cookie, name: *const
 /// `name` and `value` must point to their stated number of readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_cookie_append(cookie: *mut Cookie, name: *const u8, name_len: usize, value: *const u8, value_len: usize) -> bool {
-    let (Some(cookie), Some(name), Some(value)) = (unsafe { cookie.as_mut() }, unsafe { borrow_text(name, name_len) }, unsafe { borrow_text(value, value_len) })
+    let (Some(cookie), Some(name), Some(value)) = (unsafe { cookie.as_mut() }, unsafe { Slice::borrow_text(name, name_len) }, unsafe { Slice::borrow_text(value, value_len) })
     else {
         return false;
     };
@@ -138,7 +138,7 @@ pub unsafe extern "C" fn soyokaze_cookie_build(cookie: *const Cookie) -> Buffer 
 /// `name` and `value` must point to their stated number of readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_setcookie_new(name: *const u8, name_len: usize, value: *const u8, value_len: usize) -> *mut SetCookie {
-    let (Some(name), Some(value)) = (unsafe { borrow_text(name, name_len) }, unsafe { borrow_text(value, value_len) }) else {
+    let (Some(name), Some(value)) = (unsafe { Slice::borrow_text(name, name_len) }, unsafe { Slice::borrow_text(value, value_len) }) else {
         return std::ptr::null_mut();
     };
 
@@ -157,7 +157,7 @@ pub unsafe extern "C" fn soyokaze_setcookie_parse(value: *const u8, value_len: u
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     }
 
-    let Some(value) = (unsafe { borrow_text(value, value_len) }) else {
+    let Some(value) = (unsafe { Slice::borrow_text(value, value_len) }) else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 
@@ -298,7 +298,7 @@ pub unsafe extern "C" fn soyokaze_setcookie_samesite(cookie: *const SetCookie) -
 /// `value` must point to `value_len` readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_setcookie_set_value(cookie: *mut SetCookie, value: *const u8, value_len: usize) -> bool {
-    let (Some(cookie), Some(value)) = (unsafe { cookie.as_mut() }, unsafe { borrow_text(value, value_len) }) else {
+    let (Some(cookie), Some(value)) = (unsafe { cookie.as_mut() }, unsafe { Slice::borrow_text(value, value_len) }) else {
         return false;
     };
 
@@ -322,7 +322,7 @@ pub unsafe extern "C" fn soyokaze_setcookie_set_expires(cookie: *mut SetCookie, 
         return true;
     }
 
-    let Some(value) = (unsafe { borrow_text(value, value_len) }) else {
+    let Some(value) = (unsafe { Slice::borrow_text(value, value_len) }) else {
         return false;
     };
 
@@ -361,7 +361,7 @@ pub unsafe extern "C" fn soyokaze_setcookie_set_domain(cookie: *mut SetCookie, v
         return true;
     }
 
-    let Some(value) = (unsafe { borrow_text(value, value_len) }) else {
+    let Some(value) = (unsafe { Slice::borrow_text(value, value_len) }) else {
         return false;
     };
 
@@ -385,7 +385,7 @@ pub unsafe extern "C" fn soyokaze_setcookie_set_path(cookie: *mut SetCookie, val
         return true;
     }
 
-    let Some(value) = (unsafe { borrow_text(value, value_len) }) else {
+    let Some(value) = (unsafe { Slice::borrow_text(value, value_len) }) else {
         return false;
     };
 
@@ -520,7 +520,7 @@ pub unsafe extern "C" fn soyokaze_cookiejar_learn(jar: *const CookieJar, url: *c
     let mut parsed = Vec::with_capacity(value_count);
     for index in 0..value_count {
         let slice = unsafe { *values.add(index) };
-        let Some(value) = (unsafe { borrow_text(slice.data, slice.len) }) else {
+        let Some(value) = (unsafe { Slice::borrow_text(slice.data, slice.len) }) else {
             return false;
         };
         parsed.push(value);

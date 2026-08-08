@@ -9,7 +9,7 @@ use bytes::Bytes;
 
 use crate::errors::Error;
 use crate::ffi::errors::{ErrorHandle, Status};
-use crate::ffi::{borrow, borrow_text, Buffer, Runtime, Slice};
+use crate::ffi::{Buffer, Runtime, Slice};
 use crate::models::{Body, Message, Method, Role, Url, Version};
 
 /// Which transport a port names, and so which versions it can carry.
@@ -60,8 +60,29 @@ impl Port {
         match self.kind {
             PortKind::TCP => Some(crate::models::Port::TCP(self.number)),
             PortKind::QUIC => Some(crate::models::Port::QUIC(self.number)),
-            PortKind::UDS => Some(crate::models::Port::UDS(unsafe { borrow_text(self.path, self.path_len) }?.to_owned())),
+            PortKind::UDS => Some(crate::models::Port::UDS(unsafe { Slice::borrow_text(self.path, self.path_len) }?.to_owned())),
         }
+    }
+
+    /// Reads `count` ports out of a C array.
+    ///
+    /// `None` when the array is null or any entry will not parse.
+    ///
+    /// # Safety
+    ///
+    /// `ports` must either be null or point to `count` readable [`Port`]
+    /// values whose own pointers are valid.
+    pub unsafe fn parse_all(ports: *const Port, count: usize) -> Option<Vec<crate::models::Port>> {
+        if ports.is_null() {
+            return None;
+        }
+
+        let mut parsed = Vec::with_capacity(count);
+        for index in 0..count {
+            parsed.push(unsafe { (*ports.add(index)).parse() }?);
+        }
+
+        Some(parsed)
     }
 }
 
@@ -76,7 +97,7 @@ pub unsafe extern "C" fn soyokaze_url_parse(url: *const u8, url_len: usize, out:
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     }
 
-    let Some(text) = (unsafe { borrow_text(url, url_len) }) else {
+    let Some(text) = (unsafe { Slice::borrow_text(url, url_len) }) else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 
@@ -184,7 +205,7 @@ pub extern "C" fn soyokaze_message_new(version: Version) -> *mut Message {
 /// not UTF-8.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_request(method: Method, target: *const u8, target_len: usize, version: Version) -> *mut Message {
-    match unsafe { borrow_text(target, target_len) } {
+    match unsafe { Slice::borrow_text(target, target_len) } {
         Some(target) => Box::into_raw(Box::new(Message::request(method, target, version))),
         None => std::ptr::null_mut(),
     }
@@ -352,7 +373,7 @@ pub unsafe extern "C" fn soyokaze_message_header_value(message: *const Message, 
 /// `name` must point to `name_len` readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_header(message: *const Message, name: *const u8, name_len: usize) -> Slice {
-    let Some(name) = (unsafe { borrow_text(name, name_len) }) else {
+    let Some(name) = (unsafe { Slice::borrow_text(name, name_len) }) else {
         return Slice::ABSENT;
     };
 
@@ -370,7 +391,7 @@ pub unsafe extern "C" fn soyokaze_message_header(message: *const Message, name: 
 /// `name` and `value` must point to their stated number of readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_append_header(message: *mut Message, name: *const u8, name_len: usize, value: *const u8, value_len: usize) -> bool {
-    let (Some(message), Some(name), Some(value)) = (unsafe { message.as_mut() }, unsafe { borrow_text(name, name_len) }, unsafe { borrow_text(value, value_len) })
+    let (Some(message), Some(name), Some(value)) = (unsafe { message.as_mut() }, unsafe { Slice::borrow_text(name, name_len) }, unsafe { Slice::borrow_text(value, value_len) })
     else {
         return false;
     };
@@ -388,7 +409,7 @@ pub unsafe extern "C" fn soyokaze_message_append_header(message: *mut Message, n
 /// As [`soyokaze_message_append_header`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_insert_header(message: *mut Message, name: *const u8, name_len: usize, value: *const u8, value_len: usize) -> bool {
-    let (Some(message), Some(name), Some(value)) = (unsafe { message.as_mut() }, unsafe { borrow_text(name, name_len) }, unsafe { borrow_text(value, value_len) })
+    let (Some(message), Some(name), Some(value)) = (unsafe { message.as_mut() }, unsafe { Slice::borrow_text(name, name_len) }, unsafe { Slice::borrow_text(value, value_len) })
     else {
         return false;
     };
@@ -407,7 +428,7 @@ pub unsafe extern "C" fn soyokaze_message_insert_header(message: *mut Message, n
 /// `name` must point to `name_len` readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_remove_header(message: *mut Message, name: *const u8, name_len: usize) -> bool {
-    let (Some(message), Some(name)) = (unsafe { message.as_mut() }, unsafe { borrow_text(name, name_len) }) else {
+    let (Some(message), Some(name)) = (unsafe { message.as_mut() }, unsafe { Slice::borrow_text(name, name_len) }) else {
         return false;
     };
 
@@ -467,7 +488,7 @@ pub unsafe extern "C" fn soyokaze_message_trailer_value(message: *const Message,
 /// As [`soyokaze_message_header`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_trailer(message: *const Message, name: *const u8, name_len: usize) -> Slice {
-    let Some(name) = (unsafe { borrow_text(name, name_len) }) else {
+    let Some(name) = (unsafe { Slice::borrow_text(name, name_len) }) else {
         return Slice::ABSENT;
     };
 
@@ -483,7 +504,7 @@ pub unsafe extern "C" fn soyokaze_message_trailer(message: *const Message, name:
 /// As [`soyokaze_message_append_header`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_append_trailer(message: *mut Message, name: *const u8, name_len: usize, value: *const u8, value_len: usize) -> bool {
-    let (Some(message), Some(name), Some(value)) = (unsafe { message.as_mut() }, unsafe { borrow_text(name, name_len) }, unsafe { borrow_text(value, value_len) })
+    let (Some(message), Some(name), Some(value)) = (unsafe { message.as_mut() }, unsafe { Slice::borrow_text(name, name_len) }, unsafe { Slice::borrow_text(value, value_len) })
     else {
         return false;
     };
@@ -501,7 +522,7 @@ pub unsafe extern "C" fn soyokaze_message_append_trailer(message: *mut Message, 
 /// As [`soyokaze_message_append_header`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_insert_trailer(message: *mut Message, name: *const u8, name_len: usize, value: *const u8, value_len: usize) -> bool {
-    let (Some(message), Some(name), Some(value)) = (unsafe { message.as_mut() }, unsafe { borrow_text(name, name_len) }, unsafe { borrow_text(value, value_len) })
+    let (Some(message), Some(name), Some(value)) = (unsafe { message.as_mut() }, unsafe { Slice::borrow_text(name, name_len) }, unsafe { Slice::borrow_text(value, value_len) })
     else {
         return false;
     };
@@ -519,7 +540,7 @@ pub unsafe extern "C" fn soyokaze_message_insert_trailer(message: *mut Message, 
 /// As [`soyokaze_message_remove_header`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_remove_trailer(message: *mut Message, name: *const u8, name_len: usize) -> bool {
-    let (Some(message), Some(name)) = (unsafe { message.as_mut() }, unsafe { borrow_text(name, name_len) }) else {
+    let (Some(message), Some(name)) = (unsafe { message.as_mut() }, unsafe { Slice::borrow_text(name, name_len) }) else {
         return false;
     };
 
@@ -687,7 +708,7 @@ pub unsafe extern "C" fn soyokaze_message_quic_version(message: *const Message) 
 /// `data` must point to `data_len` readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_set_body_data(message: *mut Message, data: *const u8, data_len: usize) -> bool {
-    let (Some(message), Some(data)) = (unsafe { message.as_mut() }, unsafe { borrow(data, data_len) }) else {
+    let (Some(message), Some(data)) = (unsafe { message.as_mut() }, unsafe { Slice::borrow(data, data_len) }) else {
         return false;
     };
 
@@ -706,7 +727,7 @@ pub unsafe extern "C" fn soyokaze_message_set_body_data(message: *mut Message, d
 /// `text` must point to `text_len` readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_set_body_text(message: *mut Message, text: *const u8, text_len: usize) -> bool {
-    let (Some(message), Some(text)) = (unsafe { message.as_mut() }, unsafe { borrow_text(text, text_len) }) else {
+    let (Some(message), Some(text)) = (unsafe { message.as_mut() }, unsafe { Slice::borrow_text(text, text_len) }) else {
         return false;
     };
 
@@ -722,7 +743,7 @@ pub unsafe extern "C" fn soyokaze_message_set_body_text(message: *mut Message, t
 /// `path` must point to `path_len` readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_set_body_file(message: *mut Message, path: *const u8, path_len: usize) -> bool {
-    let (Some(message), Some(path)) = (unsafe { message.as_mut() }, unsafe { borrow_text(path, path_len) }) else {
+    let (Some(message), Some(path)) = (unsafe { message.as_mut() }, unsafe { Slice::borrow_text(path, path_len) }) else {
         return false;
     };
 
@@ -965,45 +986,49 @@ pub extern "C" fn soyokaze_limits_default() -> Limits {
     Limits::build(&crate::models::Limits::default())
 }
 
-/// Reads a version list out of a C array of `soyokaze_version_t` values.
-///
-/// A null `versions` means take the default list. `None` when an entry names
-/// no version.
-///
-/// # Safety
-///
-/// `versions` must either be null or point to `count` readable numbers.
-pub unsafe fn parse_versions(versions: *const i32, count: usize) -> Option<Vec<Version>> {
-    if versions.is_null() {
-        return Some(Vec::new());
+impl Version {
+    /// Reads a version list out of a C array of `soyokaze_version_t` values.
+    ///
+    /// A null `versions` means take the default list. `None` when an entry
+    /// names no version.
+    ///
+    /// # Safety
+    ///
+    /// `versions` must either be null or point to `count` readable numbers.
+    pub unsafe fn parse_all(versions: *const i32, count: usize) -> Option<Vec<Version>> {
+        if versions.is_null() {
+            return Some(Vec::new());
+        }
+
+        let mut parsed = Vec::with_capacity(count);
+
+        for index in 0..count {
+            parsed.push(match unsafe { *versions.add(index) } {
+                0 => Version::V1_0,
+                1 => Version::V1_1,
+                2 => Version::V2_0,
+                3 => Version::V3_0,
+                _ => return None,
+            });
+        }
+
+        Some(parsed)
     }
-
-    let mut parsed = Vec::with_capacity(count);
-
-    for index in 0..count {
-        parsed.push(match unsafe { *versions.add(index) } {
-            0 => Version::V1_0,
-            1 => Version::V1_1,
-            2 => Version::V2_0,
-            3 => Version::V3_0,
-            _ => return None,
-        });
-    }
-
-    Some(parsed)
 }
 
-/// The `soyokaze_role_t` number for a [`Role`].
-///
-/// The two enums are kept in the same order, so this is the crate's own
-/// grading rather than a narrowing of it: a caller can still tell a proxy from
-/// a user agent, and a tunnel from either.
-pub fn role(role: Role) -> u32 {
-    match role {
-        Role::UserAgent => 0,
-        Role::Origin => 1,
-        Role::Proxy => 2,
-        Role::Gateway => 3,
-        Role::Tunnel => 4,
+impl Role {
+    /// The `soyokaze_role_t` number for a [`Role`].
+    ///
+    /// The two enums are kept in the same order, so this is the crate's own
+    /// grading rather than a narrowing of it: a caller can still tell a proxy
+    /// from a user agent, and a tunnel from either.
+    pub fn build(role: Role) -> u32 {
+        match role {
+            Role::UserAgent => 0,
+            Role::Origin => 1,
+            Role::Proxy => 2,
+            Role::Gateway => 3,
+            Role::Tunnel => 4,
+        }
     }
 }

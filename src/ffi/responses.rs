@@ -8,9 +8,28 @@
 use bytes::Bytes;
 
 use crate::ffi::errors::{ErrorHandle, Status};
-use crate::ffi::{borrow, borrow_text};
+use crate::ffi::Slice;
 use crate::cookies::SetCookie;
 use crate::models::{Body, Message, Version};
+
+/// The response a callback returns to answer with a body it holds in memory.
+///
+/// A shorthand for building a response and setting its body, since that is what
+/// most callbacks do.
+///
+/// # Safety
+///
+/// `body` must either be null or point to `body_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_response_with_body(status_code: u16, version: Version, body: *const u8, body_len: usize) -> *mut Message {
+    let mut response = Message::response(status_code, version);
+
+    if let Some(body) = unsafe { Slice::borrow(body, body_len) } {
+        response.body = Some(Body::Data(Bytes::copy_from_slice(body)));
+    }
+
+    Box::into_raw(Box::new(response))
+}
 
 /// A `200 OK` carrying `body` under the given media type.
 ///
@@ -23,11 +42,11 @@ use crate::models::{Body, Message, Version};
 /// number of readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_response_content(content_type: *const u8, content_type_len: usize, body: *const u8, body_len: usize, version: Version) -> *mut Message {
-    let Some(content_type) = (unsafe { borrow_text(content_type, content_type_len) }) else {
+    let Some(content_type) = (unsafe { Slice::borrow_text(content_type, content_type_len) }) else {
         return std::ptr::null_mut();
     };
 
-    let body = Body::Data(Bytes::copy_from_slice(unsafe { borrow(body, body_len) }.unwrap_or_default()));
+    let body = Body::Data(Bytes::copy_from_slice(unsafe { Slice::borrow(body, body_len) }.unwrap_or_default()));
     Box::into_raw(Box::new(Message::content(content_type, body, version)))
 }
 
@@ -40,7 +59,7 @@ pub unsafe extern "C" fn soyokaze_response_content(content_type: *const u8, cont
 /// `content` must either be null or point to `content_len` readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_response_text(content: *const u8, content_len: usize, version: Version) -> *mut Message {
-    match unsafe { borrow_text(content, content_len) } {
+    match unsafe { Slice::borrow_text(content, content_len) } {
         Some(content) => Box::into_raw(Box::new(Message::text(content, version))),
         None => std::ptr::null_mut(),
     }
@@ -53,7 +72,7 @@ pub unsafe extern "C" fn soyokaze_response_text(content: *const u8, content_len:
 /// As [`soyokaze_response_text`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_response_html(content: *const u8, content_len: usize, version: Version) -> *mut Message {
-    match unsafe { borrow_text(content, content_len) } {
+    match unsafe { Slice::borrow_text(content, content_len) } {
         Some(content) => Box::into_raw(Box::new(Message::html(content, version))),
         None => std::ptr::null_mut(),
     }
@@ -66,7 +85,7 @@ pub unsafe extern "C" fn soyokaze_response_html(content: *const u8, content_len:
 /// As [`soyokaze_response_text`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_response_markdown(content: *const u8, content_len: usize, version: Version) -> *mut Message {
-    match unsafe { borrow_text(content, content_len) } {
+    match unsafe { Slice::borrow_text(content, content_len) } {
         Some(content) => Box::into_raw(Box::new(Message::markdown(content, version))),
         None => std::ptr::null_mut(),
     }
@@ -81,7 +100,7 @@ pub unsafe extern "C" fn soyokaze_response_markdown(content: *const u8, content_
 /// As [`soyokaze_response_text`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_response_json(content: *const u8, content_len: usize, version: Version) -> *mut Message {
-    match unsafe { borrow_text(content, content_len) } {
+    match unsafe { Slice::borrow_text(content, content_len) } {
         Some(content) => Box::into_raw(Box::new(Message::json(content, version))),
         None => std::ptr::null_mut(),
     }
@@ -97,7 +116,7 @@ pub unsafe extern "C" fn soyokaze_response_json(content: *const u8, content_len:
 /// `path` must either be null or point to `path_len` readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_response_file(path: *const u8, path_len: usize, version: Version) -> *mut Message {
-    match unsafe { borrow_text(path, path_len) } {
+    match unsafe { Slice::borrow_text(path, path_len) } {
         Some(path) => Box::into_raw(Box::new(Message::file(path, version))),
         None => std::ptr::null_mut(),
     }
@@ -110,7 +129,7 @@ pub unsafe extern "C" fn soyokaze_response_file(path: *const u8, path_len: usize
 /// `target` must either be null or point to `target_len` readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_response_redirect(target: *const u8, target_len: usize, version: Version) -> *mut Message {
-    match unsafe { borrow_text(target, target_len) } {
+    match unsafe { Slice::borrow_text(target, target_len) } {
         Some(target) => Box::into_raw(Box::new(Message::redirect(target, version))),
         None => std::ptr::null_mut(),
     }

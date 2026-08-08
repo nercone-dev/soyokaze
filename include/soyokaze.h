@@ -282,6 +282,9 @@ soyokaze_status_t soyokaze_message_body(soyokaze_runtime_t *runtime,
 
 /* --------------------------------------------------------------- responses */
 
+soyokaze_message_t *soyokaze_response_with_body(uint16_t status_code,
+                                                soyokaze_version_t version,
+                                                const uint8_t *body, size_t body_len);
 soyokaze_message_t *soyokaze_response_content(const uint8_t *content_type, size_t content_type_len,
                                               const uint8_t *body, size_t body_len,
                                               soyokaze_version_t version);
@@ -366,6 +369,7 @@ bool soyokaze_hsts_store_learn(const soyokaze_hsts_store_t *store,
                                bool secure);
 bool soyokaze_hsts_store_secure(const soyokaze_hsts_store_t *store,
                                 const uint8_t *host, size_t host_len);
+void soyokaze_hsts_store_prune(const soyokaze_hsts_store_t *store);
 
 /* --------------------------------------------------------------------- tls */
 
@@ -636,10 +640,6 @@ uint32_t soyokaze_cluster_workers(const soyokaze_cluster_t *cluster);
 /* Consumes `cluster` and blocks until the workers finish. A negative
  * `timeout` waits as long as it takes. */
 void soyokaze_cluster_close(soyokaze_cluster_t *cluster, double timeout);
-
-soyokaze_message_t *soyokaze_response_with_body(uint16_t status_code,
-                                                soyokaze_version_t version,
-                                                const uint8_t *body, size_t body_len);
 
 /* --------------------------------------------------------------- finalizer */
 

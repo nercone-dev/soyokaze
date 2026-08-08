@@ -6,7 +6,7 @@
 //! published — the same parts [`crate::tls`] arranges.
 
 use crate::ffi::errors::{ErrorHandle, Status};
-use crate::ffi::{borrow, borrow_text, Buffer, Slice};
+use crate::ffi::{Buffer, Slice};
 use crate::tls::{EchConfigList, EchKeys, Identity};
 
 /// The TLS details a context is built with, beyond its identity and roots.
@@ -52,7 +52,7 @@ impl TlsConfig {
     pub unsafe fn parse(&self) -> Option<crate::tls::TlsConfig> {
         let text = |slice: Slice| match slice.data.is_null() {
             true => Some(None),
-            false => unsafe { borrow_text(slice.data, slice.len) }.map(|text| Some(text.to_owned())),
+            false => unsafe { Slice::borrow_text(slice.data, slice.len) }.map(|text| Some(text.to_owned())),
         };
 
         Some(crate::tls::TlsConfig {
@@ -102,14 +102,14 @@ pub unsafe extern "C" fn soyokaze_identity_new(certificates: *const Slice, certi
         return std::ptr::null_mut();
     }
 
-    let Some(key) = (unsafe { borrow(key, key_len) }) else {
+    let Some(key) = (unsafe { Slice::borrow(key, key_len) }) else {
         return std::ptr::null_mut();
     };
 
     let mut chain = Vec::with_capacity(certificate_count);
     for index in 0..certificate_count {
         let slice = unsafe { *certificates.add(index) };
-        let Some(blob) = (unsafe { borrow(slice.data, slice.len) }) else {
+        let Some(blob) = (unsafe { Slice::borrow(slice.data, slice.len) }) else {
             return std::ptr::null_mut();
         };
         chain.push(blob.to_vec());
@@ -133,7 +133,7 @@ pub unsafe extern "C" fn soyokaze_identity_from_pkcs12(data: *const u8, data_len
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     }
 
-    let (Some(data), Some(passphrase)) = (unsafe { borrow(data, data_len) }, unsafe { borrow_text(passphrase, passphrase_len) }) else {
+    let (Some(data), Some(passphrase)) = (unsafe { Slice::borrow(data, data_len) }, unsafe { Slice::borrow_text(passphrase, passphrase_len) }) else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 
@@ -178,7 +178,7 @@ pub unsafe extern "C" fn soyokaze_ech_keys_generate(public_name: *const u8, publ
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     }
 
-    let Some(public_name) = (unsafe { borrow_text(public_name, public_name_len) }) else {
+    let Some(public_name) = (unsafe { Slice::borrow_text(public_name, public_name_len) }) else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 
@@ -207,7 +207,7 @@ pub unsafe extern "C" fn soyokaze_ech_keys_generate(public_name: *const u8, publ
 /// octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_ech_keys_new(config: *const u8, config_len: usize, private_key: *const u8, private_key_len: usize) -> *mut EchKeys {
-    let (Some(config), Some(private_key)) = (unsafe { borrow(config, config_len) }, unsafe { borrow(private_key, private_key_len) }) else {
+    let (Some(config), Some(private_key)) = (unsafe { Slice::borrow(config, config_len) }, unsafe { Slice::borrow(private_key, private_key_len) }) else {
         return std::ptr::null_mut();
     };
 
@@ -285,7 +285,7 @@ pub unsafe extern "C" fn soyokaze_ech_config_list_parse(data: *const u8, data_le
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     }
 
-    let Some(data) = (unsafe { borrow(data, data_len) }) else {
+    let Some(data) = (unsafe { Slice::borrow(data, data_len) }) else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 

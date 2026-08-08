@@ -8,8 +8,8 @@
 
 use crate::errors::Error;
 use crate::ffi::errors::{ErrorHandle, Status};
-use crate::ffi::helpers::fields::{parse_fields, Field, Fields};
-use crate::ffi::{borrow, Buffer};
+use crate::ffi::helpers::fields::{Field, Fields};
+use crate::ffi::{Buffer, Slice};
 use crate::helpers::qpack::{Decoder, Encoder};
 
 /// Builds a QPACK encoder that references only the static table until it is
@@ -135,7 +135,7 @@ pub unsafe extern "C" fn soyokaze_qpack_encoder_set_max_instruction_size(encoder
 /// `block` and `instructions` must be writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_qpack_encode(encoder: *mut Encoder, stream_id: u64, fields: *const Field, field_count: usize, block: *mut Buffer, instructions: *mut Buffer) -> bool {
-    let (Some(encoder), Some(fields)) = (unsafe { encoder.as_mut() }, unsafe { parse_fields(fields, field_count) }) else {
+    let (Some(encoder), Some(fields)) = (unsafe { encoder.as_mut() }, unsafe { Field::parse_all(fields, field_count) }) else {
         return false;
     };
 
@@ -173,7 +173,7 @@ pub unsafe extern "C" fn soyokaze_qpack_encoder_on_decoder_instructions(encoder:
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 
-    let Some(data) = (unsafe { borrow(data, data_len) }) else {
+    let Some(data) = (unsafe { Slice::borrow(data, data_len) }) else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 
@@ -295,7 +295,7 @@ pub unsafe extern "C" fn soyokaze_qpack_decoder_on_encoder_instructions(decoder:
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 
-    let Some(data) = (unsafe { borrow(data, data_len) }) else {
+    let Some(data) = (unsafe { Slice::borrow(data, data_len) }) else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 
@@ -333,7 +333,7 @@ pub unsafe extern "C" fn soyokaze_qpack_decode(decoder: *mut Decoder, stream_id:
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     }
 
-    let Some(block) = (unsafe { borrow(block, block_len) }) else {
+    let Some(block) = (unsafe { Slice::borrow(block, block_len) }) else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 

@@ -375,6 +375,11 @@ where
         &self.hpack_encoder
     }
 
+    /// The HPACK decoder for the other direction.
+    pub fn hpack_decoder(&self) -> &HPACKDecoder {
+        &self.hpack_decoder
+    }
+
     /// How many streams this end may open at once.
     ///
     /// The peer's advertised ceiling where it gave one, and
@@ -409,7 +414,8 @@ where
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] when a server's peer does not begin with
-    /// [`PREFACE`], and otherwise as [`Buffer::require`].
+    /// [`PREFACE`], and otherwise as [`Buffer::require`] and
+    /// [`H2Connection::flush_out`].
     pub async fn start(&mut self) -> Result<(), Error> {
         if self.started {
             return Ok(());
@@ -529,7 +535,8 @@ where
     ///
     /// Returns [`Error::Limit`] when opening a stream would go past
     /// [`H2Connection::local_stream_ceiling`], and otherwise as
-    /// [`common::Fields::of`] and [`H2Connection::flush_out`].
+    /// [`H2Connection::start`], [`common::Fields::of`], [`Body::into_bytes`],
+    /// [`H2Connection::write_data`] and [`H2Connection::flush_out`].
     pub async fn send_message(&mut self, message: Message) -> Result<(), Error> {
         let mut message = message;
         self.request_finalizer.finalize(self.role, &mut message);
@@ -717,8 +724,8 @@ where
     /// # Errors
     ///
     /// Returns [`Error::Closed`] when the transport ends mid-frame, and
-    /// otherwise as [`Frame::parse`], [`Buffer::fill`] and
-    /// [`H2Connection::flush_out`].
+    /// otherwise as [`Frame::parse`], [`H2Connection::flush_out`] and
+    /// [`Buffer::fill`].
     pub async fn read_frame(&mut self) -> Result<Frame, Error> {
         let max_frame_size = self.settings_local.max_frame_size;
 
@@ -739,7 +746,8 @@ where
     ///
     /// # Errors
     ///
-    /// As [`H2Connection::read_frame`] and [`H2Connection::handle`].
+    /// As [`H2Connection::start`], [`H2Connection::read_frame`],
+    /// [`H2Connection::handle`] and [`H2Connection::flush_out`].
     pub async fn pump(&mut self) -> Result<Option<Message>, Error> {
         self.start().await?;
         self.flush_resets().await?;
@@ -969,8 +977,9 @@ where
     /// Returns [`Error::Limit`] when the block goes past
     /// [`Limits::max_headers_size`] or spans more than
     /// [`Limits::max_header_count`] frames — a CONTINUATION flood otherwise
-    /// costs unbounded memory — and [`Error::Protocol`] when any other frame
-    /// interrupts the block.
+    /// costs unbounded memory — [`Error::Protocol`] when any other frame
+    /// interrupts the block, and otherwise as [`H2Connection::read_frame`] and
+    /// [`H2Connection::finish_headers`].
     pub async fn continue_headers(&mut self, stream_id: StreamID, end_stream: bool) -> Result<Option<Message>, Error> {
         let mut frames = 0u64;
 

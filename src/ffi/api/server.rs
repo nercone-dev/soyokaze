@@ -7,11 +7,8 @@
 //! to the [`OnRequest`] callback, which answers it, and each accepted
 //! WebSocket to the [`OnWebSocket`] callback, when one was given.
 
-use bytes::Bytes;
-
 use crate::api::cluster::Cluster;
 use crate::api::server::{Handler, Server, ServerHandle};
-use crate::ffi::models::parse_versions;
 use crate::ffi::SendPtr;
 use crate::ffi::models::Limits;
 use crate::ffi::errors::{ErrorHandle, Status};
@@ -19,8 +16,8 @@ use crate::ffi::hsts::HstsPolicy;
 use crate::ffi::models::Port;
 use crate::ffi::tls::TlsConfig;
 use crate::ffi::websocket::WebSocket;
-use crate::ffi::{borrow, Runtime, Slice};
-use crate::models::{Body, Message, Version};
+use crate::ffi::{Runtime, Slice};
+use crate::models::{Message, Version};
 use crate::protocol::base::{AnyConnection, Connection, Transport};
 use crate::tls::{EchKeys, Identity};
 
@@ -214,6 +211,23 @@ impl ServerLimits {
             worker_stack_size: self.worker_stack_size,
         }
     }
+
+    /// The C half of `limits`, field for field.
+    ///
+    /// The rate list cannot cross without a caller-owned array to point into,
+    /// so it comes back empty.
+    pub fn build(limits: &crate::api::server::ServerLimits) -> Self {
+        Self {
+            message: Limits::build(&limits.message),
+            backlog: limits.backlog,
+            max_connections: limits.max_connections,
+            max_connections_per_ip: limits.max_connections_per_ip,
+            max_connection_rate: std::ptr::null(),
+            rate_count: 0,
+            max_connection_history: limits.max_connection_history,
+            worker_stack_size: limits.worker_stack_size,
+        }
+    }
 }
 
 /// The default [`ServerLimits`], to be adjusted and passed back.
@@ -221,18 +235,7 @@ impl ServerLimits {
 /// [`ServerLimits`]: crate::api::server::ServerLimits
 #[unsafe(no_mangle)]
 pub extern "C" fn soyokaze_server_limits_default() -> ServerLimits {
-    let limits = crate::api::server::ServerLimits::default();
-
-    ServerLimits {
-        message: Limits::build(&limits.message),
-        backlog: limits.backlog,
-        max_connections: limits.max_connections,
-        max_connections_per_ip: limits.max_connections_per_ip,
-        max_connection_rate: std::ptr::null(),
-        rate_count: 0,
-        max_connection_history: limits.max_connection_history,
-        worker_stack_size: limits.worker_stack_size,
-    }
+    ServerLimits::build(&crate::api::server::ServerLimits::default())
 }
 
 /// How many threads the machine can run at once, or 1 if that cannot be
@@ -317,7 +320,7 @@ impl ServerConfig {
     pub unsafe fn build(&self) -> Option<Server> {
         let mut config = crate::api::server::ServerConfig { reuseport: self.reuseport, ..Default::default() };
 
-        let versions = unsafe { parse_versions(self.versions, self.version_count) }?;
+        let versions = unsafe { Version::parse_all(self.versions, self.version_count) }?;
         if !versions.is_empty() {
             config.versions = versions;
         }
@@ -329,8 +332,8 @@ impl ServerConfig {
         if let Some(identity) = unsafe { self.identity.as_ref() } {
             config.identity = Some(identity.clone());
         } else if let (Some(certificate), Some(key)) = (
-            unsafe { borrow(self.certificate.data, self.certificate.len) },
-            unsafe { borrow(self.key.data, self.key.len) },
+            unsafe { Slice::borrow(self.certificate.data, self.certificate.len) },
+            unsafe { Slice::borrow(self.key.data, self.key.len) },
         ) {
             config.identity = Some(Identity::new(vec![certificate.to_vec()], key.to_vec()));
         }
@@ -385,25 +388,6 @@ pub unsafe extern "C" fn soyokaze_server_free(server: *mut Server) {
     }
 }
 
-/// Reads `port_count` ports out of a C array.
-///
-/// # Safety
-///
-/// `ports` must point to `port_count` readable [`Port`] values whose own
-/// pointers are valid.
-unsafe fn parse_ports(ports: *const Port, port_count: usize) -> Option<Vec<crate::models::Port>> {
-    if ports.is_null() {
-        return None;
-    }
-
-    let mut bound = Vec::with_capacity(port_count);
-    for index in 0..port_count {
-        bound.push(unsafe { (*ports.add(index)).parse() }?);
-    }
-
-    Some(bound)
-}
-
 /// Binds every port and starts serving.
 ///
 /// Returns as soon as the ports are bound; the accept loops keep running on
@@ -430,7 +414,7 @@ pub unsafe extern "C" fn soyokaze_server_serve(runtime: *mut Runtime, server: *c
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     }
 
-    let Some(bound) = (unsafe { parse_ports(ports, port_count) }) else {
+    let Some(bound) = (unsafe { Port::parse_all(ports, port_count) }) else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 
@@ -528,7 +512,7 @@ pub unsafe extern "C" fn soyokaze_server_run(server: *const Server, on_request: 
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     }
 
-    let Some(bound) = (unsafe { parse_ports(ports, port_count) }) else {
+    let Some(bound) = (unsafe { Port::parse_all(ports, port_count) }) else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 
@@ -609,23 +593,4 @@ pub unsafe extern "C" fn soyokaze_cluster_close(cluster: *mut Cluster, timeout: 
 
     let cluster = *unsafe { Box::from_raw(cluster) };
     cluster.close((timeout >= 0.0).then_some(timeout));
-}
-
-/// The response a callback returns to answer with a body it holds in memory.
-///
-/// A shorthand for building a response and setting its body, since that is what
-/// most callbacks do.
-///
-/// # Safety
-///
-/// `body` must either be null or point to `body_len` readable octets.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_response_with_body(status_code: u16, version: Version, body: *const u8, body_len: usize) -> *mut Message {
-    let mut response = Message::response(status_code, version);
-
-    if let Some(body) = unsafe { borrow(body, body_len) } {
-        response.body = Some(Body::Data(Bytes::copy_from_slice(body)));
-    }
-
-    Box::into_raw(Box::new(response))
 }

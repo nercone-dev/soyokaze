@@ -115,6 +115,35 @@ impl Slice {
     pub fn is_absent(&self) -> bool {
         self.data.is_null()
     }
+
+    /// Borrows `len` octets from `data`.
+    ///
+    /// A null `data` borrows nothing, which is how an absent argument is
+    /// passed.
+    ///
+    /// # Safety
+    ///
+    /// `data` must either be null or point to `len` readable octets that
+    /// outlive the returned slice.
+    pub unsafe fn borrow<'a>(data: *const u8, len: usize) -> Option<&'a [u8]> {
+        if data.is_null() {
+            return None;
+        }
+
+        Some(unsafe { std::slice::from_raw_parts(data, len) })
+    }
+
+    /// Borrows `len` octets from `data` as UTF-8.
+    ///
+    /// Returns `None` when the argument is absent or is not UTF-8, which
+    /// callers report as [`Status::Invalid`].
+    ///
+    /// # Safety
+    ///
+    /// As [`Slice::borrow`].
+    pub unsafe fn borrow_text<'a>(data: *const u8, len: usize) -> Option<&'a str> {
+        std::str::from_utf8(unsafe { Self::borrow(data, len) }?).ok()
+    }
 }
 
 /// Octets owned by the caller.
@@ -161,34 +190,6 @@ pub unsafe extern "C" fn soyokaze_buffer_free(buffer: Buffer) {
 #[unsafe(no_mangle)]
 pub extern "C" fn soyokaze_version() -> Slice {
     Slice::text(env!("CARGO_PKG_VERSION"))
-}
-
-/// Borrows `len` octets from `data`.
-///
-/// A null `data` borrows nothing, which is how an absent argument is passed.
-///
-/// # Safety
-///
-/// `data` must either be null or point to `len` readable octets that outlive
-/// the returned slice.
-pub unsafe fn borrow<'a>(data: *const u8, len: usize) -> Option<&'a [u8]> {
-    if data.is_null() {
-        return None;
-    }
-
-    Some(unsafe { std::slice::from_raw_parts(data, len) })
-}
-
-/// Borrows `len` octets from `data` as UTF-8.
-///
-/// Returns `None` when the argument is absent or is not UTF-8, which callers
-/// report as [`Status::Invalid`].
-///
-/// # Safety
-///
-/// As [`borrow`].
-pub unsafe fn borrow_text<'a>(data: *const u8, len: usize) -> Option<&'a str> {
-    std::str::from_utf8(unsafe { borrow(data, len) }?).ok()
 }
 
 /// A raw pointer wrapped so a spawned task may carry it.

@@ -465,7 +465,8 @@ impl EncoderInstruction {
     ///
     /// Returns [`Error::Incomplete`] when the instruction is not all there
     /// yet, which is the signal to wait for more of the stream rather than to
-    /// fail the connection.
+    /// fail the connection. Otherwise as [`Integer::decode`] and
+    /// [`StringLiteral::decode`], whose errors are fatal.
     pub fn decode(input: &[u8]) -> Result<(usize, Self), Error> {
         let first = *input.first().ok_or(Error::Incomplete)?;
 
@@ -545,7 +546,8 @@ impl DecoderInstruction {
     /// # Errors
     ///
     /// Returns [`Error::Incomplete`] when the instruction is not all there
-    /// yet, which is the signal to wait for more of the stream.
+    /// yet, which is the signal to wait for more of the stream. Otherwise as
+    /// [`Integer::decode`], whose errors are fatal.
     pub fn decode(input: &[u8]) -> Result<(usize, Self), Error> {
         let first = *input.first().ok_or(Error::Incomplete)?;
 
@@ -1110,7 +1112,7 @@ impl Decoder {
     ///
     /// Returns [`Error::InstructionTooLarge`] when a single instruction grows
     /// past [`Decoder::set_max_instruction_size`], and otherwise as
-    /// [`Decoder::on_encoder_instruction`].
+    /// [`EncoderInstruction::decode`] and [`Decoder::on_encoder_instruction`].
     pub fn on_encoder_stream(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.stream_recv.extend_from_slice(bytes);
 

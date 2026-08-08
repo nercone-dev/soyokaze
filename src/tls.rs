@@ -792,6 +792,8 @@ impl EchKeys {
     ///
     /// Returns [`Error::Tls`] when BoringSSL rejects the key or the config.
     pub fn install(&self, builder: &SslContextBuilder) -> Result<(), Error> {
+        // boring's dhkem_p256_sha256 is misnamed: it initialises the key with
+        // EVP_hpke_x25519_hkdf_sha256, matching KEM_X25519_HKDF_SHA256.
         let key = HpkeKey::dhkem_p256_sha256(&self.private_key).map_err(Error::tls)?;
         let mut keys = SslEchKeys::builder().map_err(Error::tls)?;
         keys.add_key(true, &self.config, key).map_err(Error::tls)?;

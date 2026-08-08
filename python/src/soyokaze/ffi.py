@@ -314,6 +314,7 @@ declare("soyokaze_message_body_len", c_int64, c_void_p)
 declare("soyokaze_message_body", c_int32, c_void_p, c_void_p, POINTER(Buffer), POINTER(c_void_p))
 
 # ---------------------------------------------------------------- responses
+declare("soyokaze_response_with_body", c_void_p, c_uint16, c_int32, c_char_p, c_size_t)
 declare("soyokaze_response_content", c_void_p, c_char_p, c_size_t, c_char_p, c_size_t, c_int32)
 declare("soyokaze_response_text", c_void_p, c_char_p, c_size_t, c_int32)
 declare("soyokaze_response_html", c_void_p, c_char_p, c_size_t, c_int32)
@@ -368,6 +369,7 @@ declare("soyokaze_hsts_store_new", c_void_p, POINTER(Limits))
 declare("soyokaze_hsts_store_free", None, c_void_p)
 declare("soyokaze_hsts_store_learn", c_bool, c_void_p, c_char_p, c_size_t, c_char_p, c_size_t, c_bool)
 declare("soyokaze_hsts_store_secure", c_bool, c_void_p, c_char_p, c_size_t)
+declare("soyokaze_hsts_store_prune", None, c_void_p)
 
 # ---------------------------------------------------------------------- tls
 declare("soyokaze_tls_config_default", TlsConfig)
@@ -438,7 +440,6 @@ declare("soyokaze_cluster_address_count", c_size_t, c_void_p)
 declare("soyokaze_cluster_port_at", c_uint16, c_void_p, c_size_t)
 declare("soyokaze_cluster_workers", c_uint32, c_void_p)
 declare("soyokaze_cluster_close", None, c_void_p, c_double)
-declare("soyokaze_response_with_body", c_void_p, c_uint16, c_int32, c_char_p, c_size_t)
 
 # ---------------------------------------------------------------- finalizer
 declare("soyokaze_http_date", Buffer, c_uint64)

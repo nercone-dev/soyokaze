@@ -138,8 +138,9 @@ impl Url {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Protocol`] when the URL carries no scheme or no host,
-    /// when the port is not a number, or when an IPv6 authority is malformed.
+    /// Returns [`Error::Protocol`] when the URL carries no scheme, when an
+    /// IPv6 authority is malformed, when the port is not a number, or when
+    /// the URL carries no host.
     pub fn parse(text: &str) -> Result<Self, Error> {
         let (scheme, rest) = text.split_once("://").ok_or_else(|| Error::Protocol(format!("url {text:?} has no scheme")))?;
         let scheme = scheme.to_ascii_lowercase();

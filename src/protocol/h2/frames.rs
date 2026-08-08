@@ -505,9 +505,10 @@ impl Frame {
     ///
     /// Returns [`Error::Protocol`] when the payload does not match its
     /// declared length, when the frame is on a stream its type does not
-    /// belong on, when padding runs past the payload, when a fixed-size
-    /// frame is the wrong size, when a SETTINGS acknowledgement carries a
-    /// payload or its length is not a multiple of six, or when a
+    /// belong on, when padding runs past the payload, when a HEADERS,
+    /// PUSH_PROMISE or GOAWAY payload is too short for its fixed fields, when
+    /// a fixed-size frame is the wrong size, when a SETTINGS acknowledgement
+    /// carries a payload or its length is not a multiple of six, or when a
     /// `WINDOW_UPDATE` increment is zero.
     pub fn assemble(header: FrameHeader, payload: &[u8], shared: Option<&Bytes>) -> Result<Self, Error> {
         if payload.len() != header.length as usize {

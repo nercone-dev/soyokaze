@@ -70,3 +70,7 @@ class HstsStore:
         """Whether ``host`` must be reached over TLS."""
         encoded = ffi.encoded(host)
         return library.soyokaze_hsts_store_secure(self.handle, encoded, len(encoded))
+
+    def prune(self):
+        """Drops every entry that has expired."""
+        library.soyokaze_hsts_store_prune(self.handle)

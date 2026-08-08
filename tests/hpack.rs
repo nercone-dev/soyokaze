@@ -1,5 +1,5 @@
 use soyokaze::helpers::fields::{HeaderField, Integer};
-use soyokaze::helpers::hpack::{Decoder, DynamicTable, Encoder, Error};
+use soyokaze::helpers::hpack::{Decoder, DynamicTable, Encoder, Error, StaticTable};
 
 fn field(name: &str, value: &str) -> HeaderField {
     HeaderField::new(name, value)
@@ -86,11 +86,32 @@ fn resizing_evicts_down_to_the_new_maximum() {
 
 #[test]
 fn finds_a_full_match_before_a_name_only_match() {
-    let table = DynamicTable::new(DynamicTable::DEFAULT_CAPACITY);
+    assert_eq!(StaticTable::find(&field(":method", "GET")), Some((2, true)));
+    assert_eq!(StaticTable::find(&field(":method", "PATCH")), Some((2, false)));
+    assert_eq!(StaticTable::find(&field("x-nothing", "here")), None);
 
-    assert_eq!(table.find(&field(":method", "GET")), Some((2, true)));
-    assert_eq!(table.find(&field(":method", "PATCH")), Some((2, false)));
+    let mut table = DynamicTable::new(DynamicTable::DEFAULT_CAPACITY);
+    table.insert(field("x-custom", "one"));
+    table.insert(field("x-custom", "two"));
+
+    assert_eq!(table.find(&field("x-custom", "two")), Some((0, true)));
+    assert_eq!(table.find(&field("x-custom", "one")), Some((1, true)));
+    assert_eq!(table.find(&field("x-custom", "missing")), Some((0, false)));
     assert_eq!(table.find(&field("x-nothing", "here")), None);
+}
+
+#[test]
+fn references_dynamic_entries_after_the_static_table() {
+    let mut encoder = Encoder::new();
+    let custom = field("x-custom", "value");
+
+    assert_eq!(encoder.reference(&custom), None);
+    encoder.encode(std::slice::from_ref(&custom));
+
+    assert_eq!(encoder.reference(&custom), Some((62, true)), "RFC 7541 §2.3.3: the dynamic table starts at index 62");
+    assert_eq!(encoder.reference(&field("x-custom", "other")), Some((62, false)));
+    assert_eq!(encoder.reference(&field(":method", "GET")), Some((2, true)));
+    assert_eq!(encoder.reference(&field(":method", "PATCH")), Some((2, false)), "a static name match wins over no match at all");
 }
 
 #[test]

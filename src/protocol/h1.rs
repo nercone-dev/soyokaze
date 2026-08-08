@@ -929,7 +929,7 @@ impl BodyLength {
     /// `Content-Length` are both present, when a request's `Transfer-Encoding`
     /// does not end in `chunked`, and when two `Content-Length` values
     /// disagree. Each of these is a way of making one byte stream read as two
-    /// different messages.
+    /// different messages. Otherwise as [`BodyLength::content_length`].
     pub fn of(message: &Message, method: Option<Method>) -> Result<Self, Error> {
         let headers = message.headers.as_ref();
 
@@ -1210,8 +1210,8 @@ where
     ///
     /// Returns [`Error::Limit`] when more than [`H1Connection::pipeline_depth`]
     /// requests are already awaiting a response, [`Error::Io`] when a
-    /// [`Body::File`] cannot be read, and otherwise as
-    /// [`StartLine::write`] and [`Field::write`].
+    /// [`Body::File`] cannot be read, and otherwise as [`StartLine::write`],
+    /// [`Field::write`] and [`H1Connection::write_flushed`].
     pub async fn send_message(&mut self, message: Message) -> Result<(), Error> {
         if message.method.is_some() && self.pending.len() >= self.pipeline_depth() {
             let reason = format!("more than {} requests are awaiting a response", self.pipeline_depth());
@@ -1405,7 +1405,7 @@ where
     ///
     /// Returns [`Error::Limit`] past [`Limits::max_headers_size`],
     /// [`Error::Closed`] when the transport ends first, and otherwise as
-    /// [`Field::parse_block`].
+    /// [`Buffer::fill`] and [`Field::parse_block`].
     pub async fn read_header_block(&mut self) -> Result<(Headers, usize), Error> {
         let max = self.limits.max_headers_size;
         let mut searched = 0usize;
@@ -1454,7 +1454,8 @@ where
     /// Returns [`Error::Limit`] when the body goes past that ceiling or a
     /// chunk size line past [`Limits::max_chunk_header_size`],
     /// [`Error::Closed`] when the transport ends mid-body, and otherwise as
-    /// [`Chunk::decode`].
+    /// [`Buffer::require`], [`Chunk::parse_size`], [`Chunk::decode`] and
+    /// [`Buffer::fill`].
     pub async fn read_body(&mut self, length: BodyLength, budget: u64) -> Result<Option<Bytes>, Error> {
         let limit = self.limits.max_message_body_size.min(budget);
 

@@ -11,7 +11,7 @@
 //! Opcodes and close codes cross as their wire numbers.
 
 use crate::ffi::errors::{ErrorHandle, Status};
-use crate::ffi::{borrow, borrow_text, Buffer};
+use crate::ffi::{Buffer, Slice};
 use crate::models::Role;
 use crate::protocol::base::Transport;
 use crate::websocket::{CloseCode, Frame, Opcode, WebSocketConnection};
@@ -53,8 +53,8 @@ pub unsafe extern "C" fn soyokaze_websocket_free(socket: *mut WebSocket) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_websocket_role(socket: *const WebSocket) -> u32 {
     match unsafe { socket.as_ref() } {
-        Some(socket) => crate::ffi::models::role(socket.connection.role()),
-        None => crate::ffi::models::role(Role::UserAgent),
+        Some(socket) => Role::build(socket.connection.role()),
+        None => Role::build(Role::UserAgent),
     }
 }
 
@@ -101,7 +101,7 @@ pub unsafe extern "C" fn soyokaze_websocket_send(socket: *mut WebSocket, fin: bo
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 
-    let payload = unsafe { borrow(payload, payload_len) }.unwrap_or_default().to_vec();
+    let payload = unsafe { Slice::borrow(payload, payload_len) }.unwrap_or_default().to_vec();
     let frame = Frame { fin, opcode, mask: None, payload };
 
     match socket.handle.clone().block_on(socket.connection.send(frame)) {
@@ -206,7 +206,7 @@ pub unsafe extern "C" fn soyokaze_websocket_close(socket: *mut WebSocket, code: 
         return false;
     };
 
-    let reason = unsafe { borrow_text(reason, reason_len) }.unwrap_or_default();
+    let reason = unsafe { Slice::borrow_text(reason, reason_len) }.unwrap_or_default();
     socket.handle.clone().block_on(socket.connection.close(code, reason));
     true
 }

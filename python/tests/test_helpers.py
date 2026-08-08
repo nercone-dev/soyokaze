@@ -110,3 +110,7 @@ def test_hsts_store_remembers_and_withdraws():
 
     store.learn("example.test", "max-age=0", secure=True)
     assert not store.secure("example.test"), "max-age=0 withdraws"
+
+    store.learn("kept.test", "max-age=60", secure=True)
+    store.prune()
+    assert store.secure("kept.test"), "an unexpired entry survives a prune"

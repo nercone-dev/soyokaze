@@ -30,9 +30,10 @@ use soyokaze::ffi::models::{
     soyokaze_url_port, soyokaze_url_scheme, soyokaze_url_secure, soyokaze_url_target, Port, PortKind,
 };
 use soyokaze::ffi::api::server::{
-    soyokaze_response_with_body, soyokaze_server_free, soyokaze_server_handle_close, soyokaze_server_handle_port,
-    soyokaze_server_new, soyokaze_server_serve,
+    soyokaze_server_free, soyokaze_server_handle_close, soyokaze_server_handle_port, soyokaze_server_new,
+    soyokaze_server_serve,
 };
+use soyokaze::ffi::responses::soyokaze_response_with_body;
 use soyokaze::ffi::tls::{soyokaze_tls_config_default, TlsConfig};
 use soyokaze::ffi::{
     soyokaze_buffer_free, soyokaze_runtime_free, soyokaze_runtime_new, soyokaze_version, Buffer, Runtime, Slice,
@@ -758,18 +759,17 @@ fn the_connection_facts_cross_as_the_wire_codes_the_handshake_settled() {
 
 #[test]
 fn every_role_crosses_as_the_number_the_header_gives_it() {
-    use soyokaze::ffi::models::role;
     use soyokaze::models::Role;
 
-    assert_eq!(role(Role::UserAgent), 0);
-    assert_eq!(role(Role::Origin), 1);
-    assert_eq!(role(Role::Proxy), 2);
-    assert_eq!(role(Role::Gateway), 3);
-    assert_eq!(role(Role::Tunnel), 4, "a tunnel is neither a client nor a server, and must not read as one");
+    assert_eq!(Role::build(Role::UserAgent), 0);
+    assert_eq!(Role::build(Role::Origin), 1);
+    assert_eq!(Role::build(Role::Proxy), 2);
+    assert_eq!(Role::build(Role::Gateway), 3);
+    assert_eq!(Role::build(Role::Tunnel), 4, "a tunnel is neither a client nor a server, and must not read as one");
 
     let numbers: Vec<u32> = [Role::UserAgent, Role::Origin, Role::Proxy, Role::Gateway, Role::Tunnel]
         .into_iter()
-        .map(role)
+        .map(Role::build)
         .collect();
 
     let mut distinct = numbers.clone();
@@ -929,7 +929,7 @@ fn a_jar_returns_matching_cookies_and_a_zero_age_deletes() {
 fn an_hsts_policy_and_store_follow_rfc_6797() {
     use soyokaze::ffi::hsts::{
         soyokaze_hsts_policy_build, soyokaze_hsts_policy_parse, soyokaze_hsts_store_free, soyokaze_hsts_store_learn,
-        soyokaze_hsts_store_new, soyokaze_hsts_store_secure, HstsPolicy,
+        soyokaze_hsts_store_new, soyokaze_hsts_store_prune, soyokaze_hsts_store_secure, HstsPolicy,
     };
 
     let (value, value_len) = text("max-age=31536000; includeSubDomains");
@@ -955,6 +955,13 @@ fn an_hsts_policy_and_store_follow_rfc_6797() {
     assert!(unsafe { soyokaze_hsts_store_learn(store, plain, plain_len, value, value_len, false) });
     assert!(!unsafe { soyokaze_hsts_store_secure(store, plain, plain_len) }, "a policy over plaintext is ignored");
 
+    let (expiring, expiring_len) = text("max-age=1");
+    let (brief, brief_len) = text("brief.test");
+    assert!(unsafe { soyokaze_hsts_store_learn(store, brief, brief_len, expiring, expiring_len, true) });
+    unsafe { soyokaze_hsts_store_prune(store) };
+    assert!(unsafe { soyokaze_hsts_store_secure(store, brief, brief_len) }, "an unexpired entry survives a prune");
+    assert!(unsafe { soyokaze_hsts_store_secure(store, host, host_len) });
+
     unsafe { soyokaze_hsts_store_free(store) };
 }
 
@@ -973,7 +980,8 @@ fn base64_sha1_and_huffman_match_their_rfcs() {
     assert_eq!(take(decoded), b"foobar");
 
     let (bad, bad_len) = text("not base64!");
-    assert!(!unsafe { soyokaze_base64_decode(bad, bad_len, &mut Buffer::EMPTY) });
+    let mut refused = Buffer::EMPTY;
+    assert!(!unsafe { soyokaze_base64_decode(bad, bad_len, &mut refused) });
 
     let (abc, abc_len) = text("abc");
     let digest = take(unsafe { soyokaze_sha1(abc, abc_len) });
@@ -989,7 +997,8 @@ fn base64_sha1_and_huffman_match_their_rfcs() {
     assert_eq!(take(back), b"www.example.com");
 
     let junk = [0xffu8; 5];
-    assert!(!unsafe { soyokaze_huffman_decode(junk.as_ptr(), junk.len(), &mut Buffer::EMPTY) });
+    let mut garbled = Buffer::EMPTY;
+    assert!(!unsafe { soyokaze_huffman_decode(junk.as_ptr(), junk.len(), &mut garbled) });
 }
 
 #[test]

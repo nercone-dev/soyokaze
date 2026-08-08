@@ -314,8 +314,8 @@ impl StringLiteral {
     /// # Errors
     ///
     /// Returns [`Error::Incomplete`] when the string runs past the end of the
-    /// input, and [`Error::Huffman`] when a Huffman coded string will not
-    /// decode.
+    /// input, [`Error::Huffman`] when a Huffman coded string will not decode,
+    /// and otherwise as [`Integer::decode`].
     pub fn decode_into_ascii(input: &[u8], prefix_bits: u8, scratch: &mut Vec<u8>) -> Result<(usize, bool), Error> {
         let huffman = input.first().ok_or(Error::Incomplete)? & 1 << prefix_bits != 0;
         let (prefix, length) = Integer::decode(input, prefix_bits)?;
