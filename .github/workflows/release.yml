@@ -358,7 +358,6 @@ jobs:
     name: Build FFI (${{ matrix.arch }}-${{ matrix.os }})
     needs: update
     runs-on: ${{ matrix.runner }}
-    if: "!github.event.release.prerelease"
     strategy:
       fail-fast: false
       matrix:
