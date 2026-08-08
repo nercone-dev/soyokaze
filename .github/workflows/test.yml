@@ -16,19 +16,28 @@ env:
 
 jobs:
   test:
-    runs-on: ${{ matrix.os }}
+    name: Test (${{ matrix.os }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
+          - os: linux
+            arch: aarch64
+            runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: macos-15-intel
+          - os: macos
+            arch: x86_64
+            runner: macos-15-intel
             target: x86_64-apple-darwin
+          - os: macos
+            arch: aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
 
     steps:
       - uses: actions/checkout@v5
@@ -45,25 +54,59 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test-${{ matrix.target }}
+          key: test-${{ matrix.arch }}-${{ matrix.os }}
 
-      - name: Run tests
+      - name: Run cargo check
+        run: cargo check
+
+      - name: Run cargo test
         run: cargo test --all-features
 
+      - name: Run cargo clippy
+        run: cargo clippy
+
+  test-doc:
+    name: Test Documentation
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-doc
+
+      - name: Build the documentation
+        run: cargo doc --no-deps --all-features
+
   test-ffi:
-    runs-on: ${{ matrix.os }}
+    name: Test FFI (${{ matrix.os }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
+          - os: linux
+            arch: aarch64
+            runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: macos-15-intel
+          - os: macos
+            arch: x86_64
+            runner: macos-15-intel
             target: x86_64-apple-darwin
+          - os: macos
+            arch: aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
 
     steps:
       - uses: actions/checkout@v5
@@ -80,7 +123,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test-ffi-${{ matrix.target }}
+          key: build-ffi-${{ matrix.arch }}-${{ matrix.os }}
 
       - name: Build every library form
         run: cargo build --lib
@@ -107,27 +150,39 @@ jobs:
           cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c target/debug/libsoyokaze.a $libs -o ffi-static
           ./ffi-static
 
-  test-python:
-    runs-on: ${{ matrix.os }}
+  build-python:
+    name: Test Python Binding (${{ matrix.os }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
+          - os: linux
+            arch: aarch64
+            runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: macos-15-intel
+          - os: macos
+            arch: x86_64
+            runner: macos-15-intel
             target: x86_64-apple-darwin
+          - os: macos
+            arch: aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
 
     steps:
       - uses: actions/checkout@v5
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
+        run: |
+          dnf install -y 'dnf-command(config-manager)'
+          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf install -y cmake clang clang-devel golang perl
 
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
@@ -137,7 +192,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test-python-${{ matrix.target }}
+          key: build-python-${{ matrix.arch }}-${{ matrix.os }}
 
       - name: Build the shared library
         run: cargo build --lib
@@ -148,24 +203,3 @@ jobs:
       - name: Run the Python test suite
         working-directory: python
         run: uv run pytest
-
-  test-doc:
-    runs-on: ubuntu-latest
-
-    env:
-      RUSTDOCFLAGS: -D warnings
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: test-doc
-
-      - name: Build the documentation
-        run: cargo doc --no-deps --all-features

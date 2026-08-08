@@ -17,6 +17,7 @@ env:
 
 jobs:
   update:
+    name: Update
     runs-on: ubuntu-latest
     if: "!github.event.release.prerelease"
     permissions:
@@ -55,21 +56,30 @@ jobs:
           echo "Almost ready for releasing [Soyokaze ${VERSION}]. Good luck!"
 
   test:
+    name: Test (${{ matrix.os }}-${{ matrix.arch }})
     needs: update
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     if: "!github.event.release.prerelease"
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
+          - os: linux
+            arch: aarch64
+            runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: macos-15-intel
+          - os: macos
+            arch: x86_64
+            runner: macos-15-intel
             target: x86_64-apple-darwin
+          - os: macos
+            arch: aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
 
     steps:
       - uses: actions/checkout@v5
@@ -86,12 +96,19 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test-${{ matrix.target }}
+          key: test-${{ matrix.arch }}-${{ matrix.os }}
 
-      - name: Run tests
+      - name: Run cargo check
+        run: cargo check
+
+      - name: Run cargo test
         run: cargo test --all-features
 
+      - name: Run cargo clippy
+        run: cargo clippy
+
   test-doc:
+    name: Test Documentation
     needs: [update, test]
     runs-on: ubuntu-latest
     if: "!github.event.release.prerelease"
@@ -115,22 +132,31 @@ jobs:
         run: cargo doc --no-deps --all-features
 
   build:
+    name: Build (${{ matrix.os }}-${{ matrix.arch }})
     needs: [update, test, test-doc]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
+          - os: linux
+            arch: aarch64
+            runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: macos-15-intel
+          - os: macos
+            arch: x86_64
+            runner: macos-15-intel
             target: x86_64-apple-darwin
+          - os: macos
+            arch: aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
 
     steps:
       - uses: actions/checkout@v5
@@ -149,7 +175,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: build-${{ matrix.target }}
+          key: build-${{ matrix.arch }}-${{ matrix.os }}
 
       - name: Build the shared library
         run: cargo build --release --lib
@@ -171,12 +197,13 @@ jobs:
           echo "native static libs: $libs"
           cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c target/release/libsoyokaze.a $libs -o ffi-static
           ./ffi-static
+
       - name: Package
         run: |
           TAG="${{ github.event.release.tag_name }}"
           VERSION="${TAG#v}"
 
-          name="soyokaze-${VERSION}-${{ matrix.target }}"
+          name="soyokaze-${VERSION}-${{ matrix.arch }}-${{ matrix.os }}"
           mkdir -p "staging/$name"
 
           cp target/release/libsoyokaze.* "staging/$name/"
@@ -214,21 +241,30 @@ jobs:
           GH_TOKEN: ${{ github.token }}
 
   build-ffi:
+    name: Build FFI (${{ matrix.os }}-${{ matrix.arch }})
     needs: [update, test, test-doc]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     if: "!github.event.release.prerelease"
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
+          - os: linux
+            arch: aarch64
+            runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: macos-15-intel
+          - os: macos
+            arch: x86_64
+            runner: macos-15-intel
             target: x86_64-apple-darwin
+          - os: macos
+            arch: aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
 
     steps:
       - uses: actions/checkout@v5
@@ -245,7 +281,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: build-ffi-${{ matrix.target }}
+          key: build-ffi-${{ matrix.arch }}-${{ matrix.os }}
 
       - name: Build every library form
         run: cargo build --lib
@@ -273,8 +309,9 @@ jobs:
           ./ffi-static
 
   build-python:
+    name: Build Python Binding (${{ matrix.os }}-${{ matrix.arch }})
     needs: [update, test, test-doc]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
     permissions:
       contents: write
@@ -282,22 +319,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             container: quay.io/pypa/manylinux_2_28_x86_64
             wheel_tag: manylinux_2_28_x86_64
-          - os: ubuntu-24.04-arm
+          - os: linux
+            arch: aarch64
+            runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             container: quay.io/pypa/manylinux_2_28_aarch64
             wheel_tag: manylinux_2_28_aarch64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            deployment_target: "11.0"
-            wheel_tag: macosx_11_0_arm64
-          - os: macos-15-intel
+          - os: macos
+            arch: x86_64
+            runner: macos-15-intel
             target: x86_64-apple-darwin
             deployment_target: "10.12"
             wheel_tag: macosx_10_12_x86_64
+          - os: macos
+            arch: aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            deployment_target: "11.0"
+            wheel_tag: macosx_11_0_arm64
 
     steps:
       - uses: actions/checkout@v5
@@ -323,7 +368,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: build-python-${{ matrix.target }}
+          key: build-python-${{ matrix.arch }}-${{ matrix.os }}
 
       - name: Build the shared library
         run: cargo build --release --lib
@@ -367,6 +412,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
 
   publish:
+    name: Publish
     needs: [update, test, test-doc, build, build-ffi, build-python]
     runs-on: ubuntu-latest
 
@@ -390,6 +436,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   publish-python:
+    name: Publish Python Binding
     needs: [update, test, test-doc, build, build-ffi, build-python]
     runs-on: ubuntu-latest
     environment: pypi
