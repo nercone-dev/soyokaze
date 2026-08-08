@@ -60,13 +60,13 @@ jobs:
           key: test-${{ matrix.arch }}-${{ matrix.os }}
 
       - name: Run cargo check
-        run: cargo check
+        run: cargo check --all-features
 
       - name: Run cargo test
         run: cargo test --all-features
 
       - name: Run cargo clippy
-        run: cargo clippy
+        run: cargo clippy --all-features
 
   test-doc:
     name: Test Documentation
@@ -129,7 +129,7 @@ jobs:
           key: test-ffi-${{ matrix.arch }}-${{ matrix.os }}
 
       - name: Build every library form
-        run: cargo build --lib
+        run: cargo build --lib --all-features
 
       - name: Build and run the C test against the shared library
         run: |
@@ -143,7 +143,7 @@ jobs:
         env:
           CARGO_TERM_COLOR: never
         run: |
-          libs=$(cargo rustc --lib --crate-type staticlib -- --print native-static-libs 2>&1 \
+          libs=$(cargo rustc --lib --all-features --crate-type staticlib -- --print native-static-libs 2>&1 \
                  | sed -n 's/^note: native-static-libs: //p' | tail -n1)
           if [ -z "$libs" ]; then
             echo "::error::rustc reported no native static libs; the link would fail obscurely"
@@ -196,7 +196,7 @@ jobs:
           key: test-python-${{ matrix.arch }}-${{ matrix.os }}
 
       - name: Build the shared library
-        run: cargo build --lib
+        run: cargo build --lib --all-features
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0

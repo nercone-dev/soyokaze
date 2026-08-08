@@ -58,13 +58,13 @@ jobs:
           key: test-${{ matrix.arch }}-${{ matrix.os }}
 
       - name: Run cargo check
-        run: cargo check
+        run: cargo check --release --all-features
 
       - name: Run cargo test
-        run: cargo test --all-features
+        run: cargo test --release --all-features
 
       - name: Run cargo clippy
-        run: cargo clippy
+        run: cargo clippy --release --all-features
 
   test-doc:
     name: Test Documentation
@@ -86,7 +86,7 @@ jobs:
           key: test-doc
 
       - name: Build the documentation
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --no-deps --release --all-features
 
   test-ffi:
     name: Test FFI (${{ matrix.arch }}-${{ matrix.os }})
@@ -130,7 +130,7 @@ jobs:
           key: test-ffi-${{ matrix.arch }}-${{ matrix.os }}
 
       - name: Build every library form
-        run: cargo build --lib
+        run: cargo build --lib --release --all-features
 
       - name: Build and run the C test against the shared library
         run: |
@@ -197,7 +197,7 @@ jobs:
           key: test-python-${{ matrix.arch }}-${{ matrix.os }}
 
       - name: Build the shared library
-        run: cargo build --lib
+        run: cargo build --lib --release --all-features
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -292,7 +292,7 @@ jobs:
           key: build-${{ matrix.arch }}-${{ matrix.os }}
 
       - name: Build the shared library
-        run: cargo build --release --lib
+        run: cargo build --lib --release --all-features
 
       - name: Check the C header against what is about to ship
         if: runner.os == 'Linux'
@@ -302,7 +302,7 @@ jobs:
           cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c -Ltarget/release -lsoyokaze -o ffi-shared
           LD_LIBRARY_PATH=target/release ./ffi-shared
 
-          libs=$(cargo rustc --release --lib --crate-type staticlib -- --print native-static-libs 2>&1 \
+          libs=$(cargo rustc --lib --release --all-features --crate-type staticlib -- --print native-static-libs 2>&1 \
                  | sed -n 's/^note: native-static-libs: //p' | tail -n1)
           if [ -z "$libs" ]; then
             echo "::error::rustc reported no native static libs; the link would fail obscurely"
@@ -397,7 +397,7 @@ jobs:
           key: build-ffi-${{ matrix.arch }}-${{ matrix.os }}
 
       - name: Build every library form
-        run: cargo build --lib
+        run: cargo build --lib --release --all-features
 
       - name: Build and run the C test against the shared library
         run: |
@@ -411,7 +411,7 @@ jobs:
         env:
           CARGO_TERM_COLOR: never
         run: |
-          libs=$(cargo rustc --lib --crate-type staticlib -- --print native-static-libs 2>&1 \
+          libs=$(cargo rustc --lib --release --all-features --crate-type staticlib -- --print native-static-libs 2>&1 \
                  | sed -n 's/^note: native-static-libs: //p' | tail -n1)
           if [ -z "$libs" ]; then
             echo "::error::rustc reported no native static libs; the link would fail obscurely"
@@ -484,7 +484,7 @@ jobs:
           key: build-python-${{ matrix.arch }}-${{ matrix.os }}
 
       - name: Build the shared library
-        run: cargo build --release --lib
+        run: cargo build --lib --release --all-features
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
 
