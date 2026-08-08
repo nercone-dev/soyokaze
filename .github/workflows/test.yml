@@ -123,7 +123,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: build-ffi-${{ matrix.arch }}-${{ matrix.os }}
+          key: test-ffi-${{ matrix.arch }}-${{ matrix.os }}
 
       - name: Build every library form
         run: cargo build --lib
@@ -150,7 +150,7 @@ jobs:
           cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c target/debug/libsoyokaze.a $libs -o ffi-static
           ./ffi-static
 
-  build-python:
+  test-python:
     name: Test Python Binding (${{ matrix.os }}-${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -180,9 +180,7 @@ jobs:
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
-          dnf install -y 'dnf-command(config-manager)'
-          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
-          dnf install -y cmake clang clang-devel golang perl
+          sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
 
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
@@ -192,7 +190,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: build-python-${{ matrix.arch }}-${{ matrix.os }}
+          key: test-python-${{ matrix.arch }}-${{ matrix.os }}
 
       - name: Build the shared library
         run: cargo build --lib
