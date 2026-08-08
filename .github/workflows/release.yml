@@ -66,28 +66,6 @@ jobs:
       - name: Run cargo clippy
         run: cargo clippy --release --all-features
 
-  test-doc:
-    name: Test Documentation
-    runs-on: ubuntu-latest
-
-    env:
-      RUSTDOCFLAGS: -D warnings
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: test-doc
-
-      - name: Build the documentation
-        run: cargo doc --no-deps --release --all-features
-
   test-ffi:
     name: Test FFI (${{ matrix.arch }}-${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
@@ -206,8 +184,30 @@ jobs:
         working-directory: python
         run: uv run pytest
 
+  test-doc:
+    name: Test Documentation
+    runs-on: ubuntu-latest
+
+    env:
+      RUSTDOCFLAGS: -D warnings
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-doc
+
+      - name: Build the documentation
+        run: cargo doc --no-deps --release --all-features
+
   update:
-    needs: [test, test-doc, test-ffi, test-python]
+    needs: [test, test-ffi, test-python, test-doc]
     name: Update
     runs-on: ubuntu-latest
     permissions:

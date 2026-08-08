@@ -68,25 +68,6 @@ jobs:
       - name: Run cargo clippy
         run: cargo clippy --all-features
 
-  test-doc:
-    name: Test Documentation
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: test-doc
-
-      - name: Build the documentation
-        run: cargo doc --no-deps --all-features
-
   test-ffi:
     name: Test FFI (${{ matrix.arch }}-${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
@@ -204,3 +185,22 @@ jobs:
       - name: Run the Python test suite
         working-directory: python
         run: uv run pytest
+
+  test-doc:
+    name: Test Documentation
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-doc
+
+      - name: Build the documentation
+        run: cargo doc --no-deps --all-features
