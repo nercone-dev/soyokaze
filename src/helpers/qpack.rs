@@ -268,6 +268,41 @@ impl DynamicTable {
         base.checked_add(index).filter(|absolute| *absolute < self.inserted_count)
     }
 
+    /// Finds the best reference below `below` and whether an exact copy exists
+    /// at all, in one walk.
+    ///
+    /// `below` is the peer's known received count: entries at or above it may
+    /// not be referenced without blocking the peer. The returned reference is
+    /// the best referenceable one — an exact match where there is one, and a
+    /// name-only match otherwise, its flag saying which. The second answer
+    /// reports an exact match anywhere in the table, acknowledged or not,
+    /// which is what decides whether inserting the field again is worth it.
+    pub fn probe(&self, field: &HeaderField, below: u64) -> (Option<(u64, bool)>, bool) {
+        let mut name_only = None;
+        let mut anywhere = false;
+
+        for (offset, entry) in self.entries.iter().enumerate() {
+            if entry.name != field.name {
+                continue;
+            }
+
+            let Some(absolute) = self.inserted_count.checked_sub(offset as u64 + 1) else {
+                break;
+            };
+
+            if entry.value == field.value {
+                anywhere = true;
+                if absolute < below {
+                    return (Some((absolute, true)), true);
+                }
+            } else if absolute < below {
+                name_only.get_or_insert(absolute);
+            }
+        }
+
+        (name_only.map(|absolute| (absolute, false)), anywhere)
+    }
+
     /// Finds the best absolute index for a field in the dynamic table.
     ///
     /// The flag says whether the value matched too.
@@ -660,6 +695,7 @@ pub struct Encoder {
     idle_capacity: usize,
     stream_out: Vec<u8>,
     stream_recv: BytesMut,
+    matches: Vec<Option<(bool, u64, bool)>>,
 }
 
 impl Encoder {
@@ -690,6 +726,7 @@ impl Encoder {
             sections: VecDeque::new(),
             stream_out: Vec::new(),
             stream_recv: BytesMut::new(),
+            matches: Vec::new(),
         }
     }
 
@@ -787,61 +824,68 @@ impl Encoder {
 
     /// Encodes a field block for `stream_id`.
     ///
-    /// Returns the block and the instructions that must go out on the encoder
-    /// stream for the peer to be able to read it. The instructions do not have
-    /// to arrive first — the block carries the insert count it needs, and the
-    /// peer will hold it until they do.
-    pub fn encode(&mut self, stream_id: u64, headers: &[HeaderField]) -> (Vec<u8>, Vec<EncoderInstruction>) {
+    /// Any instructions the peer needs to read the block are queued on the
+    /// encoder stream, for [`Encoder::take_encoder_stream`] to send. They do
+    /// not have to arrive first — the block carries the insert count it needs,
+    /// and the peer will hold it until they do.
+    pub fn encode(&mut self, stream_id: u64, headers: &[HeaderField]) -> Vec<u8> {
         let mut out = Vec::with_capacity(headers.len() * 8 + 16);
-        let instructions = self.encode_into(&mut out, stream_id, headers);
-        (out, instructions)
+        self.encode_into(&mut out, stream_id, headers);
+        out
     }
 
     /// [`Encoder::encode`], appending the block to a buffer the caller reuses.
-    pub fn encode_into(&mut self, out: &mut Vec<u8>, stream_id: u64, headers: &[HeaderField]) -> Vec<EncoderInstruction> {
-        let mut instructions = Vec::new();
-        let mut representations = Vec::new();
-        let mut required = 0;
+    pub fn encode_into(&mut self, out: &mut Vec<u8>, stream_id: u64, headers: &[HeaderField]) {
+        let mut matches = std::mem::take(&mut self.matches);
+        matches.clear();
 
+        let mut required = 0;
         let tracked = self.sections.len() < self.max_outstanding_sections;
 
         for field in headers {
-            let matched = match tracked {
-                true => self.reference(field),
-                false => StaticTable::find(field).map(|(index, value)| (true, index, value)),
+            let in_static = StaticTable::find(field);
+
+            let (matched, indexed) = match in_static {
+                Some((index, true)) => (Some((true, index, true)), true),
+                _ if !tracked => (in_static.map(|(index, _)| (true, index, false)), false),
+                _ => {
+                    let (dynamic, anywhere) = self.dynamic_table.probe(field, self.known_received_count);
+
+                    let matched = match dynamic {
+                        Some((absolute, true)) => Some((false, absolute, true)),
+                        _ => in_static
+                            .map(|(index, _)| (true, index, false))
+                            .or(dynamic.map(|(absolute, _)| (false, absolute, false))),
+                    };
+
+                    (matched, anywhere)
+                }
             };
 
-            let indexed = matched.is_some_and(|(_, _, value)| value)
-                || self.dynamic_table.find(field).is_some_and(|(_, value)| value);
-
-            if tracked
-                && !indexed
-                && !field.sensitive()
-                && let Some(instruction) = self.insert(field, matched)
-            {
-                instructions.push(instruction);
+            if tracked && !indexed && !field.sensitive() {
+                self.insert(field, matched);
             }
 
             if let Some((false, absolute, _)) = matched {
                 required = required.max(absolute.saturating_add(1));
             }
 
-            representations.push((field, matched));
+            matches.push(matched);
         }
 
-        out.reserve(representations.len() * 8 + 16);
+        out.reserve(headers.len() * 8 + 16);
         Integer::encode(out, Prefix::encode_insert_count(required, self.max_capacity), 8, 0x00);
         Integer::encode(out, 0, 7, 0x00);
 
-        for (field, matched) in representations {
-            self.encode_field(out, field, matched, required);
+        for (field, matched) in headers.iter().zip(&matches) {
+            self.encode_field(out, field, *matched, required);
         }
 
         if required > 0 {
             self.sections.push_back((stream_id, required));
         }
 
-        instructions
+        self.matches = matches;
     }
 
     /// Picks the reference to use for a field.
@@ -868,33 +912,36 @@ impl Encoder {
             .or(in_dynamic.map(|(absolute, _)| (false, absolute, false)))
     }
 
-    /// Adds a field to the table and returns the instruction that tells the
-    /// peer to do the same.
+    /// Adds a field to the table and queues the instruction that tells the
+    /// peer to do the same, straight onto the encoder stream.
     ///
-    /// `None` when the field could never fit in the table as it is sized now.
-    pub fn insert(&mut self, field: &HeaderField, matched: Option<(bool, u64, bool)>) -> Option<EncoderInstruction> {
+    /// `false` when the field could never fit in the table as it is sized now,
+    /// in which case nothing is queued.
+    pub fn insert(&mut self, field: &HeaderField, matched: Option<(bool, u64, bool)>) -> bool {
         if !self.dynamic_table.fits(field) {
-            return None;
+            return false;
         }
 
-        let instruction = match matched {
-            Some((from_static, index, _)) => EncoderInstruction::InsertWithNameReference {
-                from_static,
-                name_index: if from_static {
+        let out = &mut self.stream_out;
+        match matched {
+            Some((from_static, index, _)) => {
+                let name_index = if from_static {
                     index
                 } else {
                     self.dynamic_table.inserted_count().saturating_sub(index).saturating_sub(1)
-                },
-                value: field.value.as_bytes().to_vec(),
-            },
-            None => EncoderInstruction::InsertWithLiteralName {
-                name: field.name.as_bytes().to_vec(),
-                value: field.value.as_bytes().to_vec(),
-            },
-        };
+                };
+
+                Integer::encode(out, name_index, 6, 0x80 | u8::from(from_static) << 6);
+                StringLiteral::encode_shorter(out, field.value.as_bytes(), 7, 0x00);
+            }
+            None => {
+                StringLiteral::encode_shorter(out, field.name.as_bytes(), 5, 0x40);
+                StringLiteral::encode_shorter(out, field.value.as_bytes(), 7, 0x00);
+            }
+        }
 
         self.dynamic_table.insert(field.clone());
-        Some(instruction)
+        true
     }
 
     /// Writes one field representation against `base`.

@@ -511,3 +511,37 @@ async fn how_much_room_a_read_is_given_follows_the_limit_it_was_configured_with(
     assert!(Buffer::with_chunk_size(0).chunk_size() >= 1, "a zero size must not stop reads entirely");
     assert!(first_read(0).await >= 1, "a zero size must still read");
 }
+
+#[test]
+fn a_shared_heap_text_is_not_lowercased_under_its_other_holders() {
+    use soyokaze::helpers::text::{Text, INLINE};
+
+    let long = "X".repeat(INLINE + 10);
+    let mut text = Text::from_str(&long);
+    let held = text.clone();
+
+    text.make_ascii_lowercase();
+    assert_eq!(text.as_str(), long.to_ascii_lowercase());
+    assert_eq!(held.as_str(), long, "a clone must keep the octets it was cloned with");
+
+    let mut inline = Text::from_str("MiXeD");
+    let held = inline.clone();
+    inline.make_ascii_lowercase();
+    assert_eq!(inline.as_str(), "mixed");
+    assert_eq!(held.as_str(), "MiXeD");
+}
+
+#[test]
+fn text_round_trips_across_the_inline_boundary() {
+    use soyokaze::helpers::text::{Text, INLINE};
+
+    for length in [0, 1, INLINE - 1, INLINE, INLINE + 1, 4 * INLINE] {
+        let source = "a".repeat(length);
+        let text = Text::from_str(&source);
+
+        assert_eq!(text.len(), length);
+        assert_eq!(text.as_str(), source);
+        assert_eq!(text.is_inline(), length <= INLINE);
+        assert_eq!(text.clone().into_string(), source);
+    }
+}

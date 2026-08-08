@@ -13,10 +13,11 @@ use std::borrow::Borrow;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
+use std::sync::Arc;
 
 /// The longest string held without allocating.
 ///
-/// Chosen so that [`Text`] fits in the same space as a `Box<str>` plus its
+/// Chosen so that [`Text`] fits in the same space as an `Arc<str>` plus its
 /// discriminant and length, which covers all but the longest field values.
 pub const INLINE: usize = 30;
 
@@ -31,7 +32,11 @@ pub enum Repr {
         octets: [u8; INLINE],
     },
     /// Held on the heap, for anything longer than [`INLINE`].
-    Heap(Box<str>),
+    ///
+    /// Shared rather than owned, so cloning a long field value — which the
+    /// HPACK and QPACK tables do on every insertion and resolution — costs a
+    /// reference count rather than a copy.
+    Heap(Arc<str>),
 }
 
 /// A short immutable string that stays off the heap.
@@ -92,13 +97,12 @@ impl Text {
         }
     }
 
-    /// Takes ownership of a `String`, reusing its allocation when it is long
-    /// enough to need one.
+    /// Takes ownership of a `String`.
     #[inline]
     pub fn from_string(text: String) -> Self {
         match text.len() <= INLINE {
             true => Self::from_str(&text),
-            false => Self(Repr::Heap(text.into_boxed_str())),
+            false => Self(Repr::Heap(text.into())),
         }
     }
 
@@ -118,9 +122,9 @@ impl Text {
             return Self(Repr::Inline { len: octets.len() as u8, octets: inline });
         }
 
-        let mut text = octets.to_vec();
-        text.make_ascii_lowercase();
-        Self(Repr::Heap(String::from_utf8_lossy(&text).into_owned().into_boxed_str()))
+        let mut text: Arc<str> = unsafe { std::str::from_utf8_unchecked(octets) }.into();
+        Arc::get_mut(&mut text).map(str::make_ascii_lowercase);
+        Self(Repr::Heap(text))
     }
 
     /// Copies octets that are expected to be ASCII, checking that they are.
@@ -184,9 +188,9 @@ impl Text {
             return Self(Repr::Inline { len: octets.len() as u8, octets: inline });
         }
 
-        let mut text = octets.to_vec();
-        text.make_ascii_lowercase();
-        Self(Repr::Heap(unsafe { String::from_utf8_unchecked(text) }.into_boxed_str()))
+        let mut text: Arc<str> = unsafe { std::str::from_utf8_unchecked(octets) }.into();
+        Arc::get_mut(&mut text).map(str::make_ascii_lowercase);
+        Self(Repr::Heap(text))
     }
 
     /// Copies octets, replacing anything that is not valid UTF-8.
@@ -240,20 +244,26 @@ impl Text {
     }
 
     /// Lowercases the ASCII letters in place, leaving everything else alone.
+    ///
+    /// A shared heap string is rebuilt rather than mutated, since other clones
+    /// of it must not change under their holders.
     pub fn make_ascii_lowercase(&mut self) {
         match &mut self.0 {
             Repr::Inline { len, octets } => octets[..*len as usize].make_ascii_lowercase(),
-            Repr::Heap(text) => text.make_ascii_lowercase(),
+            Repr::Heap(text) => match Arc::get_mut(text) {
+                Some(text) => text.make_ascii_lowercase(),
+                None => {
+                    let mut fresh: Arc<str> = text.as_ref().into();
+                    Arc::get_mut(&mut fresh).map(str::make_ascii_lowercase);
+                    *text = fresh;
+                }
+            },
         }
     }
 
-    /// Consumes the text and returns a `String`, reusing the heap allocation
-    /// when there is one.
+    /// Consumes the text and returns a `String`.
     pub fn into_string(self) -> String {
-        match self.0 {
-            Repr::Inline { .. } => self.as_str().to_owned(),
-            Repr::Heap(text) => text.into_string(),
-        }
+        self.as_str().to_owned()
     }
 
     /// Consumes the text and returns its octets.

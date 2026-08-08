@@ -357,7 +357,7 @@ impl Fields {
         }
 
         if let Some(headers) = &message.headers {
-            for (name, value) in headers.iter() {
+            for (name, value) in headers.fields() {
                 if name.starts_with(':') || name == "host" {
                     continue;
                 }
@@ -366,7 +366,7 @@ impl Fields {
                     return Err(Error::Protocol(format!("connection-specific field {name:?} cannot be framed")));
                 }
 
-                fields.push(HeaderField::new(name, value));
+                fields.push(HeaderField { name: name.clone(), value: value.clone() });
             }
         }
 

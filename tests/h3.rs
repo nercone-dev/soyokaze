@@ -198,8 +198,9 @@ fn stream_kinds_map_to_and_from_their_codes() {
     assert_eq!(StreamKind::from_code(0x21), None);
 }
 
-fn section(encoder: &mut Encoder, stream_id: u64, fields: &[HeaderField]) -> (Vec<u8>, Vec<EncoderInstruction>) {
-    encoder.encode(stream_id, fields)
+fn section(encoder: &mut Encoder, stream_id: u64, fields: &[HeaderField]) -> (Vec<u8>, Vec<u8>) {
+    let block = encoder.encode(stream_id, fields);
+    (block, encoder.take_encoder_stream())
 }
 
 fn permitted() -> Encoder {
@@ -351,10 +352,10 @@ fn a_section_that_needs_the_dynamic_table_waits_for_the_encoder_stream() {
     let mut fields = request_fields();
     fields.push(HeaderField::new("x-custom", "value"));
 
-    let (_, instructions) = section(&mut encoder, 0, &fields);
-    assert!(!instructions.is_empty(), "nothing was inserted into the peer's dynamic table");
+    let (_, stream) = section(&mut encoder, 0, &fields);
+    assert!(!stream.is_empty(), "nothing was inserted into the peer's dynamic table");
     encoder.on_decoder_instruction(DecoderInstruction::InsertCountIncrement {
-        increment: instructions.len() as u64,
+        increment: encoder.dynamic_table().inserted_count(),
     });
 
     let (block, _) = section(&mut encoder, 4, &fields);
@@ -362,10 +363,6 @@ fn a_section_that_needs_the_dynamic_table_waits_for_the_encoder_stream() {
 
     assert!(session.take_ready().is_none(), "a blocked section must not be delivered");
 
-    let mut stream = BytesMut::new();
-    for instruction in &instructions {
-        stream.extend_from_slice(&instruction.encode());
-    }
     session.on_encoder_bytes(&stream).expect("the encoder instructions were refused");
 
     assert!(session.take_ready().is_some(), "the section did not unblock once the inserts arrived");

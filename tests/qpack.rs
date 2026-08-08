@@ -15,14 +15,15 @@ fn paired() -> (Encoder, Decoder) {
     (encoder, decoder)
 }
 
-fn exchange(encoder: &mut Encoder, decoder: &mut Decoder, instructions: Vec<EncoderInstruction>) {
-    for instruction in instructions {
-        match decoder.on_encoder_instruction(instruction) {
-            Ok(Some(acknowledgment)) => encoder.on_decoder_instruction(acknowledgment),
-            Ok(None) => {}
-            Err(err) => panic!("the decoder rejected an encoder instruction: {err}"),
-        }
-    }
+fn section(encoder: &mut Encoder, stream_id: u64, fields: &[HeaderField]) -> (Vec<u8>, Vec<u8>) {
+    let block = encoder.encode(stream_id, fields);
+    (block, encoder.take_encoder_stream())
+}
+
+fn exchange(encoder: &mut Encoder, decoder: &mut Decoder, stream: &[u8]) {
+    decoder.on_encoder_stream(stream).expect("the decoder rejected the encoder stream");
+    let answers = decoder.take_decoder_stream();
+    encoder.on_decoder_stream(&answers).expect("the encoder rejected the decoder stream");
 }
 
 #[test]
@@ -248,8 +249,8 @@ fn round_trips_a_request_over_the_static_table() {
     let mut encoder = Encoder::new();
     let mut decoder = Decoder::new();
 
-    let (block, instructions) = encoder.encode(0, &fields);
-    exchange(&mut encoder, &mut decoder, instructions);
+    let (block, stream) = section(&mut encoder, 0, &fields);
+    exchange(&mut encoder, &mut decoder, &stream);
 
     assert_eq!(decoder.decode(0, &block), Ok((fields, None)));
 }
@@ -269,8 +270,8 @@ fn nothing_is_inserted_before_the_peer_permits_a_table() {
     let mut encoder = Encoder::new();
     let mut decoder = Decoder::new();
 
-    let (block, instructions) = encoder.encode(0, &fields);
-    assert!(instructions.is_empty(), "the encoder inserted before the peer allowed a dynamic table");
+    let (block, stream) = section(&mut encoder, 0, &fields);
+    assert!(stream.is_empty(), "the encoder inserted before the peer allowed a dynamic table");
     assert!(encoder.dynamic_table().is_empty());
     assert_eq!(encoder.dynamic_table().inserted_count(), 0);
 
@@ -284,8 +285,8 @@ fn a_peer_that_permits_nothing_keeps_the_table_shut() {
     assert_eq!(encoder.set_max_capacity(0), None, "a capacity no peer permits must not be announced");
     assert_eq!(encoder.dynamic_table().capacity(), 0);
 
-    let (_, instructions) = encoder.encode(0, &[field("x-custom", "value")]);
-    assert!(instructions.is_empty(), "the encoder inserted into a table the peer refused");
+    let (_, stream) = section(&mut encoder, 0, &[field("x-custom", "value")]);
+    assert!(stream.is_empty(), "the encoder inserted into a table the peer refused");
 }
 
 #[test]
@@ -299,8 +300,8 @@ fn the_capacity_update_precedes_the_first_insert() {
     );
     assert_eq!(encoder.set_max_capacity(512), None, "an unchanged capacity says nothing");
 
-    let (_, instructions) = encoder.encode(0, &[field("x-custom", "value")]);
-    assert!(!instructions.is_empty(), "the encoder ignored the table the peer permitted");
+    let (_, stream) = section(&mut encoder, 0, &[field("x-custom", "value")]);
+    assert!(!stream.is_empty(), "the encoder ignored the table the peer permitted");
 }
 
 #[test]
@@ -314,16 +315,16 @@ fn the_dynamic_table_shortens_a_repeated_section() {
 
     let (mut encoder, mut decoder) = paired();
 
-    let (first, instructions) = encoder.encode(0, &fields);
-    assert!(!instructions.is_empty(), "nothing was inserted into the dynamic table");
-    exchange(&mut encoder, &mut decoder, instructions);
+    let (first, stream) = section(&mut encoder, 0, &fields);
+    assert!(!stream.is_empty(), "nothing was inserted into the dynamic table");
+    exchange(&mut encoder, &mut decoder, &stream);
 
     let (decoded, acknowledgment) = decoder.decode(0, &first).expect("the first section did not decode");
     assert_eq!(decoded, fields);
     assert_eq!(acknowledgment, None, "a section over the static table needs no acknowledgement");
 
-    let (second, instructions) = encoder.encode(4, &fields);
-    assert!(instructions.is_empty(), "the encoder inserted the same fields twice");
+    let (second, stream) = section(&mut encoder, 4, &fields);
+    assert!(stream.is_empty(), "the encoder inserted the same fields twice");
     assert!(second.len() < first.len(), "the dynamic table did not shorten the second section");
 
     let (decoded, acknowledgment) = decoder.decode(4, &second).expect("the second section did not decode");
@@ -341,11 +342,11 @@ fn a_section_that_outruns_the_inserts_blocks() {
 
     let (mut encoder, mut decoder) = paired();
 
-    let (_, instructions) = encoder.encode(0, &fields);
-    assert_eq!(instructions.len(), 1);
+    let _ = section(&mut encoder, 0, &fields);
+    assert_eq!(encoder.dynamic_table().inserted_count(), 1);
     encoder.on_decoder_instruction(DecoderInstruction::InsertCountIncrement { increment: 1 });
 
-    let (block, _) = encoder.encode(4, &fields);
+    let (block, _) = section(&mut encoder, 4, &fields);
     assert_eq!(decoder.decode(4, &block), Err(Error::Blocked));
 }
 
@@ -355,9 +356,9 @@ fn never_indexes_a_sensitive_field() {
 
     let (mut encoder, mut decoder) = paired();
 
-    let (block, instructions) = encoder.encode(0, std::slice::from_ref(&secret));
-    assert!(instructions.is_empty(), "a sensitive field was inserted into the dynamic table");
-    exchange(&mut encoder, &mut decoder, instructions);
+    let (block, stream) = section(&mut encoder, 0, std::slice::from_ref(&secret));
+    assert!(stream.is_empty(), "a sensitive field was inserted into the dynamic table");
+    exchange(&mut encoder, &mut decoder, &stream);
 
     assert_eq!(decoder.decode(0, &block), Ok((vec![secret], None)));
     assert!(encoder.dynamic_table().is_empty());
@@ -367,13 +368,13 @@ fn never_indexes_a_sensitive_field() {
 fn trailers_and_empty_sections_survive() {
     let (mut encoder, mut decoder) = paired();
 
-    let (block, instructions) = encoder.encode(0, &[]);
-    exchange(&mut encoder, &mut decoder, instructions);
+    let (block, stream) = section(&mut encoder, 0, &[]);
+    exchange(&mut encoder, &mut decoder, &stream);
     assert_eq!(decoder.decode(0, &block), Ok((Vec::new(), None)));
 
     let trailers = vec![field("x-checksum", "deadbeef")];
-    let (block, instructions) = encoder.encode(4, &trailers);
-    exchange(&mut encoder, &mut decoder, instructions);
+    let (block, stream) = section(&mut encoder, 4, &trailers);
+    exchange(&mut encoder, &mut decoder, &stream);
     assert_eq!(decoder.decode(4, &block), Ok((trailers, None)));
 }
 
@@ -384,8 +385,8 @@ fn stops_once_the_decoded_section_grows_too_large() {
     let (mut encoder, mut decoder) = paired();
     decoder.set_max_decoded_size(128);
 
-    let (block, instructions) = encoder.encode(0, &fields);
-    exchange(&mut encoder, &mut decoder, instructions);
+    let (block, stream) = section(&mut encoder, 0, &fields);
+    exchange(&mut encoder, &mut decoder, &stream);
 
     assert_eq!(decoder.decode(0, &block), Err(Error::DecodedSizeExceeded));
 }
@@ -420,10 +421,10 @@ fn a_stream_cancellation_drops_the_pending_section() {
 
     let (mut encoder, mut decoder) = paired();
 
-    let (_, instructions) = encoder.encode(0, &fields);
-    exchange(&mut encoder, &mut decoder, instructions);
+    let (_, stream) = section(&mut encoder, 0, &fields);
+    exchange(&mut encoder, &mut decoder, &stream);
 
-    let (_, _) = encoder.encode(4, &fields);
+    let _ = section(&mut encoder, 4, &fields);
     encoder.on_decoder_instruction(DecoderInstruction::StreamCancellation { stream_id: 4 });
 
     let known = encoder.known_received_count();
@@ -443,15 +444,15 @@ fn a_decoder_that_never_acknowledges_cannot_grow_the_section_queue() {
     let (mut encoder, mut decoder) = paired();
     let fields = vec![field("x-request", "one")];
 
-    let (_, instructions) = encoder.encode(0, &fields);
-    exchange(&mut encoder, &mut decoder, instructions);
+    let (_, stream) = section(&mut encoder, 0, &fields);
+    exchange(&mut encoder, &mut decoder, &stream);
     encoder.on_decoder_instruction(DecoderInstruction::SectionAcknowledgment { stream_id: 0 });
 
     let ceiling = Encoder::DEFAULT_MAX_OUTSTANDING_SECTIONS;
 
-    for stream in 1..(ceiling as u64 * 4) {
-        let (_, instructions) = encoder.encode(stream * 4, &fields);
-        exchange(&mut encoder, &mut decoder, instructions);
+    for stream_id in 1..(ceiling as u64 * 4) {
+        let (_, stream) = section(&mut encoder, stream_id * 4, &fields);
+        exchange(&mut encoder, &mut decoder, &stream);
     }
 
     assert!(
@@ -466,14 +467,14 @@ fn sections_beyond_the_queue_still_decode() {
     let (mut encoder, mut decoder) = paired();
     let fields = vec![field("x-request", "one"), field(":method", "GET")];
 
-    let (_, instructions) = encoder.encode(0, &fields);
-    exchange(&mut encoder, &mut decoder, instructions);
+    let (_, stream) = section(&mut encoder, 0, &fields);
+    exchange(&mut encoder, &mut decoder, &stream);
     encoder.on_decoder_instruction(DecoderInstruction::SectionAcknowledgment { stream_id: 0 });
 
     let mut block = Vec::new();
-    for stream in 1..(Encoder::DEFAULT_MAX_OUTSTANDING_SECTIONS as u64 + 8) {
-        let (encoded, instructions) = encoder.encode(stream * 4, &fields);
-        exchange(&mut encoder, &mut decoder, instructions);
+    for stream_id in 1..(Encoder::DEFAULT_MAX_OUTSTANDING_SECTIONS as u64 + 8) {
+        let (encoded, stream) = section(&mut encoder, stream_id * 4, &fields);
+        exchange(&mut encoder, &mut decoder, &stream);
         block = encoded;
     }
 
@@ -486,8 +487,8 @@ fn a_cancelled_stream_releases_its_sections() {
     let (mut encoder, mut decoder) = paired();
     let fields = vec![field("x-request", "one")];
 
-    let (_, instructions) = encoder.encode(0, &fields);
-    exchange(&mut encoder, &mut decoder, instructions);
+    let (_, stream) = section(&mut encoder, 0, &fields);
+    exchange(&mut encoder, &mut decoder, &stream);
     encoder.on_decoder_instruction(DecoderInstruction::SectionAcknowledgment { stream_id: 0 });
 
     encoder.encode(4, &fields);
@@ -503,18 +504,14 @@ fn a_blocked_stream_is_registered_until_its_insertions_arrive() {
 
     let (mut encoder, mut decoder) = paired();
 
-    let (_, instructions) = encoder.encode(0, &fields);
+    let (_, stream) = section(&mut encoder, 0, &fields);
     encoder.on_decoder_instruction(DecoderInstruction::InsertCountIncrement { increment: 1 });
-    let (block, _) = encoder.encode(4, &fields);
+    let (block, _) = section(&mut encoder, 4, &fields);
 
     assert_eq!(decoder.decode(4, &block), Err(Error::Blocked));
     assert_eq!(decoder.blocked(), 1);
     assert!(decoder.unblocked().is_empty(), "nothing arrived, so nothing is unblocked");
 
-    let mut stream = Vec::new();
-    for instruction in &instructions {
-        instruction.encode_into(&mut stream);
-    }
     decoder.on_encoder_stream(&stream).expect("the instructions did not apply");
 
     assert_eq!(decoder.unblocked(), vec![4]);
@@ -531,10 +528,10 @@ fn refuses_more_blocked_streams_than_were_advertised() {
     let (mut encoder, mut decoder) = paired();
     decoder.set_max_blocked_streams(2);
 
-    let (_, _) = encoder.encode(0, &fields);
+    let _ = section(&mut encoder, 0, &fields);
     encoder.on_decoder_instruction(DecoderInstruction::InsertCountIncrement { increment: 1 });
 
-    let (block, _) = encoder.encode(4, &fields);
+    let (block, _) = section(&mut encoder, 4, &fields);
     assert_eq!(decoder.decode(4, &block), Err(Error::Blocked));
     assert_eq!(decoder.decode(8, &block), Err(Error::Blocked));
 
@@ -587,10 +584,10 @@ fn acknowledgements_on_the_decoder_stream_free_the_encoder() {
 
     let (mut encoder, _) = paired();
 
-    let (_, _) = encoder.encode(0, &fields);
+    let _ = section(&mut encoder, 0, &fields);
     encoder.on_decoder_instruction(DecoderInstruction::InsertCountIncrement { increment: 1 });
 
-    let (_, _) = encoder.encode(4, &fields);
+    let _ = section(&mut encoder, 4, &fields);
     assert_eq!(encoder.outstanding(), 1);
 
     let mut stream = Vec::new();
@@ -715,4 +712,22 @@ fn a_codec_carries_no_setting_that_is_not_qpack() {
     let update = encoder.set_max_capacity(4096).expect("the table was not sized");
     encoder.queue(&[update]);
     assert!(!encoder.encoder_stream().is_empty());
+}
+
+#[test]
+fn an_unacknowledged_entry_is_not_inserted_again() {
+    let fields = vec![field("x-custom", "value")];
+    let (mut encoder, mut decoder) = paired();
+
+    let (first, stream) = section(&mut encoder, 0, &fields);
+    assert_eq!(encoder.dynamic_table().inserted_count(), 1);
+
+    let (second, _) = section(&mut encoder, 4, &fields);
+    assert_eq!(encoder.dynamic_table().inserted_count(), 1, "an exact copy already in the table must not be inserted again");
+
+    decoder.on_encoder_stream(&stream).expect("the instructions did not apply");
+    let (decoded, _) = decoder.decode(0, &first).expect("the first section did not decode");
+    assert_eq!(decoded, fields);
+    let (decoded, _) = decoder.decode(4, &second).expect("the second section did not decode");
+    assert_eq!(decoded, fields);
 }

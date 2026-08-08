@@ -357,8 +357,7 @@ impl H3Session {
     /// [`common::Fields::of`].
     pub fn frame_message(&mut self, stream_id: StreamID, message: &Message, out: &mut BytesMut) -> Result<bool, Error> {
         let fields = common::Fields::of(message)?;
-        let (block, instructions) = self.encoder.encode(stream_id.0, &fields);
-        self.encoder.queue(&instructions);
+        let block = self.encoder.encode(stream_id.0, &fields);
 
         Frame::Headers(block.into()).encode_into(out);
 
@@ -372,9 +371,8 @@ impl H3Session {
         }
 
         if let Some(trailers) = message.trailers.as_ref().filter(|trailers| !trailers.is_empty()) {
-            let fields: Vec<HeaderField> = trailers.iter().map(|(name, value)| HeaderField::new(name, value)).collect();
-            let (block, instructions) = self.encoder.encode(stream_id.0, &fields);
-            self.encoder.queue(&instructions);
+            let fields: Vec<HeaderField> = trailers.fields().iter().map(|(name, value)| HeaderField::new(name.clone(), value.clone())).collect();
+            let block = self.encoder.encode(stream_id.0, &fields);
             Frame::Headers(block.into()).encode_into(out);
         }
 

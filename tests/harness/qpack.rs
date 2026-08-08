@@ -78,17 +78,19 @@ pub fn session(sections: &[Vec<HeaderField>]) {
 
     for (index, fields) in sections.iter().enumerate() {
         let stream_id = index as u64;
-        let (block, instructions) = encoder.encode(stream_id, fields);
+        let block = encoder.encode(stream_id, fields);
 
-        for instruction in instructions {
-            let bytes = instruction.encode();
-            let (consumed, delivered) = match EncoderInstruction::decode(&bytes) {
+        let stream = encoder.take_encoder_stream();
+        let mut rest = stream.as_slice();
+
+        while !rest.is_empty() {
+            let (consumed, delivered) = match EncoderInstruction::decode(rest) {
                 Ok(decoded) => decoded,
                 Err(err) => panic!("an instruction this encoder produced did not decode: {err}"),
             };
 
-            assert_eq!(consumed, bytes.len(), "an instruction decoded to the wrong length");
-            assert_eq!(delivered, instruction, "an instruction changed in transit");
+            assert_eq!(delivered.encode(), &rest[..consumed], "an instruction changed in transit");
+            rest = &rest[consumed..];
 
             match decoder.on_encoder_instruction(delivered) {
                 Ok(Some(acknowledgment)) => encoder.on_decoder_instruction(acknowledgment),
@@ -96,6 +98,8 @@ pub fn session(sections: &[Vec<HeaderField>]) {
                 Err(err) => panic!("the decoder rejected an instruction this encoder produced: {err}"),
             }
         }
+
+        encoder.reclaim_encoder_stream(stream);
 
         let (decoded, acknowledgment) = match decoder.decode(stream_id, &block) {
             Ok(decoded) => decoded,

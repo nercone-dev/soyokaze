@@ -153,6 +153,105 @@ impl CloseCode {
     }
 }
 
+/// Where a frame's payload sits within the octets that carry it.
+///
+/// [`FrameHead::decode`] reads everything but the payload, so a caller that
+/// holds the octets in a buffer can split the payload off in place rather
+/// than copy it out — which is what [`Frame::take`] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameHead {
+    /// Whether the frame ends its message.
+    pub fin: bool,
+    /// What the frame is.
+    pub opcode: Opcode,
+    /// The masking key, if the payload is masked.
+    pub mask: Option<[u8; 4]>,
+    /// Where the payload starts.
+    pub start: usize,
+    /// How long the payload is.
+    pub length: usize,
+}
+
+impl FrameHead {
+    /// Reads a frame's header, leaving the payload where it is.
+    ///
+    /// `None` when the header — or, judged by the length it declares, the
+    /// payload — has not fully arrived yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when a reserved bit is set with no
+    /// extension negotiated, when the opcode is reserved, when the length has
+    /// its high bit set, or when a control frame is longer than
+    /// [`MAXIMUM_CONTROL_PAYLOAD`] or fragmented.
+    pub fn decode(data: &[u8]) -> Result<Option<Self>, Error> {
+        if data.len() < 2 {
+            return Ok(None);
+        }
+
+        if data[0] & 0x70 != 0 {
+            return Err(Error::Protocol("a reserved bit is set with no extension negotiated".into()));
+        }
+
+        let fin = data[0] & 0x80 != 0;
+        let opcode = Opcode::from_code(data[0] & 0x0f)
+            .ok_or_else(|| Error::Protocol(format!("opcode {:#x} is reserved", data[0] & 0x0f)))?;
+
+        let masked = data[1] & 0x80 != 0;
+        let (mut start, length) = match data[1] & 0x7f {
+            126 => match Frame::octets::<2>(data, 2) {
+                Some(octets) => (4, u16::from_be_bytes(octets) as u64),
+                None => return Ok(None),
+            },
+
+            127 => {
+                let Some(octets) = Frame::octets::<8>(data, 2) else {
+                    return Ok(None);
+                };
+
+                let length = u64::from_be_bytes(octets);
+                if length & 0x8000_0000_0000_0000 != 0 {
+                    return Err(Error::Protocol("the payload length has its high bit set".into()));
+                }
+
+                (10, length)
+            }
+
+            length => (2, length as u64),
+        };
+
+        if opcode.control() {
+            if length > MAXIMUM_CONTROL_PAYLOAD as u64 {
+                return Err(Error::Protocol(format!("control frame carries {length} octets")));
+            }
+            if !fin {
+                return Err(Error::Protocol("control frame is fragmented".into()));
+            }
+        }
+
+        let mask = if masked {
+            let Some(mask) = Frame::octets::<4>(data, start) else {
+                return Ok(None);
+            };
+
+            start += 4;
+            Some(mask)
+        } else {
+            None
+        };
+
+        let Ok(length) = usize::try_from(length) else {
+            return Ok(None);
+        };
+
+        if start.checked_add(length).filter(|end| *end <= data.len()).is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(Self { fin, opcode, mask, start, length }))
+    }
+}
+
 /// One WebSocket frame.
 ///
 /// The payload is always unmasked here; masking is applied on the way out and
@@ -166,7 +265,7 @@ pub struct Frame {
     /// The masking key, which a client must set and a server must not.
     pub mask: Option<[u8; 4]>,
     /// The payload, unmasked.
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
 }
 
 impl Frame {
@@ -186,7 +285,7 @@ impl Frame {
     ///
     /// The mask is filled in by [`WebSocketConnection::send`] according to the
     /// role, so it need not be set here.
-    pub fn new(opcode: Opcode, payload: impl Into<Vec<u8>>) -> Self {
+    pub fn new(opcode: Opcode, payload: impl Into<Bytes>) -> Self {
         Self { fin: true, opcode, mask: None, payload: payload.into() }
     }
 
@@ -249,84 +348,50 @@ impl Frame {
     /// Reads one frame, returning how many octets it took.
     ///
     /// `None` when the frame has not fully arrived; the caller should read
-    /// more and try again. The payload comes back unmasked.
+    /// more and try again. The payload comes back unmasked, copied out of
+    /// `data`; a caller holding the octets in a buffer should prefer
+    /// [`Frame::take`], which does not copy.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Protocol`] when a reserved bit is set with no
-    /// extension negotiated, when the opcode is reserved, when the length has
-    /// its high bit set, or when a control frame is longer than
-    /// [`MAXIMUM_CONTROL_PAYLOAD`] or fragmented.
+    /// As [`FrameHead::decode`].
     pub fn decode(data: &[u8]) -> Result<Option<(usize, Self)>, Error> {
-        if data.len() < 2 {
-            return Ok(None);
-        }
-
-        if data[0] & 0x70 != 0 {
-            return Err(Error::Protocol("a reserved bit is set with no extension negotiated".into()));
-        }
-
-        let fin = data[0] & 0x80 != 0;
-        let opcode = Opcode::from_code(data[0] & 0x0f)
-            .ok_or_else(|| Error::Protocol(format!("opcode {:#x} is reserved", data[0] & 0x0f)))?;
-
-        let masked = data[1] & 0x80 != 0;
-        let (mut consumed, length) = match data[1] & 0x7f {
-            126 => match Self::octets::<2>(data, 2) {
-                Some(octets) => (4, u16::from_be_bytes(octets) as u64),
-                None => return Ok(None),
-            },
-
-            127 => {
-                let Some(octets) = Self::octets::<8>(data, 2) else {
-                    return Ok(None);
-                };
-
-                let length = u64::from_be_bytes(octets);
-                if length & 0x8000_0000_0000_0000 != 0 {
-                    return Err(Error::Protocol("the payload length has its high bit set".into()));
-                }
-
-                (10, length)
-            }
-
-            length => (2, length as u64),
-        };
-
-        if opcode.control() {
-            if length > MAXIMUM_CONTROL_PAYLOAD as u64 {
-                return Err(Error::Protocol(format!("control frame carries {length} octets")));
-            }
-            if !fin {
-                return Err(Error::Protocol("control frame is fragmented".into()));
-            }
-        }
-
-        let mask = if masked {
-            let Some(mask) = Self::octets::<4>(data, consumed) else {
-                return Ok(None);
-            };
-
-            consumed += 4;
-            Some(mask)
-        } else {
-            None
-        };
-
-        let Ok(length) = usize::try_from(length) else {
+        let Some(head) = FrameHead::decode(data)? else {
             return Ok(None);
         };
 
-        let Some(end) = consumed.checked_add(length).filter(|end| *end <= data.len()) else {
-            return Ok(None);
-        };
-
-        let mut payload = data[consumed..end].to_vec();
-        if let Some(mask) = mask {
+        let end = head.start + head.length;
+        let mut payload = BytesMut::from(&data[head.start..end]);
+        if let Some(mask) = head.mask {
             Self::apply_mask(mask, &mut payload);
         }
 
-        Ok(Some((end, Self { fin, opcode, mask, payload })))
+        Ok(Some((end, Self { fin: head.fin, opcode: head.opcode, mask: head.mask, payload: payload.freeze() })))
+    }
+
+    /// Takes one frame off the front of a buffer, without copying its payload.
+    ///
+    /// `None` when the frame has not fully arrived; the buffer is left
+    /// untouched so the call can be repeated as more octets come in. The
+    /// payload is split out of the buffer in place and unmasked there.
+    ///
+    /// # Errors
+    ///
+    /// As [`FrameHead::decode`].
+    pub fn take(buffer: &mut BytesMut) -> Result<Option<Self>, Error> {
+        use bytes::Buf;
+
+        let Some(head) = FrameHead::decode(buffer)? else {
+            return Ok(None);
+        };
+
+        buffer.advance(head.start);
+        let mut payload = buffer.split_to(head.length);
+        if let Some(mask) = head.mask {
+            Self::apply_mask(mask, &mut payload);
+        }
+
+        Ok(Some(Self { fin: head.fin, opcode: head.opcode, mask: head.mask, payload: payload.freeze() }))
     }
 
     /// Reads `N` octets at `offset`, or `None` when they are not all there.
@@ -899,9 +964,7 @@ where
     /// the transport ends mid-frame. Otherwise as [`Buffer::fill`].
     pub async fn receive(&mut self) -> Result<Frame, Error> {
         loop {
-            if let Some((consumed, frame)) = Frame::decode(self.buffer.as_slice())? {
-                self.buffer.consume(consumed);
-
+            if let Some(frame) = Frame::take(self.buffer.as_bytes_mut())? {
                 if self.role.is_client() == frame.mask.is_some() {
                     return Err(Error::Protocol(match frame.mask {
                         Some(_) => "a masked frame arrived from a server".into(),
@@ -927,7 +990,7 @@ where
     /// # Errors
     ///
     /// As [`WebSocketConnection::send`].
-    pub async fn send_message(&mut self, opcode: Opcode, payload: impl Into<Vec<u8>>) -> Result<(), Error> {
+    pub async fn send_message(&mut self, opcode: Opcode, payload: impl Into<Bytes>) -> Result<(), Error> {
         self.send(Frame::new(opcode, payload)).await
     }
 
@@ -963,7 +1026,7 @@ where
                             self.send(Frame::new(Opcode::Close, frame.payload.clone())).await?;
                         }
 
-                        return Ok((Opcode::Close, Bytes::from(frame.payload)));
+                        return Ok((Opcode::Close, frame.payload));
                     }
 
                     Opcode::Ping => self.send(Frame::new(Opcode::Pong, frame.payload)).await?,
@@ -981,6 +1044,15 @@ where
 
             if reassembled_len as u64 > self.limits.max_message_size {
                 return Err(Error::Limit(format!("message exceeds {} octets", self.limits.max_message_size)));
+            }
+
+            if frame.fin && self.fragments.is_none() && frame.opcode != Opcode::Continuation {
+                if frame.opcode == Opcode::Text && std::str::from_utf8(&frame.payload).is_err() {
+                    self.close(CloseCode::InvalidPayload, "invalid utf-8").await;
+                    return Err(Error::Protocol("a text message is not valid UTF-8".into()));
+                }
+
+                return Ok((frame.opcode, frame.payload));
             }
 
             let opcode = match (&mut self.fragments, frame.opcode) {

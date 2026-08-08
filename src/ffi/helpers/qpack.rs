@@ -143,12 +143,8 @@ pub unsafe extern "C" fn soyokaze_qpack_encode(encoder: *mut Encoder, stream_id:
         return false;
     }
 
-    let (encoded, emitted) = encoder.encode(stream_id, &fields);
-
-    let mut stream = Vec::new();
-    for instruction in &emitted {
-        instruction.encode_into(&mut stream);
-    }
+    let encoded = encoder.encode(stream_id, &fields);
+    let stream = encoder.take_encoder_stream();
 
     unsafe {
         *block = Buffer::new(encoded);

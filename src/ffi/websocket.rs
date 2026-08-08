@@ -102,7 +102,7 @@ pub unsafe extern "C" fn soyokaze_websocket_send(socket: *mut WebSocket, fin: bo
     };
 
     let payload = unsafe { Slice::borrow(payload, payload_len) }.unwrap_or_default().to_vec();
-    let frame = Frame { fin, opcode, mask: None, payload };
+    let frame = Frame { fin, opcode, mask: None, payload: payload.into() };
 
     match socket.handle.clone().block_on(socket.connection.send(frame)) {
         Ok(()) => Status::Ok,
@@ -138,7 +138,7 @@ pub unsafe extern "C" fn soyokaze_websocket_receive(socket: *mut WebSocket, fin:
             if !opcode.is_null() {
                 unsafe { *opcode = frame.opcode.code() };
             }
-            unsafe { *out = Buffer::new(frame.payload) };
+            unsafe { *out = Buffer::new(frame.payload.to_vec()) };
             Status::Ok
         }
         Err(failure) => unsafe { ErrorHandle::report(error, &failure) },

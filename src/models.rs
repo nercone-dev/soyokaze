@@ -784,6 +784,16 @@ impl Headers {
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
         self.fields.iter().map(|(name, value)| (name.as_str(), value.as_str()))
     }
+
+    /// Every field in order, as the [`Text`] pairs they are stored as.
+    ///
+    /// This is what the binary versions build their field lists from: cloning
+    /// a [`Text`] shares a long value rather than copying it, which
+    /// [`Headers::iter`] and `&str` cannot.
+    #[inline]
+    pub fn fields(&self) -> &[(Text, Text)] {
+        &self.fields
+    }
 }
 
 impl PartialEq for Headers {

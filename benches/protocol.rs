@@ -182,6 +182,11 @@ fn websocket_frames() {
 
         let encoded = frame.encode();
         group.throughput(&format!("decode masked ({name})"), length, || websocket::Frame::decode(opaque(&encoded)));
+
+        group.throughput(&format!("take masked ({name})"), length, || {
+            let mut buffer = BytesMut::from(&encoded[..]);
+            websocket::Frame::take(opaque(&mut buffer))
+        });
     }
 
     let mut payload = vec![b'x'; 64 * 1024];

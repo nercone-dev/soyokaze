@@ -47,12 +47,11 @@ fn warmed(fields: &[HeaderField]) -> (Encoder, Decoder) {
     let mut encoder = ready();
     let mut decoder = Decoder::new();
 
-    let (block, instructions) = encoder.encode(0, fields);
-    for instruction in instructions {
-        if let Ok(Some(acknowledgment)) = decoder.on_encoder_instruction(instruction) {
-            encoder.on_decoder_instruction(acknowledgment);
-        }
-    }
+    let block = encoder.encode(0, fields);
+    let stream = encoder.take_encoder_stream();
+    decoder.on_encoder_stream(&stream).expect("the encoder stream was refused");
+    let answers = decoder.take_decoder_stream();
+    encoder.on_decoder_stream(&answers).expect("the decoder stream was refused");
 
     if let Ok((_, Some(acknowledgment))) = decoder.decode(0, &block) {
         encoder.on_decoder_instruction(acknowledgment);
@@ -81,14 +80,14 @@ fn main() {
 
     let mut group = Group::new("qpack::Decoder::decode (static only)");
     for (name, fields) in &sections {
-        let (block, _) = ready().encode(0, fields);
+        let block = ready().encode(0, fields);
         group.throughput(name, block.len(), || Decoder::new().decode(0, opaque(&block)));
     }
 
     let mut group = Group::new("qpack::Decoder::decode (warm table)");
     for (name, fields) in &sections {
         let (mut encoder, mut decoder) = warmed(fields);
-        let (block, _) = encoder.encode(4, fields);
+        let block = encoder.encode(4, fields);
 
         group.throughput(name, block.len(), || decoder.decode(8, opaque(&block)));
     }

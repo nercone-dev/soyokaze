@@ -598,7 +598,7 @@ where
         }
 
         if let Some(trailers) = trailers {
-            let fields = trailers.iter().map(|(name, value)| HeaderField::new(name, value)).collect::<Vec<_>>();
+            let fields = trailers.fields().iter().map(|(name, value)| HeaderField { name: name.clone(), value: value.clone() }).collect::<Vec<_>>();
 
             let mut block = std::mem::take(&mut self.block);
             block.clear();

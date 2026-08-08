@@ -65,7 +65,7 @@ fn frames_round_trip_at_every_length_form() {
         let payload = vec![b'x'; length];
 
         for mask in [None, Some([1u8, 2, 3, 4])] {
-            let frame = Frame { fin: true, opcode: Opcode::Binary, mask, payload: payload.clone() };
+            let frame = Frame { fin: true, opcode: Opcode::Binary, mask, payload: payload.clone().into() };
             let encoded = frame.encode();
 
             let decoded = Frame::decode(&encoded).ok().flatten().expect("a frame did not decode");
@@ -300,7 +300,7 @@ async fn a_ping_is_answered_between_fragments() {
 
     let pong = Frame::decode(&scratch[..read]).ok().flatten().expect("the answer did not decode");
     assert_eq!(pong.1.opcode, Opcode::Pong);
-    assert_eq!(pong.1.payload, b"are you there");
+    assert_eq!(pong.1.payload, b"are you there".as_slice());
 }
 
 #[tokio::test]
@@ -509,4 +509,38 @@ fn an_extended_connect_does_not_assume_its_transport_was_secure() {
         fields.iter().any(|field| field.name == ":scheme" && field.value == "https"),
         "over a secure connection the scheme must be https",
     );
+}
+
+#[test]
+fn taking_a_frame_matches_decoding_it_and_consumes_the_buffer() {
+    let first = masked(Opcode::Text, b"hello");
+    let second = masked(Opcode::Binary, &[0x00, 0xff, 0x7f]);
+
+    let mut stream = first.clone();
+    stream.extend_from_slice(&second);
+
+    let mut buffer = bytes::BytesMut::from(&stream[..]);
+
+    let taken = Frame::take(&mut buffer).expect("a whole frame must take").expect("a whole frame was buffered");
+    let (consumed, decoded) = Frame::decode(&first).expect("a whole frame must decode").expect("a whole frame was given");
+
+    assert_eq!(consumed, first.len());
+    assert_eq!(taken, decoded, "taking and decoding must read one frame the same way");
+    assert_eq!(taken.payload, b"hello".as_slice(), "the payload must come back unmasked");
+    assert_eq!(buffer, second, "taking a frame must consume exactly that frame");
+
+    let taken = Frame::take(&mut buffer).expect("the second frame must take").expect("the second frame was buffered");
+    assert_eq!(taken.payload, [0x00, 0xff, 0x7f].as_slice());
+    assert!(buffer.is_empty());
+}
+
+#[test]
+fn taking_a_partial_frame_leaves_the_buffer_untouched() {
+    let encoded = masked(Opcode::Binary, &[b'x'; 300]);
+
+    for partial in 0..encoded.len() {
+        let mut buffer = bytes::BytesMut::from(&encoded[..partial]);
+        assert_eq!(Frame::take(&mut buffer).expect("a partial frame is not an error"), None);
+        assert_eq!(buffer, encoded[..partial], "{partial} octets must be left where they were");
+    }
 }

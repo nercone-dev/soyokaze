@@ -87,8 +87,7 @@ fn response() -> Message {
 }
 
 fn wire_request(encoder: &mut H3Session, stream_id: u64) -> Bytes {
-    let (block, instructions) = encoder.encoder.encode(stream_id, &request_fields());
-    let _ = instructions;
+    let block = encoder.encoder.encode(stream_id, &request_fields());
 
     let mut out = bytes::BytesMut::new();
     Frame::Headers(block.into()).encode_into(&mut out);
