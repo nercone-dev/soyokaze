@@ -5,10 +5,10 @@ import pathlib
 import pytest
 
 import soyokaze
-from soyokaze import Message, Method, Url, Version
+from soyokaze import Message, Method, URL, Version
 
 def test_a_url_is_taken_apart_into_the_pieces_a_request_needs():
-    url = Url("https://example.test:8443/a/b?q=1")
+    url = URL("https://example.test:8443/a/b?q=1")
 
     assert url.scheme == "https"
     assert url.host == "example.test"
@@ -18,14 +18,14 @@ def test_a_url_is_taken_apart_into_the_pieces_a_request_needs():
     assert url.authority() == "example.test:8443"
 
 def test_a_url_defaults_its_port_and_target_from_the_scheme():
-    assert Url("http://example.test").port == 80
-    assert Url("https://example.test").port == 443
-    assert Url("wss://example.test").port == 443
-    assert Url("http://example.test").target == "/"
+    assert URL("http://example.test").port == 80
+    assert URL("https://example.test").port == 443
+    assert URL("wss://example.test").port == 443
+    assert URL("http://example.test").target == "/"
 
 def test_a_url_that_will_not_parse_raises_a_protocol_error():
     with pytest.raises(soyokaze.ProtocolError):
-        Url("not a url")
+        URL("not a url")
 
 def test_a_request_and_a_response_each_carry_only_what_belongs_to_them():
     request = Message.request(Method.GET, "/index.html", Version.V1_1)
@@ -92,7 +92,7 @@ def test_a_body_reads_back_whichever_way_it_was_set(tmp_path):
     assert message.body() == b"from a file"
 
     message.set_body(pathlib.Path(tmp_path / "missing"))
-    with pytest.raises(soyokaze.IoError):
+    with pytest.raises(soyokaze.IOError):
         message.body()
 
 def test_stream_and_connection_facts_default_to_absent():
@@ -130,8 +130,8 @@ def test_a_consumed_message_refuses_further_use():
         message.take()
 
 def test_http_date_renders_the_imf_fixdate():
-    assert soyokaze.http_date(784111777) == "Sun, 06 Nov 1994 08:49:37 GMT"
-    assert len(soyokaze.http_date(0)) == 29
+    assert soyokaze.DateCache.http_date(784111777) == "Sun, 06 Nov 1994 08:49:37 GMT"
+    assert len(soyokaze.DateCache.http_date(0)) == 29
 
 def test_every_role_carries_the_number_the_c_abi_gives_it():
     assert (soyokaze.Role.USER_AGENT, soyokaze.Role.ORIGIN) == (0, 1)
@@ -156,7 +156,7 @@ def test_a_message_that_crossed_nothing_reports_no_transport_underneath():
 
 def test_a_failure_that_names_no_stream_leaves_its_stream_fields_unset():
     with pytest.raises(soyokaze.ProtocolError) as raised:
-        Url("not a url")
+        URL("not a url")
 
     assert raised.value.status == soyokaze.Status.PROTOCOL
     assert raised.value.stream_id is None, "a failure that took the whole connection names no stream"

@@ -155,22 +155,22 @@ fn a_format_is_told_from_the_first_byte_that_is_not_whitespace() {
     assert_eq!(Format::SEQUENCE, 0x30);
 
     for pem in [LEAF, EC_SEC1, RSA_PKCS1, EC_PKCS8_ENCRYPTED] {
-        assert_eq!(Format::of(&der(pem)), Format::Der, "DER was not recognised");
-        assert_eq!(Format::of(pem.as_bytes()), Format::Pem, "PEM was not recognised");
+        assert_eq!(Format::of(&der(pem)), Format::DER, "DER was not recognised");
+        assert_eq!(Format::of(pem.as_bytes()), Format::PEM, "PEM was not recognised");
         assert_eq!(der(pem)[0], Format::SEQUENCE, "the test material is not a DER SEQUENCE");
     }
 
-    assert_eq!(Format::of(&base64::decode(BUNDLE_PKCS12).expect("the archive is not Base64")), Format::Der);
+    assert_eq!(Format::of(&base64::decode(BUNDLE_PKCS12).expect("the archive is not Base64")), Format::DER);
 }
 
 #[test]
 fn pem_is_recognised_when_something_precedes_its_armour() {
     let described = format!("Subject: CN=soyokaze.test\nIssuer: CN=soyokaze.test\n\n{LEAF}");
-    assert_eq!(Format::of(described.as_bytes()), Format::Pem);
+    assert_eq!(Format::of(described.as_bytes()), Format::PEM);
     assert_eq!(tls::Format::certificates(described.as_bytes()).expect("described PEM did not parse").len(), 1);
 
     let indented = format!("\n\n\t{LEAF}");
-    assert_eq!(Format::of(indented.as_bytes()), Format::Pem);
+    assert_eq!(Format::of(indented.as_bytes()), Format::PEM);
 }
 
 #[test]
@@ -532,12 +532,7 @@ fn a_plaintext_transport_is_what_the_default_security_stands_for() {
 
 /// As [`exchange`], but with each side's TLS details, and with a failed
 /// handshake returned rather than unwrapped.
-fn tls_exchange(
-    server_tls: tls::TlsConfig,
-    client_tls: tls::TlsConfig,
-    version: Version,
-    port: Port,
-) -> Result<Message, soyokaze::protocol::common::Error> {
+fn tls_exchange(server_tls: tls::TLSConfig, client_tls: tls::TLSConfig, version: Version, port: Port) -> Result<Message, soyokaze::protocol::common::Error> {
     let issued = issue("localhost");
     let identity = Identity::new(vec![issued.certificate_pem.into_bytes()], issued.key_pem.into_bytes());
     let roots = vec![issued.certificate_der];
@@ -584,9 +579,9 @@ const X25519: u16 = 0x001d;
 
 #[test]
 fn a_server_restricted_to_one_group_settles_the_handshake_on_it() {
-    let server_tls = tls::TlsConfig { groups: Some("P-384".into()), ..tls::TlsConfig::default() };
+    let server_tls = tls::TLSConfig { groups: Some("P-384".into()), ..tls::TLSConfig::default() };
 
-    let response = tls_exchange(server_tls, tls::TlsConfig::default(), Version::V2_0, Port::TCP(0))
+    let response = tls_exchange(server_tls, tls::TLSConfig::default(), Version::V2_0, Port::TCP(0))
         .expect("a group the client also supports must not fail the handshake");
 
     assert_eq!(
@@ -598,9 +593,9 @@ fn a_server_restricted_to_one_group_settles_the_handshake_on_it() {
 
 #[test]
 fn a_client_preferring_one_group_settles_the_handshake_on_it() {
-    let client_tls = tls::TlsConfig { groups: Some("X25519".into()), ..tls::TlsConfig::default() };
+    let client_tls = tls::TLSConfig { groups: Some("X25519".into()), ..tls::TLSConfig::default() };
 
-    let response = tls_exchange(tls::TlsConfig::default(), client_tls, Version::V2_0, Port::TCP(0))
+    let response = tls_exchange(tls::TLSConfig::default(), client_tls, Version::V2_0, Port::TCP(0))
         .expect("a group the server also supports must not fail the handshake");
 
     assert_eq!(response.security.tls_group.map(|group| group.0), Some(X25519));
@@ -608,8 +603,8 @@ fn a_client_preferring_one_group_settles_the_handshake_on_it() {
 
 #[test]
 fn a_restricted_group_reaches_a_quic_handshake_too() {
-    let p384 = tls::TlsConfig { groups: Some("P-384".into()), ..tls::TlsConfig::default() };
-    let x25519 = tls::TlsConfig { groups: Some("X25519".into()), ..tls::TlsConfig::default() };
+    let p384 = tls::TLSConfig { groups: Some("P-384".into()), ..tls::TLSConfig::default() };
+    let x25519 = tls::TLSConfig { groups: Some("X25519".into()), ..tls::TLSConfig::default() };
 
     let same = tls_exchange(p384.clone(), p384.clone(), Version::V3_0, Port::QUIC(0));
     assert!(same.is_ok(), "one shared group must be enough to complete the handshake");
@@ -620,9 +615,9 @@ fn a_restricted_group_reaches_a_quic_handshake_too() {
 
 #[test]
 fn a_signature_algorithm_matching_the_key_completes_the_handshake() {
-    let server_tls = tls::TlsConfig { signature_algorithms: Some("ecdsa_secp256r1_sha256".into()), ..tls::TlsConfig::default() };
+    let server_tls = tls::TLSConfig { signature_algorithms: Some("ecdsa_secp256r1_sha256".into()), ..tls::TLSConfig::default() };
 
-    let response = tls_exchange(server_tls, tls::TlsConfig::default(), Version::V2_0, Port::TCP(0))
+    let response = tls_exchange(server_tls, tls::TLSConfig::default(), Version::V2_0, Port::TCP(0))
         .expect("the algorithm the key signs with must not fail the handshake");
 
     assert_eq!(response.status_code, Some(200));
@@ -630,16 +625,16 @@ fn a_signature_algorithm_matching_the_key_completes_the_handshake() {
 
 #[test]
 fn a_signature_algorithm_the_key_cannot_sign_with_fails_the_handshake() {
-    let server_tls = tls::TlsConfig { signature_algorithms: Some("rsa_pss_rsae_sha256".into()), ..tls::TlsConfig::default() };
+    let server_tls = tls::TLSConfig { signature_algorithms: Some("rsa_pss_rsae_sha256".into()), ..tls::TLSConfig::default() };
 
-    let result = tls_exchange(server_tls, tls::TlsConfig::default(), Version::V2_0, Port::TCP(0));
+    let result = tls_exchange(server_tls, tls::TLSConfig::default(), Version::V2_0, Port::TCP(0));
 
     assert!(result.is_err(), "an ECDSA key cannot sign RSA-PSS, so the handshake must fail rather than mislead");
 }
 
 #[test]
 fn a_compressed_certificate_serves_tls() {
-    let compressed = tls::TlsConfig { certificate_compression: true, ..tls::TlsConfig::default() };
+    let compressed = tls::TLSConfig { certificate_compression: true, ..tls::TLSConfig::default() };
 
     let response = tls_exchange(compressed.clone(), compressed, Version::V2_0, Port::TCP(0))
         .expect("RFC 8879 compression must not fail a handshake both sides support");
@@ -672,7 +667,7 @@ fn a_compressing_server_sends_a_certificate_the_client_must_inflate() {
     let server = Server::new(ServerConfig {
         versions: vec![Version::V1_1],
         identity: Some(identity),
-        tls: tls::TlsConfig { certificate_compression: true, ..tls::TlsConfig::default() },
+        tls: tls::TLSConfig { certificate_compression: true, ..tls::TLSConfig::default() },
         ..ServerConfig::default()
     });
 
@@ -702,9 +697,9 @@ fn a_compressing_server_sends_a_certificate_the_client_must_inflate() {
 
 #[test]
 fn a_compressing_server_still_serves_a_client_that_does_not_join_in() {
-    let server_tls = tls::TlsConfig { certificate_compression: true, ..tls::TlsConfig::default() };
+    let server_tls = tls::TLSConfig { certificate_compression: true, ..tls::TLSConfig::default() };
 
-    let response = tls_exchange(server_tls, tls::TlsConfig::default(), Version::V2_0, Port::TCP(0))
+    let response = tls_exchange(server_tls, tls::TLSConfig::default(), Version::V2_0, Port::TCP(0))
         .expect("a client without the extension must be served plain certificates");
 
     assert_eq!(response.status_code, Some(200));
@@ -712,9 +707,9 @@ fn a_compressing_server_still_serves_a_client_that_does_not_join_in() {
 
 #[test]
 fn tickets_off_and_server_preference_still_complete_a_handshake() {
-    let server_tls = tls::TlsConfig { session_tickets: false, prefer_server_ciphers: true, ..tls::TlsConfig::default() };
+    let server_tls = tls::TLSConfig { session_tickets: false, prefer_server_ciphers: true, ..tls::TLSConfig::default() };
 
-    let response = tls_exchange(server_tls, tls::TlsConfig::default(), Version::V2_0, Port::TCP(0))
+    let response = tls_exchange(server_tls, tls::TLSConfig::default(), Version::V2_0, Port::TCP(0))
         .expect("declining tickets changes resumption, not the handshake");
 
     assert_eq!(response.status_code, Some(200));
@@ -743,9 +738,9 @@ fn an_unusable_tls_list_is_refused_when_the_context_is_built() {
     let identity = Identity::new(vec![issued.certificate_pem.into_bytes()], issued.key_pem.into_bytes());
     let versions = [Version::V2_0];
 
-    let bad_ciphers = tls::TlsConfig { ciphers: Some("NO-SUCH-CIPHER".into()), ..tls::TlsConfig::default() };
-    let bad_groups = tls::TlsConfig { groups: Some("NoSuchGroup".into()), ..tls::TlsConfig::default() };
-    let bad_algorithms = tls::TlsConfig { signature_algorithms: Some("no_such_algorithm".into()), ..tls::TlsConfig::default() };
+    let bad_ciphers = tls::TLSConfig { ciphers: Some("NO-SUCH-CIPHER".into()), ..tls::TLSConfig::default() };
+    let bad_groups = tls::TLSConfig { groups: Some("NoSuchGroup".into()), ..tls::TLSConfig::default() };
+    let bad_algorithms = tls::TLSConfig { signature_algorithms: Some("no_such_algorithm".into()), ..tls::TLSConfig::default() };
 
     for unusable in [&bad_ciphers, &bad_groups, &bad_algorithms] {
         assert!(
@@ -761,9 +756,9 @@ fn a_cipher_list_the_profile_recognises_is_accepted() {
     let issued = issue("localhost");
     let identity = Identity::new(vec![issued.certificate_pem.into_bytes()], issued.key_pem.into_bytes());
 
-    let tls = tls::TlsConfig {
+    let tls = tls::TLSConfig {
         ciphers: Some("ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305".into()),
-        ..tls::TlsConfig::default()
+        ..tls::TLSConfig::default()
     };
 
     assert!(tls.server(&identity, &[Version::V2_0], None).is_ok());

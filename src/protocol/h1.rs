@@ -691,10 +691,10 @@ impl Field {
     pub fn parse(line: &str) -> Result<(String, String), Error> {
         let spans = Self::spans(line.as_bytes())?;
 
-        Ok((
-            line.get(spans.name).unwrap_or_default().to_ascii_lowercase(),
-            line.get(spans.value).unwrap_or_default().to_owned(),
-        ))
+        let name = line.get(spans.name).unwrap_or_default().to_ascii_lowercase();
+        let value = line.get(spans.value).unwrap_or_default().to_owned();
+
+        Ok((name, value))
     }
 
     /// [`Field::parse`] over raw octets, decoding straight into [`Text`].
@@ -1142,7 +1142,7 @@ where
     /// # Errors
     ///
     /// Returns [`Error::Timeout`] past [`Limits::write_timeout`], and
-    /// [`Error::Io`] when the transport fails.
+    /// [`Error::IO`] when the transport fails.
     pub async fn write(&mut self, data: &[u8]) -> Result<(), Error> {
         sync::Timeout::within(self.limits.write_timeout, self.transport.write_all(data)).await??;
         Ok(())
@@ -1209,7 +1209,7 @@ where
     /// # Errors
     ///
     /// Returns [`Error::Limit`] when more than [`H1Connection::pipeline_depth`]
-    /// requests are already awaiting a response, [`Error::Io`] when a
+    /// requests are already awaiting a response, [`Error::IO`] when a
     /// [`Body::File`] cannot be read, and otherwise as [`StartLine::write`],
     /// [`Field::write`] and [`H1Connection::write_flushed`].
     pub async fn send_message(&mut self, message: Message) -> Result<(), Error> {

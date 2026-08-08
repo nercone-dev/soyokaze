@@ -10,7 +10,7 @@ import ctypes
 import enum
 
 from . import ffi
-from .errors import InvalidError, error_out, raise_for
+from .errors import Error, InvalidError
 from .ffi import library
 from .models import Role
 
@@ -80,22 +80,22 @@ class WebSocketConnection:
 
     def id(self):
         """The identifier of the connection this came from."""
-        return ffi.take(library.soyokaze_websocket_id(self.handle))
+        return library.soyokaze_websocket_id(self.handle).take()
 
     def send(self, frame):
         """Sends one frame. The mask is set from the role."""
-        payload = ffi.encoded(frame.payload)
-        error = error_out()
-        raise_for(library.soyokaze_websocket_send(self.handle, frame.fin, int(frame.opcode), payload, len(payload), ctypes.byref(error)), error)
+        payload = ffi.Library.encoded(frame.payload)
+        error = Error.out()
+        Error.raise_for(library.soyokaze_websocket_send(self.handle, frame.fin, int(frame.opcode), payload, len(payload), ctypes.byref(error)), error)
 
     def receive(self):
         """Receives one frame, without reassembling or answering anything."""
         fin = ctypes.c_bool()
         opcode = ctypes.c_uint8()
         out = ffi.Buffer()
-        error = error_out()
-        raise_for(library.soyokaze_websocket_receive(self.handle, ctypes.byref(fin), ctypes.byref(opcode), ctypes.byref(out), ctypes.byref(error)), error)
-        return Frame(Opcode(opcode.value), ffi.take(out), fin.value)
+        error = Error.out()
+        Error.raise_for(library.soyokaze_websocket_receive(self.handle, ctypes.byref(fin), ctypes.byref(opcode), ctypes.byref(out), ctypes.byref(error)), error)
+        return Frame(Opcode(opcode.value), out.take(), fin.value)
 
     def send_message(self, opcode, payload):
         """Sends a whole message as one unfragmented frame.
@@ -108,9 +108,9 @@ class WebSocketConnection:
         if opcode is None:
             opcode = Opcode.TEXT if isinstance(payload, str) else Opcode.BINARY
 
-        payload = ffi.encoded(payload)
-        error = error_out()
-        raise_for(library.soyokaze_websocket_send_message(self.handle, int(Opcode(opcode)), payload, len(payload), ctypes.byref(error)), error)
+        payload = ffi.Library.encoded(payload)
+        error = Error.out()
+        Error.raise_for(library.soyokaze_websocket_send_message(self.handle, int(Opcode(opcode)), payload, len(payload), ctypes.byref(error)), error)
 
     def receive_message(self):
         """Receives one whole message, reassembling fragments.
@@ -121,12 +121,12 @@ class WebSocketConnection:
         """
         opcode = ctypes.c_uint8()
         out = ffi.Buffer()
-        error = error_out()
-        raise_for(library.soyokaze_websocket_receive_message(self.handle, ctypes.byref(opcode), ctypes.byref(out), ctypes.byref(error)), error)
-        return Opcode(opcode.value), ffi.take(out)
+        error = Error.out()
+        Error.raise_for(library.soyokaze_websocket_receive_message(self.handle, ctypes.byref(opcode), ctypes.byref(out), ctypes.byref(error)), error)
+        return Opcode(opcode.value), out.take()
 
     def close(self, code=CloseCode.NORMAL, reason=""):
         """Closes the connection, running the closing handshake."""
-        encoded = ffi.encoded(reason)
+        encoded = ffi.Library.encoded(reason)
         if not library.soyokaze_websocket_close(self.handle, int(CloseCode(code)), encoded, len(encoded)):
             raise InvalidError("the close was refused")

@@ -12,13 +12,13 @@ from ..ffi import library
 
 def encode(data):
     """Encodes octets as base64 text."""
-    data = ffi.encoded(data)
-    return ffi.take(library.soyokaze_base64_encode(data, len(data))).decode()
+    data = ffi.Library.encoded(data)
+    return library.soyokaze_base64_encode(data, len(data)).take().decode()
 
 def decode(text):
     """Decodes base64 text, raising :class:`InvalidError` when it is not valid."""
-    encoded = ffi.encoded(text)
+    encoded = ffi.Library.encoded(text)
     out = ffi.Buffer()
     if not library.soyokaze_base64_decode(encoded, len(encoded), ctypes.byref(out)):
         raise InvalidError("the text is not valid base64")
-    return ffi.take(out)
+    return out.take()

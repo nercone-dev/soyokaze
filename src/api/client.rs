@@ -11,7 +11,7 @@
 //! HTTP/1.1 by ALPN. A plaintext connection cannot negotiate, so it takes the
 //! version [`ClientConfig::versions`] pinned or HTTP/1.1.
 //!
-//! A client keeps a [`CookieJar`] and an [`HstsStore`] unless told not to, and
+//! A client keeps a [`CookieJar`] and an [`HSTSStore`] unless told not to, and
 //! both are consulted by [`Client::fetch`] and updated from what comes back.
 
 use std::sync::Arc;
@@ -23,16 +23,16 @@ use tokio::net::{TcpStream, UnixStream};
 
 use crate::api::common::VERSIONS;
 use crate::cookies::CookieJar;
-use crate::hsts::HstsStore;
+use crate::hsts::HSTSStore;
 use crate::helpers::text::Text;
-use crate::models::{Alpn, Body, ConnectionID, Headers, Limits, Message, Method, Port, TransportKind, Url, Version};
+use crate::models::{ALPN, Body, ConnectionID, Headers, Limits, Message, Method, Port, TransportKind, URL, Version};
 use crate::tls::Security;
 use crate::protocol::base::{AnyConnection, Connection, Transport};
 use crate::protocol::common::Error;
 use crate::protocol::h1::H1Connection;
 use crate::protocol::h2::H2Connection;
 use crate::protocol::h3::{H3Connection, H3Session};
-use crate::protocol::handler::QuicApplication;
+use crate::protocol::handler::QUICApplication;
 use crate::protocol::quic;
 use crate::helpers::sync;
 
@@ -66,20 +66,20 @@ pub struct ClientConfig {
     /// The TLS details every context is built with: cipher suites, groups,
     /// signature algorithms, session tickets, early data and certificate
     /// compression.
-    pub tls: crate::tls::TlsConfig,
+    pub tls: crate::tls::TLSConfig,
 
     /// The ECH configuration list to use when dialling each host.
     ///
     /// A host of `*` applies wherever no exact entry matches. Each list is
-    /// what [`EchKeys::config_list`] produces.
+    /// what [`ECHKeys::config_list`] produces.
     ///
-    /// [`EchKeys::config_list`]: crate::tls::EchKeys::config_list
+    /// [`ECHKeys::config_list`]: crate::tls::ECHKeys::config_list
     pub ech: std::collections::HashMap<String, Vec<u8>>,
 
     /// Whether to keep a [`CookieJar`] across requests.
     pub cookies: bool,
 
-    /// Whether to keep an [`HstsStore`] across requests.
+    /// Whether to keep an [`HSTSStore`] across requests.
     pub hsts: bool,
 }
 
@@ -90,7 +90,7 @@ impl Default for ClientConfig {
             limits: ClientLimits::default(),
             secure: true,
             roots: None,
-            tls: crate::tls::TlsConfig::default(),
+            tls: crate::tls::TLSConfig::default(),
             ech: std::collections::HashMap::new(),
             cookies: true,
             hsts: true,
@@ -126,7 +126,7 @@ pub struct Client {
     /// The cookie jar, unless [`ClientConfig::cookies`] turned it off.
     pub jar: Option<Arc<CookieJar>>,
     /// The HSTS store, unless [`ClientConfig::hsts`] turned it off.
-    pub store: Option<Arc<HstsStore>>,
+    pub store: Option<Arc<HSTSStore>>,
     /// The TLS configuration dials go out with, built by [`Client::connector`]
     /// on the first secure dial and reused for every one after it.
     pub connector: std::sync::OnceLock<SslConnector>,
@@ -142,7 +142,7 @@ impl Client {
     /// A client with this configuration.
     pub fn new(config: ClientConfig) -> Self {
         let jar = config.cookies.then(|| Arc::new(CookieJar::new().with_limits(config.limits.message)));
-        let store = config.hsts.then(|| Arc::new(HstsStore::new().with_limits(config.limits.message)));
+        let store = config.hsts.then(|| Arc::new(HSTSStore::new().with_limits(config.limits.message)));
 
         Self { config, jar, store, connector: std::sync::OnceLock::new() }
     }
@@ -159,9 +159,9 @@ impl Client {
     /// # Errors
     ///
     /// Returns [`Error::Version`] when no configured version runs over a
-    /// stream transport, and otherwise as [`TlsConfig::client`].
+    /// stream transport, and otherwise as [`TLSConfig::client`].
     ///
-    /// [`TlsConfig::client`]: crate::tls::TlsConfig::client
+    /// [`TLSConfig::client`]: crate::tls::TLSConfig::client
     pub fn connector(&self) -> Result<&SslConnector, Error> {
         if let Some(connector) = self.connector.get() {
             return Ok(connector);
@@ -199,7 +199,7 @@ impl Client {
 
         match target {
             Port::UDS(_) => host.to_owned(),
-            Port::TCP(port) | Port::QUIC(port) => Url::authority_of(scheme, host, *port),
+            Port::TCP(port) | Port::QUIC(port) => URL::authority_of(scheme, host, *port),
         }
     }
 
@@ -223,8 +223,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] when the transport cannot be established,
-    /// [`Error::Tls`] when the handshake fails, [`Error::Version`] when no
+    /// Returns [`Error::IO`] when the transport cannot be established,
+    /// [`Error::TLS`] when the handshake fails, [`Error::Version`] when no
     /// usable version is agreed, and [`Error::Timeout`] when the dial takes too
     /// long.
     pub async fn connect(&self, host: &str, target: Port) -> Result<AnyConnection, Error> {
@@ -274,7 +274,7 @@ impl Client {
     /// # Errors
     ///
     /// Returns [`Error::Version`] when HTTP/3 is the only version configured,
-    /// or when nothing usable is negotiated, and [`Error::Tls`] when the
+    /// or when nothing usable is negotiated, and [`Error::TLS`] when the
     /// handshake fails.
     pub async fn connect_stream_tls(&self, host: &str, transport: Box<dyn Transport>, id: ConnectionID, authority: &str) -> Result<AnyConnection, Error> {
         let versions: Vec<Version> = self.config.versions.iter().copied().filter(|version| version.transport() == TransportKind::Stream).collect();
@@ -283,14 +283,14 @@ impl Client {
         }
 
         let connector = self.connector()?;
-        let mut config = connector.configure().map_err(|err| Error::Tls(err.to_string()))?;
+        let mut config = connector.configure().map_err(|err| Error::TLS(err.to_string()))?;
 
         if let Some(list) = self.ech(host) {
-            config.set_ech_config_list(list).map_err(|err| Error::Tls(err.to_string()))?;
+            config.set_ech_config_list(list).map_err(|err| Error::TLS(err.to_string()))?;
         }
 
-        let stream = tokio_boring::connect(config, host, transport).await.map_err(|err| Error::Tls(err.to_string()))?;
-        let version = Alpn::negotiated(stream.ssl().selected_alpn_protocol(), &versions)?;
+        let stream = tokio_boring::connect(config, host, transport).await.map_err(|err| Error::TLS(err.to_string()))?;
+        let version = ALPN::negotiated(stream.ssl().selected_alpn_protocol(), &versions)?;
         let security = Security::of(stream.ssl());
 
         Ok(self.assemble(version, Box::new(stream), id, authority).await?.with_security(security))
@@ -307,14 +307,14 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] when the host resolves to nothing or the socket
+    /// Returns [`Error::IO`] when the host resolves to nothing or the socket
     /// cannot be set up, [`Error::Version`] when no configured version runs
-    /// over QUIC, and [`Error::Tls`] when the QUIC handshake fails.
+    /// over QUIC, and [`Error::TLS`] when the QUIC handshake fails.
     pub async fn connect_quic(&self, host: &str, port: u16, id: ConnectionID, authority: &str) -> Result<AnyConnection, Error> {
         let address = tokio::net::lookup_host((host, port))
             .await?
             .next()
-            .ok_or_else(|| Error::Io(std::io::Error::other(format!("{host} resolved to no address"))))?;
+            .ok_or_else(|| Error::IO(std::io::Error::other(format!("{host} resolved to no address"))))?;
 
         let bind = match address {
             std::net::SocketAddr::V4(_) => std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
@@ -331,13 +331,13 @@ impl Client {
 
         match version {
             Version::V3_0 => {
-                let config = quic::QuicConfig {
+                let config = quic::QUICConfig {
                     versions: versions.clone(),
                     idle_timeout: self.config.limits.message.read_timeout,
                     max_streams_bidi: None,
                     enable_dgram: false,
                 };
-                let hook = std::sync::Arc::new(quic::QuicClientTls {
+                let hook = std::sync::Arc::new(quic::QUICClientTLS {
                     roots: self.config.roots.clone().unwrap_or_default(),
                     tls: self.config.tls.clone(),
                 });
@@ -345,9 +345,9 @@ impl Client {
                 let session = H3Session::new(crate::models::Role::UserAgent, id, self.config.limits.message);
                 let (connection, worker) = H3Connection::pair(session);
                 let connection = connection.with_request_finalizer(self.request_finalizer(authority));
-                let application = QuicApplication::new(versions, version, worker);
+                let application = QUICApplication::new(versions, version, worker);
 
-                let guard = quic::QuicDialer::connect(host, udp, &config, hook, application).await?;
+                let guard = quic::QUICDialer::connect(host, udp, &config, hook, application).await?;
                 Ok(AnyConnection::H3(connection.with_guard(std::sync::Arc::new(guard))))
             }
 
@@ -400,12 +400,14 @@ impl Client {
         let finalizer = self.request_finalizer(authority);
 
         match version {
-            Version::V1_0 | Version::V1_1 => Ok(AnyConnection::H1(
-                H1Connection::new(transport, role, id, self.config.limits.message).with_version(version).with_request_finalizer(finalizer),
-            )),
-            Version::V2_0 => Ok(AnyConnection::H2(
-                H2Connection::new(transport, role, id, self.config.limits.message).with_request_finalizer(finalizer),
-            )),
+            Version::V1_0 | Version::V1_1 => {
+                let connection = H1Connection::new(transport, role, id, self.config.limits.message).with_version(version).with_request_finalizer(finalizer);
+                Ok(AnyConnection::H1(connection))
+            }
+            Version::V2_0 => {
+                let connection = H2Connection::new(transport, role, id, self.config.limits.message).with_request_finalizer(finalizer);
+                Ok(AnyConnection::H2(connection))
+            }
             Version::V3_0 => Err(Error::Version("HTTP/3 needs a QUIC port".into())),
         }
     }
@@ -433,7 +435,7 @@ impl Client {
     /// Whether every version on offer runs over QUIC, and so QUIC is the
     /// only transport to dial.
     pub fn only_quic(&self) -> bool {
-        !self.config.versions.is_empty() && self.config.versions.iter().all(|version| version.transport() == TransportKind::Quic)
+        !self.config.versions.is_empty() && self.config.versions.iter().all(|version| version.transport() == TransportKind::QUIC)
     }
 
     /// Opens a connection for a URL, taking the transport from its scheme.
@@ -445,7 +447,7 @@ impl Client {
     /// # Errors
     ///
     /// As [`Client::connect`].
-    pub async fn open(&self, url: &Url) -> Result<AnyConnection, Error> {
+    pub async fn open(&self, url: &URL) -> Result<AnyConnection, Error> {
         let id = self.id(&url.host, &Port::TCP(url.port));
         let authority = url.authority();
 
@@ -471,7 +473,7 @@ impl Client {
     ///
     /// `http` becomes `https` and `ws` becomes `wss`, and a default port of 80
     /// moves to 443. Does nothing when HSTS is off or the host is not stored.
-    pub fn apply_hsts(&self, url: &mut Url, now: Instant) {
+    pub fn apply_hsts(&self, url: &mut URL, now: Instant) {
         if let Some(store) = &self.store
             && matches!(url.scheme.as_str(), "http" | "ws")
             && store.secure(&url.host, now)
@@ -499,7 +501,7 @@ impl Client {
     /// as [`Client::open`] and [`Client::request`].
     pub async fn fetch(&self, method: Method, url: &str, headers: Option<Headers>, body: Option<Body>) -> Result<Message, Error> {
         let now = Instant::now();
-        let mut url = Url::parse(url)?;
+        let mut url = URL::parse(url)?;
         self.apply_hsts(&mut url, now);
 
         let mut connection = self.open(&url).await?;
@@ -591,7 +593,7 @@ impl Client {
     /// handshake does not check out, and otherwise as [`Client::open`] and
     /// [`AnyConnection::open_websocket`].
     pub async fn websocket(&self, url: &str) -> Result<crate::websocket::WebSocketConnection<Box<dyn Transport>>, Error> {
-        let mut url = Url::parse(url)?;
+        let mut url = URL::parse(url)?;
         self.apply_hsts(&mut url, Instant::now());
 
         let connection = self.open(&url).await?;

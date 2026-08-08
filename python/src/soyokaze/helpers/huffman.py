@@ -11,13 +11,13 @@ from ..ffi import library
 
 def encode(data):
     """Huffman-encodes octets."""
-    data = ffi.encoded(data)
-    return ffi.take(library.soyokaze_huffman_encode(data, len(data)))
+    data = ffi.Library.encoded(data)
+    return library.soyokaze_huffman_encode(data, len(data)).take()
 
 def decode(data):
     """Huffman-decodes octets, raising :class:`ProtocolError` on a bad sequence."""
-    data = ffi.encoded(data)
+    data = ffi.Library.encoded(data)
     out = ffi.Buffer()
     if not library.soyokaze_huffman_decode(data, len(data), ctypes.byref(out)):
         raise ProtocolError("the octets are not a valid Huffman sequence")
-    return ffi.take(out)
+    return out.take()

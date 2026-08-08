@@ -8,8 +8,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::errors::Error;
-use crate::helpers::sync::lock;
-use crate::models::{Limits, Url};
+use crate::helpers::sync::Lock;
+use crate::models::{Limits, URL};
 
 /// The `SameSite` attribute of a cookie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +51,6 @@ pub struct Cookie {
 }
 
 impl Cookie {
-
     /// Whether an octet is a separator, and so cannot appear in a token.
     pub fn is_separator(byte: u8) -> bool {
         byte <= 0x20 || byte == 0x7f || b"()<>@,;:\\\"/[]?={}".contains(&byte)
@@ -267,7 +266,6 @@ pub struct StoredCookie {
 }
 
 impl StoredCookie {
-
     /// Whether a request target falls under a cookie's path.
     ///
     /// The two match when they are equal, or when the target continues past the
@@ -296,7 +294,7 @@ impl StoredCookie {
     ///
     /// The cookie has to be unexpired, allowed on the transport, and matched
     /// by both domain and path.
-    pub fn matches(&self, url: &Url, now: Instant) -> bool {
+    pub fn matches(&self, url: &URL, now: Instant) -> bool {
         if self.expires.is_some_and(|expiry| expiry <= now) {
             return false;
         }
@@ -392,8 +390,8 @@ impl CookieJar {
     /// A cookie replaces any it shares a name, domain and path with. One whose
     /// `Max-Age` has already passed deletes rather than stores. Values that do
     /// not parse are skipped rather than failing the whole batch.
-    pub fn learn(&self, url: &Url, values: &[&str], now: Instant) {
-        let mut entries = lock(&self.entries);
+    pub fn learn(&self, url: &URL, values: &[&str], now: Instant) {
+        let mut entries = Lock::on(&self.entries);
 
         for value in values {
             let Ok(cookie) = SetCookie::parse(value) else {
@@ -433,8 +431,8 @@ impl CookieJar {
     }
 
     /// The `Cookie` field value for a request to `url`, if any cookie matches.
-    pub fn cookie(&self, url: &Url, now: Instant) -> Option<String> {
-        let entries = lock(&self.entries);
+    pub fn cookie(&self, url: &URL, now: Instant) -> Option<String> {
+        let entries = Lock::on(&self.entries);
         let pairs: Vec<String> = entries
             .iter()
             .filter(|cookie| cookie.matches(url, now))
@@ -446,7 +444,7 @@ impl CookieJar {
 
     /// Drops every cookie that has expired by `now`.
     pub fn prune(&self, now: Instant) {
-        lock(&self.entries).retain(|cookie| !cookie.expires.is_some_and(|expiry| expiry <= now));
+        Lock::on(&self.entries).retain(|cookie| !cookie.expires.is_some_and(|expiry| expiry <= now));
     }
 }
 

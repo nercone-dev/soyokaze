@@ -1,25 +1,25 @@
 //! TLS identities, context details and Encrypted Client Hello, from C.
 //!
-//! [`Identity`] is what a server serves, [`TlsConfig`] is how either side's
-//! context is tuned, [`EchKeys`] is what a server offers ECH with, and
-//! [`EchConfigList`] is what a client reads back out of what a server
+//! [`Identity`] is what a server serves, [`TLSConfig`] is how either side's
+//! context is tuned, [`ECHKeys`] is what a server offers ECH with, and
+//! [`ECHConfigList`] is what a client reads back out of what a server
 //! published — the same parts [`crate::tls`] arranges.
 
 use crate::ffi::errors::{ErrorHandle, Status};
 use crate::ffi::{Buffer, Slice};
-use crate::tls::{EchConfigList, EchKeys, Identity};
+use crate::tls::{ECHConfigList, ECHKeys, Identity};
 
 /// The TLS details a context is built with, beyond its identity and roots.
 ///
-/// The C half of [`TlsConfig`], field for field. Each string is an OpenSSL
+/// The C half of [`TLSConfig`], field for field. Each string is an OpenSSL
 /// list, entries separated by `:` and most preferred first; an absent slice
-/// keeps that field's default, the way [`TlsConfig::default`] would.
+/// keeps that field's default, the way [`TLSConfig::default`] would.
 ///
-/// [`TlsConfig`]: crate::tls::TlsConfig
-/// [`TlsConfig::default`]: crate::tls::TlsConfig::default
+/// [`TLSConfig`]: crate::tls::TLSConfig
+/// [`TLSConfig::default`]: crate::tls::TLSConfig::default
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct TlsConfig {
+pub struct TLSConfig {
     /// The cipher suites to allow, for TLS 1.2 and 1.3 in one list. BoringSSL
     /// keeps its built-in order for the TLS 1.3 suites, so what this
     /// restricts and orders is TLS 1.2.
@@ -38,24 +38,24 @@ pub struct TlsConfig {
     pub certificate_compression: bool,
 }
 
-impl TlsConfig {
-    /// The [`TlsConfig`] this stands for.
+impl TLSConfig {
+    /// The [`TLSConfig`] this stands for.
     ///
     /// `None` when a string is not UTF-8.
     ///
-    /// [`TlsConfig`]: crate::tls::TlsConfig
+    /// [`TLSConfig`]: crate::tls::TLSConfig
     ///
     /// # Safety
     ///
     /// Each slice must either be absent or point to its stated number of
     /// readable octets.
-    pub unsafe fn parse(&self) -> Option<crate::tls::TlsConfig> {
+    pub unsafe fn parse(&self) -> Option<crate::tls::TLSConfig> {
         let text = |slice: Slice| match slice.data.is_null() {
             true => Some(None),
             false => unsafe { Slice::borrow_text(slice.data, slice.len) }.map(|text| Some(text.to_owned())),
         };
 
-        Some(crate::tls::TlsConfig {
+        Some(crate::tls::TLSConfig {
             ciphers: text(self.ciphers)?,
             groups: text(self.groups)?,
             signature_algorithms: text(self.signature_algorithms)?,
@@ -67,14 +67,14 @@ impl TlsConfig {
     }
 }
 
-/// The default [`TlsConfig`], to be adjusted and passed back.
+/// The default [`TLSConfig`], to be adjusted and passed back.
 ///
-/// [`TlsConfig`]: crate::tls::TlsConfig
+/// [`TLSConfig`]: crate::tls::TLSConfig
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_tls_config_default() -> TlsConfig {
-    let config = crate::tls::TlsConfig::default();
+pub extern "C" fn soyokaze_tls_config_default() -> TLSConfig {
+    let config = crate::tls::TLSConfig::default();
 
-    TlsConfig {
+    TLSConfig {
         ciphers: Slice::ABSENT,
         groups: Slice::ABSENT,
         signature_algorithms: Slice::ABSENT,
@@ -173,7 +173,7 @@ pub unsafe extern "C" fn soyokaze_identity_free(identity: *mut Identity) {
 /// `public_name` must point to `public_name_len` readable octets, and `out`
 /// must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_ech_keys_generate(public_name: *const u8, public_name_len: usize, config_id: u8, out: *mut *mut EchKeys, error: *mut *mut ErrorHandle) -> Status {
+pub unsafe extern "C" fn soyokaze_ech_keys_generate(public_name: *const u8, public_name_len: usize, config_id: u8, out: *mut *mut ECHKeys, error: *mut *mut ErrorHandle) -> Status {
     if out.is_null() {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     }
@@ -186,7 +186,7 @@ pub unsafe extern "C" fn soyokaze_ech_keys_generate(public_name: *const u8, publ
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     }
 
-    match EchKeys::generate(public_name, config_id) {
+    match ECHKeys::generate(public_name, config_id) {
         Ok(keys) => {
             unsafe { *out = Box::into_raw(Box::new(keys)) };
             Status::Ok
@@ -206,22 +206,22 @@ pub unsafe extern "C" fn soyokaze_ech_keys_generate(public_name: *const u8, publ
 /// `config` and `private_key` must point to their stated number of readable
 /// octets.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_ech_keys_new(config: *const u8, config_len: usize, private_key: *const u8, private_key_len: usize) -> *mut EchKeys {
+pub unsafe extern "C" fn soyokaze_ech_keys_new(config: *const u8, config_len: usize, private_key: *const u8, private_key_len: usize) -> *mut ECHKeys {
     let (Some(config), Some(private_key)) = (unsafe { Slice::borrow(config, config_len) }, unsafe { Slice::borrow(private_key, private_key_len) }) else {
         return std::ptr::null_mut();
     };
 
-    Box::into_raw(Box::new(EchKeys { config: config.to_vec(), private_key: private_key.to_vec() }))
+    Box::into_raw(Box::new(ECHKeys { config: config.to_vec(), private_key: private_key.to_vec() }))
 }
 
-/// Releases an [`EchKeys`].
+/// Releases an [`ECHKeys`].
 ///
 /// # Safety
 ///
 /// `keys` must come from `soyokaze_ech_keys_generate` or
 /// `soyokaze_ech_keys_new` and not have been freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_ech_keys_free(keys: *mut EchKeys) {
+pub unsafe extern "C" fn soyokaze_ech_keys_free(keys: *mut ECHKeys) {
     if !keys.is_null() {
         drop(unsafe { Box::from_raw(keys) });
     }
@@ -233,7 +233,7 @@ pub unsafe extern "C" fn soyokaze_ech_keys_free(keys: *mut EchKeys) {
 ///
 /// `keys` must either be null or be a handle that has not been freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_ech_keys_config(keys: *const EchKeys) -> Slice {
+pub unsafe extern "C" fn soyokaze_ech_keys_config(keys: *const ECHKeys) -> Slice {
     match unsafe { keys.as_ref() } {
         Some(keys) => Slice::new(&keys.config),
         None => Slice::ABSENT,
@@ -248,7 +248,7 @@ pub unsafe extern "C" fn soyokaze_ech_keys_config(keys: *const EchKeys) -> Slice
 ///
 /// As [`soyokaze_ech_keys_config`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_ech_keys_private_key(keys: *const EchKeys) -> Slice {
+pub unsafe extern "C" fn soyokaze_ech_keys_private_key(keys: *const ECHKeys) -> Slice {
     match unsafe { keys.as_ref() } {
         Some(keys) => Slice::new(&keys.private_key),
         None => Slice::ABSENT,
@@ -264,7 +264,7 @@ pub unsafe extern "C" fn soyokaze_ech_keys_private_key(keys: *const EchKeys) -> 
 ///
 /// As [`soyokaze_ech_keys_config`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_ech_keys_config_list(keys: *const EchKeys) -> Buffer {
+pub unsafe extern "C" fn soyokaze_ech_keys_config_list(keys: *const ECHKeys) -> Buffer {
     match unsafe { keys.as_ref() } {
         Some(keys) => Buffer::new(keys.config_list()),
         None => Buffer::EMPTY,
@@ -280,7 +280,7 @@ pub unsafe extern "C" fn soyokaze_ech_keys_config_list(keys: *const EchKeys) -> 
 /// `data` must point to `data_len` readable octets, and `out` must be
 /// writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_ech_config_list_parse(data: *const u8, data_len: usize, out: *mut *mut EchConfigList, error: *mut *mut ErrorHandle) -> Status {
+pub unsafe extern "C" fn soyokaze_ech_config_list_parse(data: *const u8, data_len: usize, out: *mut *mut ECHConfigList, error: *mut *mut ErrorHandle) -> Status {
     if out.is_null() {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     }
@@ -289,7 +289,7 @@ pub unsafe extern "C" fn soyokaze_ech_config_list_parse(data: *const u8, data_le
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 
-    match EchConfigList::parse(data) {
+    match ECHConfigList::parse(data) {
         Ok(list) => {
             unsafe { *out = Box::into_raw(Box::new(list)) };
             Status::Ok
@@ -298,14 +298,14 @@ pub unsafe extern "C" fn soyokaze_ech_config_list_parse(data: *const u8, data_le
     }
 }
 
-/// Releases an [`EchConfigList`].
+/// Releases an [`ECHConfigList`].
 ///
 /// # Safety
 ///
 /// `list` must come from `soyokaze_ech_config_list_parse` and not have been
 /// freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_ech_config_list_free(list: *mut EchConfigList) {
+pub unsafe extern "C" fn soyokaze_ech_config_list_free(list: *mut ECHConfigList) {
     if !list.is_null() {
         drop(unsafe { Box::from_raw(list) });
     }
@@ -317,7 +317,7 @@ pub unsafe extern "C" fn soyokaze_ech_config_list_free(list: *mut EchConfigList)
 ///
 /// `list` must either be null or be a handle that has not been freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_ech_config_list_count(list: *const EchConfigList) -> usize {
+pub unsafe extern "C" fn soyokaze_ech_config_list_count(list: *const ECHConfigList) -> usize {
     unsafe { list.as_ref() }.map_or(0, |list| list.configs.len())
 }
 
@@ -327,7 +327,7 @@ pub unsafe extern "C" fn soyokaze_ech_config_list_count(list: *const EchConfigLi
 ///
 /// As [`soyokaze_ech_config_list_count`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_ech_config_version(list: *const EchConfigList, index: usize) -> u16 {
+pub unsafe extern "C" fn soyokaze_ech_config_version(list: *const ECHConfigList, index: usize) -> u16 {
     unsafe { list.as_ref() }.and_then(|list| list.configs.get(index)).map_or(0, |config| config.version)
 }
 
@@ -337,7 +337,7 @@ pub unsafe extern "C" fn soyokaze_ech_config_version(list: *const EchConfigList,
 ///
 /// As [`soyokaze_ech_config_list_count`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_ech_config_public_name(list: *const EchConfigList, index: usize) -> Slice {
+pub unsafe extern "C" fn soyokaze_ech_config_public_name(list: *const ECHConfigList, index: usize) -> Slice {
     Slice::maybe(unsafe { list.as_ref() }.and_then(|list| list.configs.get(index)).map(|config| config.public_name.as_str()))
 }
 
@@ -347,7 +347,7 @@ pub unsafe extern "C" fn soyokaze_ech_config_public_name(list: *const EchConfigL
 ///
 /// As [`soyokaze_ech_config_list_count`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_ech_config_maximum_name_length(list: *const EchConfigList, index: usize) -> i32 {
+pub unsafe extern "C" fn soyokaze_ech_config_maximum_name_length(list: *const ECHConfigList, index: usize) -> i32 {
     unsafe { list.as_ref() }
         .and_then(|list| list.configs.get(index))
         .map_or(-1, |config| config.maximum_name_length as i32)
@@ -361,7 +361,7 @@ pub unsafe extern "C" fn soyokaze_ech_config_maximum_name_length(list: *const Ec
 /// [`ClientConfig::ech`]: crate::api::client::ClientConfig::ech
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct EchEntry {
+pub struct ECHEntry {
     /// The host the list applies to.
     pub host: Slice,
     /// The `ECHConfigList`, as `soyokaze_ech_keys_config_list` produces it.

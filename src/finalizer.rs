@@ -14,7 +14,7 @@
 use std::cell::Cell;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::hsts::HstsPolicy;
+use crate::hsts::HSTSPolicy;
 use crate::helpers::text::Text;
 use crate::models::{Headers, Message, Role};
 
@@ -40,7 +40,6 @@ thread_local! {
 }
 
 impl DateCache {
-
     /// The proleptic Gregorian year, month and day for a count of days since
     /// the Unix epoch.
     ///
@@ -154,12 +153,12 @@ impl Default for DateCache {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResponseFinalizer {
     /// The HSTS policy to attach to responses, if any.
-    pub hsts: Option<HstsPolicy>,
+    pub hsts: Option<HSTSPolicy>,
 }
 
 impl ResponseFinalizer {
     /// A finalizer attaching `hsts`, when there is a policy to attach.
-    pub fn new(hsts: Option<HstsPolicy>) -> Self {
+    pub fn new(hsts: Option<HSTSPolicy>) -> Self {
         Self { hsts }
     }
 
@@ -185,7 +184,7 @@ impl Message {
     ///
     /// Requests and informational (1xx) responses are left alone: a 1xx is
     /// followed by the real response, which carries the fields instead.
-    pub fn finalize_response(&mut self, date: &DateCache, hsts: Option<&HstsPolicy>) {
+    pub fn finalize_response(&mut self, date: &DateCache, hsts: Option<&HSTSPolicy>) {
         if !self.is_response() {
             return;
         }

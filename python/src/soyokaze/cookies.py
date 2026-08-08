@@ -10,8 +10,8 @@ import ctypes
 import enum
 
 from . import ffi
-from .models import limits_argument, limits_pointer
-from .errors import InvalidError, error_out, raise_for
+from .models import Limits
+from .errors import Error, InvalidError
 from .ffi import library
 
 class SameSite(enum.IntEnum):
@@ -40,7 +40,7 @@ class Cookie:
         Parsing never fails — a malformed field yields whatever pairs could
         be read from it.
         """
-        encoded = ffi.encoded(value)
+        encoded = ffi.Library.encoded(value)
         handle = library.soyokaze_cookie_parse(encoded, len(encoded))
         if not handle:
             raise InvalidError("the value was refused")
@@ -56,18 +56,18 @@ class Cookie:
 
     def get(self, name):
         """The value stored under this exact name, or ``None``."""
-        encoded = ffi.encoded(name)
+        encoded = ffi.Library.encoded(name)
         return library.soyokaze_cookie_get(self.handle, encoded, len(encoded)).text()
 
     def append(self, name, value):
         """Adds a pair at the end."""
-        name, value = ffi.encoded(name), ffi.encoded(value)
+        name, value = ffi.Library.encoded(name), ffi.Library.encoded(value)
         if not library.soyokaze_cookie_append(self.handle, name, len(name), value, len(value)):
             raise InvalidError("the pair was refused")
 
     def build(self):
         """Writes the pairs back out as a ``Cookie`` field value."""
-        return ffi.take(library.soyokaze_cookie_build(self.handle)).decode()
+        return library.soyokaze_cookie_build(self.handle).take().decode()
 
     def __repr__(self):
         return f"Cookie({self.build()!r})"
@@ -78,7 +78,7 @@ class SetCookie:
     def __init__(self, name=None, value=None, handle=None):
         """A cookie with no attributes set, or a wrapper around a handle."""
         if handle is None:
-            name, value = ffi.encoded(name), ffi.encoded(value if value is not None else "")
+            name, value = ffi.Library.encoded(name), ffi.Library.encoded(value if value is not None else "")
             handle = library.soyokaze_setcookie_new(name, len(name), value, len(value))
             if not handle:
                 raise InvalidError("the name or value was refused")
@@ -93,9 +93,9 @@ class SetCookie:
     def parse(cls, value):
         """Reads a ``Set-Cookie`` field value."""
         handle = ctypes.c_void_p()
-        error = error_out()
-        encoded = ffi.encoded(value)
-        raise_for(library.soyokaze_setcookie_parse(encoded, len(encoded), ctypes.byref(handle), ctypes.byref(error)), error)
+        error = Error.out()
+        encoded = ffi.Library.encoded(value)
+        Error.raise_for(library.soyokaze_setcookie_parse(encoded, len(encoded), ctypes.byref(handle), ctypes.byref(error)), error)
         return cls(handle=handle)
 
     @property
@@ -110,7 +110,7 @@ class SetCookie:
 
     @value.setter
     def value(self, value):
-        encoded = ffi.encoded(value)
+        encoded = ffi.Library.encoded(value)
         library.soyokaze_setcookie_set_value(self.handle, encoded, len(encoded))
 
     @property
@@ -120,7 +120,7 @@ class SetCookie:
 
     @expires.setter
     def expires(self, value):
-        encoded = None if value is None else ffi.encoded(value)
+        encoded = None if value is None else ffi.Library.encoded(value)
         library.soyokaze_setcookie_set_expires(self.handle, encoded, 0 if encoded is None else len(encoded))
 
     @property
@@ -142,7 +142,7 @@ class SetCookie:
 
     @domain.setter
     def domain(self, value):
-        encoded = None if value is None else ffi.encoded(value)
+        encoded = None if value is None else ffi.Library.encoded(value)
         library.soyokaze_setcookie_set_domain(self.handle, encoded, 0 if encoded is None else len(encoded))
 
     @property
@@ -152,7 +152,7 @@ class SetCookie:
 
     @path.setter
     def path(self, value):
-        encoded = None if value is None else ffi.encoded(value)
+        encoded = None if value is None else ffi.Library.encoded(value)
         library.soyokaze_setcookie_set_path(self.handle, encoded, 0 if encoded is None else len(encoded))
 
     @property
@@ -186,9 +186,9 @@ class SetCookie:
     def build(self):
         """Writes the cookie out as a ``Set-Cookie`` field value."""
         out = ffi.Buffer()
-        error = error_out()
-        raise_for(library.soyokaze_setcookie_build(self.handle, ctypes.byref(out), ctypes.byref(error)), error)
-        return ffi.take(out).decode()
+        error = Error.out()
+        Error.raise_for(library.soyokaze_setcookie_build(self.handle, ctypes.byref(out), ctypes.byref(error)), error)
+        return out.take().decode()
 
     def __repr__(self):
         return f"SetCookie({self.name!r})"
@@ -205,8 +205,8 @@ class CookieJar:
 
     def __init__(self, limits=None):
         """An empty jar, bounded by ``limits`` or the defaults."""
-        struct = limits_argument(limits)
-        self.handle = library.soyokaze_cookiejar_new(limits_pointer(struct))
+        struct = Limits.argument(limits)
+        self.handle = library.soyokaze_cookiejar_new(Limits.pointer(struct))
 
     def __del__(self):
         if getattr(self, "handle", None):
@@ -218,14 +218,14 @@ class CookieJar:
 
         Values that do not parse are skipped rather than failing the batch.
         """
-        slices = [ffi.slice_of(ffi.encoded(value)) for value in values]
+        slices = [ffi.Slice.of(ffi.Library.encoded(value)) for value in values]
         array = (ffi.Slice * len(slices))(*slices)
         if not library.soyokaze_cookiejar_learn(self.handle, url.handle, array, len(slices)):
             raise InvalidError("the values were refused")
 
     def cookie(self, url):
         """The ``Cookie`` field value for a request to ``url``, or ``None``."""
-        octets = ffi.taken(library.soyokaze_cookiejar_cookie(self.handle, url.handle))
+        octets = library.soyokaze_cookiejar_cookie(self.handle, url.handle).taken()
         return None if octets is None else octets.decode()
 
     def prune(self):

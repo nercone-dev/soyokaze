@@ -29,10 +29,9 @@ use crate::protocol::common::Error;
 use crate::api::cluster::Cluster;
 use crate::api::gate::Gate;
 use crate::protocol::handler::{Incoming, Negotiation};
-use crate::protocol::quic::{self, QuicIncoming};
+use crate::protocol::quic::{self, QUICIncoming};
 use crate::tls::Identity;
 use crate::helpers::sync;
-
 
 /// How a [`Server`] is configured.
 ///
@@ -61,13 +60,13 @@ pub struct ServerConfig {
     /// The TLS details every context is built with: cipher suites, groups,
     /// signature algorithms, suite preference, session tickets, early data
     /// and certificate compression.
-    pub tls: crate::tls::TlsConfig,
+    pub tls: crate::tls::TLSConfig,
 
     /// The keys to offer Encrypted Client Hello with.
-    pub ech: Option<crate::tls::EchKeys>,
+    pub ech: Option<crate::tls::ECHKeys>,
 
     /// The HSTS policy to attach to every secure response.
-    pub hsts: Option<crate::hsts::HstsPolicy>,
+    pub hsts: Option<crate::hsts::HSTSPolicy>,
 
     /// Whether sockets are opened with `SO_REUSEPORT`.
     ///
@@ -82,7 +81,7 @@ impl Default for ServerConfig {
             versions: VERSIONS.to_vec(),
             limits: ServerLimits::default(),
             identity: None,
-            tls: crate::tls::TlsConfig::default(),
+            tls: crate::tls::TLSConfig::default(),
             ech: None,
             hsts: None,
             reuseport: true,
@@ -123,7 +122,7 @@ impl Server {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] when the socket cannot be created or bound.
+    /// Returns [`Error::IO`] when the socket cannot be created or bound.
     pub fn open(&self, target: &Port) -> Result<RawSocket, Error> {
         Ok(match target {
             Port::UDS(path) => {
@@ -144,7 +143,7 @@ impl Server {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] when the socket cannot be created, configured or
+    /// Returns [`Error::IO`] when the socket cannot be created, configured or
     /// bound.
     pub fn socket(&self, port: u16, kind: socket2::Type) -> Result<socket2::Socket, Error> {
         let socket = socket2::Socket::new(socket2::Domain::IPV6, kind, None)?;
@@ -179,8 +178,8 @@ impl Server {
     /// # Errors
     ///
     /// Returns [`Error::Version`] when the port is offered no version it can
-    /// carry, [`Error::Io`] when the socket cannot be adopted, and
-    /// [`Error::Tls`] when a QUIC port has no identity or a TLS context
+    /// carry, [`Error::IO`] when the socket cannot be adopted, and
+    /// [`Error::TLS`] when a QUIC port has no identity or a TLS context
     /// cannot be built.
     pub async fn attach(&self, target: &Port, socket: RawSocket) -> Result<Listener, Error> {
         let versions = target.offers(&self.config.versions);
@@ -198,21 +197,21 @@ impl Server {
                     .config
                     .identity
                     .as_ref()
-                    .ok_or_else(|| Error::Tls("a QUIC port needs a certificate and a key".into()))?;
+                    .ok_or_else(|| Error::TLS("a QUIC port needs a certificate and a key".into()))?;
 
-                let config = quic::QuicConfig {
+                let config = quic::QUICConfig {
                     versions: versions.clone(),
                     idle_timeout: self.config.limits.message.read_timeout,
                     max_streams_bidi: Some(self.config.limits.message.max_concurrent_streams as u64),
                     enable_dgram: false,
                 };
-                let hook = std::sync::Arc::new(quic::QuicServerTls {
+                let hook = std::sync::Arc::new(quic::QUICServerTLS {
                     identity: identity.clone(),
                     ech: self.config.ech.clone(),
                     tls: self.config.tls.clone(),
                 });
 
-                let (incoming, address) = quic::QuicListener::bind(udp, &config, hook)?;
+                let (incoming, address) = quic::QUICListener::bind(udp, &config, hook)?;
                 Socket::QUIC { incoming: tokio::sync::Mutex::new(incoming), address }
             }
         };
@@ -248,13 +247,13 @@ impl RawSocket {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] for a Unix socket, which has no address, and when
+    /// Returns [`Error::IO`] for a Unix socket, which has no address, and when
     /// the address cannot be read.
     pub fn address(&self) -> Result<SocketAddr, Error> {
         match self {
             Self::TCP(listener) => Ok(listener.local_addr()?),
             Self::QUIC(socket) => Ok(socket.local_addr()?),
-            Self::UDS(_) => Err(Error::Io(std::io::Error::other("a unix socket has no address"))),
+            Self::UDS(_) => Err(Error::IO(std::io::Error::other("a unix socket has no address"))),
         }
     }
 
@@ -265,7 +264,7 @@ impl RawSocket {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] when the descriptor cannot be duplicated.
+    /// Returns [`Error::IO`] when the descriptor cannot be duplicated.
     pub fn share(&self) -> Result<Self, Error> {
         Ok(match self {
             Self::UDS(listener) => Self::UDS(listener.try_clone()?),
@@ -288,7 +287,7 @@ pub enum Socket {
     /// a socket to accept on.
     QUIC {
         /// Connections `tokio-quiche` has completed the handshake for.
-        incoming: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<std::io::Result<QuicIncoming>>>,
+        incoming: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<std::io::Result<QUICIncoming>>>,
         /// The address the UDP socket is bound to.
         address: std::net::SocketAddr,
     },
@@ -299,13 +298,13 @@ impl Socket {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] for a Unix socket, which has no address, and when
+    /// Returns [`Error::IO`] for a Unix socket, which has no address, and when
     /// the address cannot be read.
     pub fn address(&self) -> Result<SocketAddr, Error> {
         match self {
             Self::TCP(listener) => Ok(listener.local_addr()?),
             Self::QUIC { address, .. } => Ok(*address),
-            Self::UDS(_) => Err(Error::Io(std::io::Error::other("a unix socket has no address"))),
+            Self::UDS(_) => Err(Error::IO(std::io::Error::other("a unix socket has no address"))),
         }
     }
 
@@ -314,11 +313,11 @@ impl Socket {
     /// # Errors
     ///
     /// Returns [`Error::Closed`] when a QUIC endpoint has shut down, and
-    /// [`Error::Io`] when accepting fails.
+    /// [`Error::IO`] when accepting fails.
     pub async fn accept(&self) -> Result<Incoming, Error> {
         match self {
             Self::QUIC { incoming, .. } => {
-                let incoming = incoming.lock().await.recv().await.ok_or(Error::Closed)?.map_err(Error::Io)?;
+                let incoming = incoming.lock().await.recv().await.ok_or(Error::Closed)?.map_err(Error::IO)?;
                 Ok(Incoming::QUIC(incoming))
             }
 
@@ -395,7 +394,7 @@ impl Listener {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] or [`Error::Closed`] when accepting itself fails.
+    /// Returns [`Error::IO`] or [`Error::Closed`] when accepting itself fails.
     pub async fn accept(&mut self) -> Result<AnyConnection, Error> {
         loop {
             tokio::select! {
@@ -471,7 +470,6 @@ impl Default for ServerLimits {
         }
     }
 }
-
 
 /// What a server does with the connections it accepts.
 ///
@@ -557,7 +555,6 @@ pub trait Handler: Send + Sync + 'static {
     }
 }
 
-
 /// A running server, as [`Server::serve`] returns it.
 ///
 /// Everything runs on the current runtime. Dropping this leaves the server
@@ -578,6 +575,11 @@ impl ServerHandle {
     /// The first bound address, if any port has one.
     pub fn address(&self) -> Option<std::net::SocketAddr> {
         self.addresses.first().copied()
+    }
+
+    /// Every bound address.
+    pub fn addresses(&self) -> &[std::net::SocketAddr] {
+        &self.addresses
     }
 
     /// Stops accepting and waits for connections to finish.
@@ -706,7 +708,7 @@ impl Server {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] when a QUIC port is asked for more than one
+    /// Returns [`Error::IO`] when a QUIC port is asked for more than one
     /// worker without reuseport, when a socket cannot be opened, or when a
     /// thread or runtime cannot be created, [`Error::Closed`] when a worker
     /// dies before reporting, and otherwise as [`Server::attach`], whose
@@ -717,7 +719,7 @@ impl Server {
 
         if workers > 1 && !self.config.reuseport && ports.iter().any(|port| matches!(port, Port::QUIC(_))) {
             let reason = "a QUIC port needs reuseport to run on more than one worker";
-            return Err(Error::Io(std::io::Error::other(reason)));
+            return Err(Error::IO(std::io::Error::other(reason)));
         }
 
         let handler = Arc::new(handler);
@@ -772,7 +774,7 @@ impl Server {
                 let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                     Ok(runtime) => runtime,
                     Err(error) => {
-                        let _ = ready.send(Err(Error::Io(error)));
+                        let _ = ready.send(Err(Error::IO(error)));
                         return;
                     }
                 };
@@ -806,7 +808,7 @@ impl Server {
             match std::thread::Builder::new().name(format!("soyokaze-{index}")).stack_size(self.config.limits.worker_stack_size).spawn(worker) {
                 Ok(thread) => threads.push(thread),
                 Err(error) => {
-                    failure = Some(Error::Io(error));
+                    failure = Some(Error::IO(error));
                     break;
                 }
             }

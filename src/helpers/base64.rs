@@ -77,24 +77,14 @@ pub fn encode(input: &[u8]) -> String {
     for group in &mut groups {
         let packed = (group[0] as u32) << 16 | (group[1] as u32) << 8 | group[2] as u32;
 
-        out.extend_from_slice(&[
-            symbol((packed >> 18) as u8),
-            symbol((packed >> 12) as u8),
-            symbol((packed >> 6) as u8),
-            symbol(packed as u8),
-        ]);
+        out.extend_from_slice(&[symbol((packed >> 18) as u8), symbol((packed >> 12) as u8), symbol((packed >> 6) as u8), symbol(packed as u8)]);
     }
 
     let rest = groups.remainder();
     if !rest.is_empty() {
         let packed = (rest[0] as u32) << 16 | (*rest.get(1).unwrap_or(&0) as u32) << 8;
 
-        out.extend_from_slice(&[
-            symbol((packed >> 18) as u8),
-            symbol((packed >> 12) as u8),
-            if rest.len() > 1 { symbol((packed >> 6) as u8) } else { PAD },
-            PAD,
-        ]);
+        out.extend_from_slice(&[symbol((packed >> 18) as u8), symbol((packed >> 12) as u8), if rest.len() > 1 { symbol((packed >> 6) as u8) } else { PAD }, PAD]);
     }
 
     String::from_utf8(out).unwrap_or_default()

@@ -12,7 +12,7 @@ use crate::ffi::models::Limits;
 use crate::ffi::errors::{ErrorHandle, Status};
 use crate::ffi::{Buffer, Slice};
 use crate::cookies::{Cookie, CookieJar, SameSite, SetCookie};
-use crate::models::Url;
+use crate::models::URL;
 
 /// Builds an empty `Cookie` field: no pairs yet.
 #[unsafe(no_mangle)]
@@ -508,7 +508,7 @@ pub unsafe extern "C" fn soyokaze_cookiejar_free(jar: *mut CookieJar) {
 /// must point to `value_count` readable slices whose own pointers are valid
 /// UTF-8 text.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_cookiejar_learn(jar: *const CookieJar, url: *const Url, values: *const Slice, value_count: usize) -> bool {
+pub unsafe extern "C" fn soyokaze_cookiejar_learn(jar: *const CookieJar, url: *const URL, values: *const Slice, value_count: usize) -> bool {
     let (Some(jar), Some(url)) = (unsafe { jar.as_ref() }, unsafe { url.as_ref() }) else {
         return false;
     };
@@ -539,7 +539,7 @@ pub unsafe extern "C" fn soyokaze_cookiejar_learn(jar: *const CookieJar, url: *c
 /// `jar` and `url` must each either be null or be handles that have not been
 /// freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_cookiejar_cookie(jar: *const CookieJar, url: *const Url) -> Buffer {
+pub unsafe extern "C" fn soyokaze_cookiejar_cookie(jar: *const CookieJar, url: *const URL) -> Buffer {
     let (Some(jar), Some(url)) = (unsafe { jar.as_ref() }, unsafe { url.as_ref() }) else {
         return Buffer::EMPTY;
     };

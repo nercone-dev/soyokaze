@@ -9,7 +9,7 @@ import threading
 import pytest
 
 import soyokaze
-from soyokaze import Client, ClientConfig, Limits, Message, Method, Port, Server, ServerConfig, ServerLimits, Url, Version
+from soyokaze import Client, ClientConfig, Limits, Message, Method, Port, Server, ServerConfig, ServerLimits, URL, Version
 
 def echo(request):
     """Answers with the request's own target, so the round trip proves the
@@ -97,7 +97,7 @@ def test_send_and_receive_expose_the_raw_exchange():
     server, handle, origin = serve()
     try:
         client = Client(ClientConfig(secure=False))
-        connection = client.open(Url(origin))
+        connection = client.open(URL(origin))
 
         connection.send(Message.request(Method.GET, "/raw"))
         response = connection.receive()

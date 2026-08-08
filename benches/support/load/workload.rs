@@ -113,7 +113,7 @@ impl Workload {
             request_body: 0,
             response_body: 13,
             timeout: Duration::from_secs(10),
-            workers: soyokaze::cores(),
+            workers: soyokaze::Cluster::cores(),
         }
     }
 
@@ -151,14 +151,14 @@ impl Workload {
     /// The port this run's version is served over.
     pub fn port(&self, number: u16) -> Port {
         match self.version.transport() {
-            soyokaze::TransportKind::Quic => Port::QUIC(number),
+            soyokaze::TransportKind::QUIC => Port::QUIC(number),
             soyokaze::TransportKind::Stream => Port::TCP(number),
         }
     }
 
     /// Whether the server needs a certificate to run this workload.
     pub fn needs_identity(&self) -> bool {
-        self.secure || self.version.transport() == soyokaze::TransportKind::Quic
+        self.secure || self.version.transport() == soyokaze::TransportKind::QUIC
     }
 
     /// The request every client sends.

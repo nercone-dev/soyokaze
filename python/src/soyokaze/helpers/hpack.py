@@ -9,9 +9,9 @@ the shared vocabulary in :mod:`.fields`.
 import ctypes
 
 from .. import ffi
-from ..errors import error_out, raise_for
+from ..errors import Error
 from ..ffi import library
-from .fields import fields_argument, fields_taken
+from .fields import Fields
 
 class Encoder:
     """An HPACK encoder with its dynamic table."""
@@ -34,8 +34,8 @@ class Encoder:
 
     def encode(self, fields):
         """Encodes one field section — pairs of name and value — as a block."""
-        array, slices = fields_argument(fields)
-        return ffi.take(library.soyokaze_hpack_encode(self.handle, array, len(fields)))
+        array, slices = Fields.argument(fields)
+        return library.soyokaze_hpack_encode(self.handle, array, len(fields)).take()
 
 class Decoder:
     """An HPACK decoder with its dynamic table."""
@@ -59,7 +59,7 @@ class Decoder:
     def decode(self, block):
         """Decodes one block into pairs of name and value."""
         out = ctypes.c_void_p()
-        error = error_out()
-        block = ffi.encoded(block)
-        raise_for(library.soyokaze_hpack_decode(self.handle, block, len(block), ctypes.byref(out), ctypes.byref(error)), error)
-        return fields_taken(out)
+        error = Error.out()
+        block = ffi.Library.encoded(block)
+        Error.raise_for(library.soyokaze_hpack_decode(self.handle, block, len(block), ctypes.byref(out), ctypes.byref(error)), error)
+        return Fields.taken(out)

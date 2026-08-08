@@ -594,7 +594,7 @@ fn worker() -> H3Worker {
 /// worker without a QUIC connection underneath.
 struct NullTransport;
 
-impl quic::QuicTransport for NullTransport {
+impl quic::QUICTransport for NullTransport {
     fn send(&mut self, _stream_id: u64, data: &[u8], _fin: bool) -> Result<quic::StreamWrite, Error> {
         Ok(quic::StreamWrite::Sent(data.len()))
     }

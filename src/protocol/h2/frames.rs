@@ -651,8 +651,6 @@ impl Frame {
     }
 }
 
-
-
 /// The parameters one end of a connection has announced.
 ///
 /// Each connection keeps two: what this end advertised, which starts at

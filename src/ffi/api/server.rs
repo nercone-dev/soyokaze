@@ -12,14 +12,14 @@ use crate::api::server::{Handler, Server, ServerHandle};
 use crate::ffi::SendPtr;
 use crate::ffi::models::Limits;
 use crate::ffi::errors::{ErrorHandle, Status};
-use crate::ffi::hsts::HstsPolicy;
+use crate::ffi::hsts::HSTSPolicy;
 use crate::ffi::models::Port;
-use crate::ffi::tls::TlsConfig;
+use crate::ffi::tls::TLSConfig;
 use crate::ffi::websocket::WebSocket;
 use crate::ffi::{Runtime, Slice};
 use crate::models::{Message, Version};
 use crate::protocol::base::{AnyConnection, Connection, Transport};
-use crate::tls::{EchKeys, Identity};
+use crate::tls::{ECHKeys, Identity};
 
 /// Answers one request.
 ///
@@ -41,7 +41,6 @@ pub type OnRequest = extern "C" fn(context: *mut std::ffi::c_void, request: *mut
 /// The callback runs on its own blocking thread, so it may block as long as
 /// the connection lives.
 pub type OnWebSocket = extern "C" fn(context: *mut std::ffi::c_void, socket: *mut WebSocket);
-
 
 /// A [`Handler`] that answers each request through a C callback.
 ///
@@ -244,7 +243,7 @@ pub extern "C" fn soyokaze_server_limits_default() -> ServerLimits {
 /// Useful as the worker count for [`soyokaze_server_run`].
 #[unsafe(no_mangle)]
 pub extern "C" fn soyokaze_cores() -> u32 {
-    crate::api::cluster::cores() as u32
+    Cluster::cores() as u32
 }
 
 /// How a [`Server`] is configured.
@@ -280,14 +279,14 @@ pub struct ServerConfig {
 
     /// The TLS details every context is built with. Null takes every default,
     /// as `soyokaze_tls_config_default` hands them out.
-    pub tls: *const TlsConfig,
+    pub tls: *const TLSConfig,
 
     /// The keys to offer Encrypted Client Hello with, from
     /// `soyokaze_ech_keys_generate` or `soyokaze_ech_keys_new`.
-    pub ech: *const EchKeys,
+    pub ech: *const ECHKeys,
 
     /// The HSTS policy to attach to every secure response.
-    pub hsts: *const HstsPolicy,
+    pub hsts: *const HSTSPolicy,
 
     /// Whether sockets are opened with `SO_REUSEPORT`.
     pub reuseport: bool,
@@ -517,7 +516,7 @@ pub unsafe extern "C" fn soyokaze_server_run(server: *const Server, on_request: 
     };
 
     let workers = match workers {
-        0 => crate::api::cluster::cores(),
+        0 => Cluster::cores(),
         count => count as usize,
     };
 

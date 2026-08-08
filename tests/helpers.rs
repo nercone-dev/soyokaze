@@ -3,7 +3,7 @@ mod harness;
 use std::time::{Duration, Instant};
 
 use soyokaze::helpers::base64::{self, DecodeError};
-use soyokaze::hsts::{HstsPolicy, HstsStore};
+use soyokaze::hsts::{HSTSPolicy, HSTSStore};
 use soyokaze::helpers::scan;
 use soyokaze::helpers::sha1::{self, Sha1};
 use soyokaze::models::{Headers, Message, Version};
@@ -108,36 +108,36 @@ fn sha1_pads_across_the_awkward_block_boundaries() {
 
 #[test]
 fn hsts_builds_and_parses_a_policy() {
-    let mut policy = HstsPolicy::new(31_536_000);
+    let mut policy = HSTSPolicy::new(31_536_000);
     assert_eq!(policy.build(), "max-age=31536000");
 
     policy.include_subdomains = true;
     policy.preload = true;
     assert_eq!(policy.build(), "max-age=31536000; includeSubDomains; preload");
 
-    assert_eq!(HstsPolicy::parse("max-age=31536000; includeSubDomains; preload"), Some(policy));
+    assert_eq!(HSTSPolicy::parse("max-age=31536000; includeSubDomains; preload"), Some(policy));
 }
 
 #[test]
 fn hsts_parsing_ignores_case_and_quotes_and_unknown_directives() {
-    let policy = HstsPolicy::parse("MAX-AGE=\"600\"; IncludeSubDomains; something-else");
+    let policy = HSTSPolicy::parse("MAX-AGE=\"600\"; IncludeSubDomains; something-else");
 
-    assert_eq!(policy, Some(HstsPolicy { max_age: 600, include_subdomains: true, preload: false }));
+    assert_eq!(policy, Some(HSTSPolicy { max_age: 600, include_subdomains: true, preload: false }));
 }
 
 #[test]
 fn hsts_refuses_a_header_with_no_usable_max_age() {
-    assert_eq!(HstsPolicy::parse(""), None);
-    assert_eq!(HstsPolicy::parse("includeSubDomains"), None);
-    assert_eq!(HstsPolicy::parse("max-age"), None);
-    assert_eq!(HstsPolicy::parse("max-age=-1"), None);
-    assert_eq!(HstsPolicy::parse("max-age=abc"), None);
-    assert_eq!(HstsPolicy::parse("max-age=1; max-age=2"), None);
+    assert_eq!(HSTSPolicy::parse(""), None);
+    assert_eq!(HSTSPolicy::parse("includeSubDomains"), None);
+    assert_eq!(HSTSPolicy::parse("max-age"), None);
+    assert_eq!(HSTSPolicy::parse("max-age=-1"), None);
+    assert_eq!(HSTSPolicy::parse("max-age=abc"), None);
+    assert_eq!(HSTSPolicy::parse("max-age=1; max-age=2"), None);
 }
 
 #[test]
 fn hsts_is_only_learned_over_a_secure_connection() {
-    let store = HstsStore::new();
+    let store = HSTSStore::new();
     let now = Instant::now();
 
     store.learn("example.test", "max-age=600", false, now);
@@ -149,7 +149,7 @@ fn hsts_is_only_learned_over_a_secure_connection() {
 
 #[test]
 fn hsts_covers_subdomains_only_when_asked() {
-    let store = HstsStore::new();
+    let store = HSTSStore::new();
     let now = Instant::now();
 
     store.learn("example.test", "max-age=600", true, now);
@@ -162,7 +162,7 @@ fn hsts_covers_subdomains_only_when_asked() {
 
 #[test]
 fn hsts_forgets_an_expired_or_withdrawn_policy() {
-    let store = HstsStore::new();
+    let store = HSTSStore::new();
     let now = Instant::now();
 
     store.learn("example.test", "max-age=60", true, now);
@@ -176,7 +176,7 @@ fn hsts_forgets_an_expired_or_withdrawn_policy() {
 
 #[test]
 fn hsts_prunes_expired_entries_and_keeps_live_ones() {
-    let store = HstsStore::new();
+    let store = HSTSStore::new();
     let now = Instant::now();
 
     store.learn("brief.test", "max-age=60", true, now);
@@ -189,7 +189,7 @@ fn hsts_prunes_expired_entries_and_keeps_live_ones() {
 
 #[test]
 fn hsts_never_applies_to_an_address_literal() {
-    let store = HstsStore::new();
+    let store = HSTSStore::new();
     let now = Instant::now();
 
     store.learn("127.0.0.1", "max-age=600", true, now);
@@ -197,8 +197,8 @@ fn hsts_never_applies_to_an_address_literal() {
 
     assert!(!store.secure("127.0.0.1", now));
     assert!(!store.secure("::1", now));
-    assert_eq!(HstsStore::normalize("192.0.2.1"), None);
-    assert_eq!(HstsStore::normalize("Example.Test."), Some("example.test".to_owned()));
+    assert_eq!(HSTSStore::normalize("192.0.2.1"), None);
+    assert_eq!(HSTSStore::normalize("Example.Test."), Some("example.test".to_owned()));
 }
 
 #[test]
@@ -264,7 +264,7 @@ fn an_informational_response_is_left_alone() {
 #[test]
 fn hsts_is_only_advertised_on_a_secure_response() {
     let cache = DateCache::new();
-    let policy = HstsPolicy::new(600);
+    let policy = HSTSPolicy::new(600);
 
     let mut plain = Message::response(200, Version::V1_1);
     plain.finalize_response(&cache, Some(&policy));
@@ -329,7 +329,7 @@ fn a_request_gains_the_authority_it_was_dialled_with() {
 
 #[test]
 fn the_hsts_store_does_not_remember_hosts_without_limit() {
-    let store = HstsStore::new();
+    let store = HSTSStore::new();
     let now = Instant::now();
 
     let ceiling = store.limits.max_hsts_entries as usize;
@@ -344,7 +344,7 @@ fn the_hsts_store_does_not_remember_hosts_without_limit() {
 
 #[test]
 fn an_expired_hsts_entry_makes_room_for_a_new_one() {
-    let store = HstsStore::new();
+    let store = HSTSStore::new();
     let now = Instant::now();
 
     for index in 0..store.limits.max_hsts_entries {
@@ -360,7 +360,7 @@ fn an_expired_hsts_entry_makes_room_for_a_new_one() {
 
 #[test]
 fn an_unreachable_hsts_expiry_does_not_overflow_the_clock() {
-    let store = HstsStore::new();
+    let store = HSTSStore::new();
     let now = Instant::now();
 
     store.learn("example.test", &format!("max-age={}", i64::MAX), true, now);

@@ -7,7 +7,7 @@ whole stack:
     uv run examples/loopback.py
 """
 
-from soyokaze import Client, Message, Method, Port, Server, Url
+from soyokaze import Client, Message, Method, Port, Server, URL
 
 def greet(request):
     """Answers every request with a greeting taken from its target.
@@ -25,7 +25,7 @@ def main():
     handle = server.serve(greet, [Port.TCP(0)])
 
     client = Client()
-    connection = client.open(Url(f"http://127.0.0.1:{handle.port}/"))
+    connection = client.open(URL(f"http://127.0.0.1:{handle.port}/"))
 
     for target in ["/", "/soyokaze"]:
         response = client.request(connection, Message.request(Method.GET, target, connection.version))

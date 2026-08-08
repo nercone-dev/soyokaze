@@ -85,20 +85,20 @@ def test_qpack_round_trips_through_the_dynamic_table():
     encoder.on_decoder_instructions(answer)
 
 def test_hsts_policy_parses_and_builds():
-    policy = hsts.HstsPolicy.parse("max-age=31536000; includeSubDomains")
+    policy = hsts.HSTSPolicy.parse("max-age=31536000; includeSubDomains")
     assert policy.max_age == 31536000
     assert policy.include_subdomains and not policy.preload
 
-    assert hsts.HstsPolicy(60, preload=True).build() == "max-age=60; preload"
+    assert hsts.HSTSPolicy(60, preload=True).build() == "max-age=60; preload"
 
     with pytest.raises(soyokaze.ProtocolError):
-        hsts.HstsPolicy.parse("includeSubDomains"), "max-age is mandatory"
+        hsts.HSTSPolicy.parse("includeSubDomains"), "max-age is mandatory"
 
     with pytest.raises(soyokaze.ProtocolError):
-        hsts.HstsPolicy.parse("max-age=1; max-age=2"), "a repeated directive cannot be trusted"
+        hsts.HSTSPolicy.parse("max-age=1; max-age=2"), "a repeated directive cannot be trusted"
 
 def test_hsts_store_remembers_and_withdraws():
-    store = hsts.HstsStore()
+    store = hsts.HSTSStore()
 
     store.learn("example.test", "max-age=60; includeSubDomains", secure=True)
     assert store.secure("example.test")

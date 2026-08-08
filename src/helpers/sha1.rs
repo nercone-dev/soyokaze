@@ -61,12 +61,7 @@ impl Sha1 {
     pub fn compress(&mut self, block: &[u8; BLOCK_SIZE]) {
         let mut words = [0u32; 80];
         for (index, word) in words.iter_mut().take(16).enumerate() {
-            *word = u32::from_be_bytes([
-                block[index * 4],
-                block[index * 4 + 1],
-                block[index * 4 + 2],
-                block[index * 4 + 3],
-            ]);
+            *word = u32::from_be_bytes([block[index * 4], block[index * 4 + 1], block[index * 4 + 2], block[index * 4 + 3]]);
         }
         for index in 16..80 {
             words[index] = (words[index - 3] ^ words[index - 8] ^ words[index - 14] ^ words[index - 16]).rotate_left(1);

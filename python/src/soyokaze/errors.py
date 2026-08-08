@@ -46,6 +46,44 @@ class Error(Exception):
         self.code = code
         super().__init__(message if message is not None else self.status.message())
 
+    @classmethod
+    def of(cls, status):
+        """The class a failing status is reported as.
+
+        Read off the subclasses themselves, so a status gains an exception of
+        its own simply by something subclassing this and naming it.
+        """
+        for subclass in cls.__subclasses__():
+            if subclass.status == status:
+                return subclass
+        return cls
+
+    @classmethod
+    def out(cls):
+        """A fresh ``error`` out parameter, to pass by reference."""
+        return ctypes.c_void_p()
+
+    @classmethod
+    def raise_for(cls, status, error):
+        """Raises what a failing call reported, or returns on success.
+
+        ``error`` is the ``ctypes.c_void_p`` an ``error`` out parameter was
+        written through; the handle is read and freed here.
+        """
+        status = Status(status)
+
+        if status == Status.OK:
+            return
+
+        message, stream_id, code = None, None, None
+        if error and error.value:
+            message = library.soyokaze_error_message(error).text()
+            stream_id = library.soyokaze_error_stream_id(error)
+            code = library.soyokaze_error_code(error)
+            library.soyokaze_error_free(error)
+
+        raise cls.of(status)(message, status, None if stream_id is None or stream_id < 0 else stream_id, None if code is None or code < 0 else code)
+
 class ClosedError(Error):
     """The peer closed the connection, or it was closed under us."""
 
@@ -71,7 +109,7 @@ class TimeoutError(Error):
 
     status = Status.TIMEOUT
 
-class TlsError(Error):
+class TLSError(Error):
     """The TLS handshake failed, or a TLS object could not be built."""
 
     status = Status.TLS
@@ -81,7 +119,7 @@ class VersionError(Error):
 
     status = Status.VERSION
 
-class IoError(Error):
+class IOError(Error):
     """The transport underneath failed."""
 
     status = Status.IO
@@ -95,40 +133,3 @@ class RuntimeError(Error):
     """The runtime could not be built, or the call was made without one."""
 
     status = Status.RUNTIME
-
-CLASSES = {
-    Status.CLOSED: ClosedError,
-    Status.PROTOCOL: ProtocolError,
-    Status.LIMIT: LimitError,
-    Status.STREAM: StreamError,
-    Status.TIMEOUT: TimeoutError,
-    Status.TLS: TlsError,
-    Status.VERSION: VersionError,
-    Status.IO: IoError,
-    Status.INVALID: InvalidError,
-    Status.RUNTIME: RuntimeError,
-}
-
-def raise_for(status, error):
-    """Raises the exception a failing call reported, or returns on success.
-
-    ``error`` is the ``ctypes.c_void_p`` an ``error`` out parameter was
-    written through; the handle is read and freed here.
-    """
-    status = Status(status)
-
-    if status == Status.OK:
-        return
-
-    message, stream_id, code = None, None, None
-    if error and error.value:
-        message = library.soyokaze_error_message(error).text()
-        stream_id = library.soyokaze_error_stream_id(error)
-        code = library.soyokaze_error_code(error)
-        library.soyokaze_error_free(error)
-
-    raise CLASSES[status](message, status, None if stream_id is None or stream_id < 0 else stream_id, None if code is None or code < 0 else code)
-
-def error_out():
-    """A fresh ``error`` out parameter, to pass by reference."""
-    return ctypes.c_void_p()

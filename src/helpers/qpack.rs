@@ -172,10 +172,6 @@ impl StaticTable {
     }
 }
 
-
-
-
-
 /// The table of fields built up over one direction of a connection.
 ///
 /// Unlike the HPACK table this counts insertions for their whole life, so an
@@ -600,9 +596,6 @@ impl DecoderInstruction {
         Ok((consumed, Self::InsertCountIncrement { increment }))
     }
 }
-
-
-
 
 /// The prefix a field section opens with: the Required Insert Count and the
 /// Base the block's indices are read against.

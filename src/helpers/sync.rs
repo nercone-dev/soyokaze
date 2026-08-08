@@ -1,6 +1,6 @@
 //! Locking and deadlines.
 //!
-//! [`lock`] treats a poisoned mutex as an ordinary one, and [`Timeout`] runs an
+//! [`Lock`] treats a poisoned mutex as an ordinary one, and [`Timeout`] runs an
 //! operation under a deadline, reporting [`Elapsed`] when it passes. Nothing
 //! here knows what the deadline was for: a caller that wants its own error
 //! converts, as [`Error`] does.
@@ -28,15 +28,20 @@ impl fmt::Display for Elapsed {
 
 impl std::error::Error for Elapsed {}
 
-/// Locks `mutex`, ignoring poisoning.
-///
-/// A panic while another thread held the lock poisons it, and the state behind
-/// it may be halfway through an update. Every mutex in this crate guards a
-/// bounded cache — a cookie jar, an HSTS store, a connection tally — where a
-/// half-finished update costs at most one wrong entry, so refusing to lock
-/// afterwards would take down a connection over nothing.
-pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+/// Taking a mutex the way this crate takes one.
+pub struct Lock;
+
+impl Lock {
+    /// Locks `mutex`, ignoring poisoning.
+    ///
+    /// A panic while another thread held the lock poisons it, and the state
+    /// behind it may be halfway through an update. Every mutex in this crate
+    /// guards a bounded cache — a cookie jar, an HSTS store, a connection
+    /// tally — where a half-finished update costs at most one wrong entry, so
+    /// refusing to lock afterwards would take down a connection over nothing.
+    pub fn on<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// The deadlines the [`Limits`] fields describe.

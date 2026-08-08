@@ -1,4 +1,4 @@
-//! Carrying [`Url`] and [`Message`] across the boundary.
+//! Carrying [`URL`] and [`Message`] across the boundary.
 //!
 //! A [`Message`] is reached as a handle, and its field section and body are
 //! reached through it rather than as handles of their own — there is no way to
@@ -10,7 +10,7 @@ use bytes::Bytes;
 use crate::errors::Error;
 use crate::ffi::errors::{ErrorHandle, Status};
 use crate::ffi::{Buffer, Runtime, Slice};
-use crate::models::{Body, Message, Method, Role, Url, Version};
+use crate::models::{Body, Message, Method, Role, URL, Version};
 
 /// Which transport a port names, and so which versions it can carry.
 ///
@@ -92,7 +92,7 @@ impl Port {
 ///
 /// `url` must point to `url_len` readable octets, and `out` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_url_parse(url: *const u8, url_len: usize, out: *mut *mut Url, error: *mut *mut ErrorHandle) -> Status {
+pub unsafe extern "C" fn soyokaze_url_parse(url: *const u8, url_len: usize, out: *mut *mut URL, error: *mut *mut ErrorHandle) -> Status {
     if out.is_null() {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     }
@@ -101,7 +101,7 @@ pub unsafe extern "C" fn soyokaze_url_parse(url: *const u8, url_len: usize, out:
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };
 
-    match Url::parse(text) {
+    match URL::parse(text) {
         Ok(url) => {
             unsafe { *out = Box::into_raw(Box::new(url)) };
             Status::Ok
@@ -110,13 +110,13 @@ pub unsafe extern "C" fn soyokaze_url_parse(url: *const u8, url_len: usize, out:
     }
 }
 
-/// Releases a [`Url`].
+/// Releases a [`URL`].
 ///
 /// # Safety
 ///
 /// `url` must come from [`soyokaze_url_parse`] and not have been freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_url_free(url: *mut Url) {
+pub unsafe extern "C" fn soyokaze_url_free(url: *mut URL) {
     if !url.is_null() {
         drop(unsafe { Box::from_raw(url) });
     }
@@ -128,7 +128,7 @@ pub unsafe extern "C" fn soyokaze_url_free(url: *mut Url) {
 ///
 /// `url` must either be null or be a handle that has not been freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_url_scheme(url: *const Url) -> Slice {
+pub unsafe extern "C" fn soyokaze_url_scheme(url: *const URL) -> Slice {
     Slice::maybe(unsafe { url.as_ref() }.map(|url| url.scheme.as_str()))
 }
 
@@ -138,7 +138,7 @@ pub unsafe extern "C" fn soyokaze_url_scheme(url: *const Url) -> Slice {
 ///
 /// As [`soyokaze_url_scheme`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_url_host(url: *const Url) -> Slice {
+pub unsafe extern "C" fn soyokaze_url_host(url: *const URL) -> Slice {
     Slice::maybe(unsafe { url.as_ref() }.map(|url| url.host.as_str()))
 }
 
@@ -148,7 +148,7 @@ pub unsafe extern "C" fn soyokaze_url_host(url: *const Url) -> Slice {
 ///
 /// As [`soyokaze_url_scheme`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_url_target(url: *const Url) -> Slice {
+pub unsafe extern "C" fn soyokaze_url_target(url: *const URL) -> Slice {
     Slice::maybe(unsafe { url.as_ref() }.map(|url| url.target.as_str()))
 }
 
@@ -158,7 +158,7 @@ pub unsafe extern "C" fn soyokaze_url_target(url: *const Url) -> Slice {
 ///
 /// As [`soyokaze_url_scheme`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_url_port(url: *const Url) -> u16 {
+pub unsafe extern "C" fn soyokaze_url_port(url: *const URL) -> u16 {
     unsafe { url.as_ref() }.map_or(0, |url| url.port)
 }
 
@@ -168,7 +168,7 @@ pub unsafe extern "C" fn soyokaze_url_port(url: *const Url) -> u16 {
 ///
 /// As [`soyokaze_url_scheme`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_url_secure(url: *const Url) -> bool {
+pub unsafe extern "C" fn soyokaze_url_secure(url: *const URL) -> bool {
     unsafe { url.as_ref() }.is_some_and(|url| url.secure())
 }
 
@@ -181,7 +181,7 @@ pub unsafe extern "C" fn soyokaze_url_secure(url: *const Url) -> bool {
 ///
 /// As [`soyokaze_url_scheme`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_url_authority(url: *const Url) -> Buffer {
+pub unsafe extern "C" fn soyokaze_url_authority(url: *const URL) -> Buffer {
     match unsafe { url.as_ref() } {
         Some(url) => Buffer::new(url.authority().into_bytes()),
         None => Buffer::EMPTY,
@@ -337,12 +337,9 @@ pub unsafe extern "C" fn soyokaze_message_header_count(message: *const Message) 
 /// As [`soyokaze_message_version`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_header_name(message: *const Message, index: usize) -> Slice {
-    Slice::maybe(
-        unsafe { message.as_ref() }
-            .and_then(|message| message.headers.as_ref())
-            .and_then(|headers| headers.iter().nth(index))
-            .map(|(name, _)| name),
-    )
+    let field = unsafe { message.as_ref() }.and_then(|message| message.headers.as_ref()).and_then(|headers| headers.iter().nth(index)).map(|(name, _)| name);
+
+    Slice::maybe(field)
 }
 
 /// The value of the field at `index`, borrowed from `message`.
@@ -354,12 +351,9 @@ pub unsafe extern "C" fn soyokaze_message_header_name(message: *const Message, i
 /// As [`soyokaze_message_version`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_header_value(message: *const Message, index: usize) -> Slice {
-    Slice::maybe(
-        unsafe { message.as_ref() }
-            .and_then(|message| message.headers.as_ref())
-            .and_then(|headers| headers.iter().nth(index))
-            .map(|(_, value)| value),
-    )
+    let field = unsafe { message.as_ref() }.and_then(|message| message.headers.as_ref()).and_then(|headers| headers.iter().nth(index)).map(|(_, value)| value);
+
+    Slice::maybe(field)
 }
 
 /// The first value stored under `name`, borrowed from `message`.
@@ -454,12 +448,9 @@ pub unsafe extern "C" fn soyokaze_message_trailer_count(message: *const Message)
 /// As [`soyokaze_message_version`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_trailer_name(message: *const Message, index: usize) -> Slice {
-    Slice::maybe(
-        unsafe { message.as_ref() }
-            .and_then(|message| message.trailers.as_ref())
-            .and_then(|trailers| trailers.iter().nth(index))
-            .map(|(name, _)| name),
-    )
+    let field = unsafe { message.as_ref() }.and_then(|message| message.trailers.as_ref()).and_then(|trailers| trailers.iter().nth(index)).map(|(name, _)| name);
+
+    Slice::maybe(field)
 }
 
 /// The value of the trailer field at `index`, borrowed from `message`.
@@ -471,12 +462,9 @@ pub unsafe extern "C" fn soyokaze_message_trailer_name(message: *const Message, 
 /// As [`soyokaze_message_version`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_trailer_value(message: *const Message, index: usize) -> Slice {
-    Slice::maybe(
-        unsafe { message.as_ref() }
-            .and_then(|message| message.trailers.as_ref())
-            .and_then(|trailers| trailers.iter().nth(index))
-            .map(|(_, value)| value),
-    )
+    let field = unsafe { message.as_ref() }.and_then(|message| message.trailers.as_ref()).and_then(|trailers| trailers.iter().nth(index)).map(|(_, value)| value);
+
+    Slice::maybe(field)
 }
 
 /// The first trailer value stored under `name`, borrowed from `message`.
@@ -794,7 +782,7 @@ pub unsafe extern "C" fn soyokaze_message_body(runtime: *mut Runtime, message: *
             unsafe { *out = Buffer::new(octets.to_vec()) };
             Status::Ok
         }
-        Err(failure) => unsafe { ErrorHandle::report(error, &Error::Io(failure)) },
+        Err(failure) => unsafe { ErrorHandle::report(error, &Error::IO(failure)) },
     }
 }
 

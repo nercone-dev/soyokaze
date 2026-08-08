@@ -3,16 +3,16 @@
 //! QUIC itself is provided by `quiche` and driven by `tokio-quiche`; what is
 //! here is the boundary this crate consumes it through, the way HTTP/1 and
 //! HTTP/2 consume a stream transport through [`Transport`]. Nothing in this
-//! module knows which application protocol runs on top: [`QuicTransport`] is
+//! module knows which application protocol runs on top: [`QUICTransport`] is
 //! the stream surface an established connection offers, [`Varint`] and
-//! [`StreamId`] are RFC 9000 vocabulary, [`Handshake`] reads back what the
+//! [`QUICStreamID`] are RFC 9000 vocabulary, [`Handshake`] reads back what the
 //! handshake settled — including the ALPN that decides the application — and
-//! [`QuicListener`] and [`QuicDialer`] stand up an endpoint on either side.
+//! [`QUICListener`] and [`QUICDialer`] stand up an endpoint on either side.
 //!
-//! An application over QUIC is written against [`QuicApplication`], and reaches
-//! the connection only through [`QuicTransport`]. The `tokio-quiche` types that
-//! carry all of this are re-exported here — [`QuicApplication`],
-//! [`QuicConnection`], [`QuicHandshake`], [`QuicError`] and [`QuicOutcome`] —
+//! An application over QUIC is written against [`QUICApplication`], and reaches
+//! the connection only through [`QUICTransport`]. The `tokio-quiche` types that
+//! carry all of this are re-exported here — [`QUICApplication`],
+//! [`QUICConnection`], [`QUICHandshake`], [`QUICError`] and [`QUICOutcome`] —
 //! so nothing above this module has to name the crate underneath, and swapping
 //! it out is a change to this file alone.
 //!
@@ -28,21 +28,21 @@ use tokio_quiche::ApplicationOverQuic;
 ///
 /// The seam an application is written against, so `h3` and anything after it
 /// never names the QUIC crate itself.
-pub use tokio_quiche::ApplicationOverQuic as QuicApplication;
+pub use tokio_quiche::ApplicationOverQuic as QUICApplication;
 /// A live QUIC connection, as the driver hands it over.
-pub use tokio_quiche::quic::QuicheConnection as QuicConnection;
+pub use tokio_quiche::quic::QuicheConnection as QUICConnection;
 /// What the QUIC handshake reports when it completes.
-pub use tokio_quiche::quic::HandshakeInfo as QuicHandshake;
+pub use tokio_quiche::quic::HandshakeInfo as QUICHandshake;
 /// The error an application hands back to the QUIC driver.
-pub use tokio_quiche::BoxError as QuicError;
+pub use tokio_quiche::BoxError as QUICError;
 /// What an application returns to the QUIC driver.
-pub use tokio_quiche::QuicResult as QuicOutcome;
+pub use tokio_quiche::QuicResult as QUICOutcome;
 /// The handle that keeps a QUIC connection alive.
-pub use tokio_quiche::QuicConnection as QuicGuard;
+pub use tokio_quiche::QuicConnection as QUICGuard;
 
-use crate::models::{Alpn, Role, Version};
+use crate::models::{ALPN, Role, Version};
 use crate::protocol::common::Error;
-use crate::tls::{EchKeys, Identity, Security, TlsConfig};
+use crate::tls::{ECHKeys, Identity, Security, TLSConfig};
 use crate::helpers::sync;
 
 /// A QUIC variable-length integer.
@@ -124,10 +124,10 @@ impl Varint {
 /// The stream identifier arithmetic of RFC 9000 §2.1.
 ///
 /// The two low bits carry who opened the stream and in how many directions,
-/// so successive streams of one kind step by [`StreamId::STEP`].
-pub struct StreamId;
+/// so successive streams of one kind step by [`QUICStreamID::STEP`].
+pub struct QUICStreamID;
 
-impl StreamId {
+impl QUICStreamID {
     /// How far apart successive streams of one kind are numbered.
     pub const STEP: u64 = 4;
 
@@ -196,12 +196,12 @@ pub enum StreamWrite {
 /// leaves the connection running.
 ///
 /// [`Transport`]: crate::protocol::base::Transport
-pub trait QuicTransport {
+pub trait QUICTransport {
     /// Writes octets to a stream, ending it when `fin` is set.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] when the connection has failed; a stream the
+    /// Returns [`Error::IO`] when the connection has failed; a stream the
     /// peer stopped is a [`StreamWrite::Stopped`], not an error.
     fn send(&mut self, stream_id: u64, data: &[u8], fin: bool) -> Result<StreamWrite, Error>;
 
@@ -209,7 +209,7 @@ pub trait QuicTransport {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] when the connection has failed; a stream the
+    /// Returns [`Error::IO`] when the connection has failed; a stream the
     /// peer reset is a [`StreamRead::Reset`], not an error.
     fn receive(&mut self, stream_id: u64, out: &mut [u8]) -> Result<StreamRead, Error>;
 
@@ -217,7 +217,7 @@ pub trait QuicTransport {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] when the connection has failed; a stream already
+    /// Returns [`Error::IO`] when the connection has failed; a stream already
     /// finished is not an error.
     fn shutdown_read(&mut self, stream_id: u64, code: u64) -> Result<(), Error>;
 
@@ -225,7 +225,7 @@ pub trait QuicTransport {
     ///
     /// # Errors
     ///
-    /// As [`QuicTransport::shutdown_read`].
+    /// As [`QUICTransport::shutdown_read`].
     fn shutdown_write(&mut self, stream_id: u64, code: u64) -> Result<(), Error>;
 
     /// The streams with octets waiting to be read.
@@ -235,7 +235,7 @@ pub trait QuicTransport {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] when the connection has failed; a connection
+    /// Returns [`Error::IO`] when the connection has failed; a connection
     /// already closing is not an error.
     fn close(&mut self, code: u64, reason: &[u8]) -> Result<(), Error>;
 
@@ -246,7 +246,7 @@ pub trait QuicTransport {
     fn version(&self) -> u32;
 }
 
-impl QuicTransport for QuicheConnection {
+impl QUICTransport for QuicheConnection {
     fn send(&mut self, stream_id: u64, data: &[u8], fin: bool) -> Result<StreamWrite, Error> {
         match self.stream_send(stream_id, data, fin) {
             Ok(sent) => Ok(StreamWrite::Sent(sent)),
@@ -315,7 +315,7 @@ pub struct Handshake {
 
 impl Handshake {
     /// Reads the handshake facts off an established connection.
-    pub fn of(transport: &impl QuicTransport) -> Self {
+    pub fn of(transport: &impl QUICTransport) -> Self {
         Self { alpn: transport.application_protocol().to_vec(), version: transport.version() }
     }
 
@@ -327,7 +327,7 @@ impl Handshake {
     /// `versions`, or selected nothing and `versions` offers no HTTP/1.x
     /// fallback.
     pub fn negotiated(&self, versions: &[Version]) -> Result<Version, Error> {
-        Alpn::negotiated((!self.alpn.is_empty()).then_some(&self.alpn), versions)
+        ALPN::negotiated((!self.alpn.is_empty()).then_some(&self.alpn), versions)
     }
 
     /// The [`Security`] this connection stands for.
@@ -340,7 +340,7 @@ impl Handshake {
 ///
 /// The counterpart of what a TLS acceptor or connector is built from: the
 /// versions to offer by ALPN and the transport knobs both ends share.
-pub struct QuicConfig {
+pub struct QUICConfig {
     /// The versions offered by ALPN.
     pub versions: Vec<Version>,
     /// In seconds, how long the connection may sit idle (0 waits forever).
@@ -351,11 +351,11 @@ pub struct QuicConfig {
     pub enable_dgram: bool,
 }
 
-impl QuicConfig {
+impl QUICConfig {
     /// The `tokio-quiche` settings this configuration stands for.
     pub fn settings(&self) -> tokio_quiche::settings::QuicSettings {
         let mut settings = tokio_quiche::settings::QuicSettings::default();
-        settings.alpn = Alpn::list(&self.versions);
+        settings.alpn = ALPN::list(&self.versions);
         settings.max_idle_timeout = sync::Timeout::duration(self.idle_timeout);
         settings.enable_dgram = self.enable_dgram;
 
@@ -368,8 +368,8 @@ impl QuicConfig {
 
     /// The certificate paths handed to `tokio-quiche`, which are never read.
     ///
-    /// The TLS context actually used is built by the [`QuicServerTls`] or
-    /// [`QuicClientTls`] hook, so the paths exist only to satisfy the
+    /// The TLS context actually used is built by the [`QUICServerTLS`] or
+    /// [`QUICClientTLS`] hook, so the paths exist only to satisfy the
     /// signature.
     pub fn placeholder_certificate() -> tokio_quiche::settings::TlsCertificatePaths<'static> {
         tokio_quiche::settings::TlsCertificatePaths { cert: "", private_key: "", kind: tokio_quiche::settings::CertificateKind::X509 }
@@ -377,15 +377,15 @@ impl QuicConfig {
 }
 
 /// A QUIC connection that has arrived but not yet been given an application.
-pub type QuicIncoming = tokio_quiche::InitialQuicConnection<tokio::net::UdpSocket, tokio_quiche::metrics::DefaultMetrics>;
+pub type QUICIncoming = tokio_quiche::InitialQuicConnection<tokio::net::UdpSocket, tokio_quiche::metrics::DefaultMetrics>;
 
 /// The queue of connections a bound QUIC endpoint yields.
-pub type QuicIncomingStream = tokio::sync::mpsc::Receiver<std::io::Result<QuicIncoming>>;
+pub type QUICIncomingStream = tokio::sync::mpsc::Receiver<std::io::Result<QUICIncoming>>;
 
 /// The server side of a QUIC endpoint.
-pub struct QuicListener;
+pub struct QUICListener;
 
-impl QuicListener {
+impl QUICListener {
     /// Binds a QUIC endpoint over an already-bound UDP socket.
     ///
     /// `tokio-quiche` owns the socket from here on and demultiplexes
@@ -395,15 +395,15 @@ impl QuicListener {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] when the socket cannot be read or the endpoint
+    /// Returns [`Error::IO`] when the socket cannot be read or the endpoint
     /// cannot be stood up, and [`Error::Closed`] when no listener comes back.
-    pub fn bind(udp: std::net::UdpSocket, config: &QuicConfig, hook: Arc<dyn tokio_quiche::quic::ConnectionHook + Send + Sync>) -> Result<(QuicIncomingStream, std::net::SocketAddr), Error> {
+    pub fn bind(udp: std::net::UdpSocket, config: &QUICConfig, hook: Arc<dyn tokio_quiche::quic::ConnectionHook + Send + Sync>) -> Result<(QUICIncomingStream, std::net::SocketAddr), Error> {
         let address = udp.local_addr()?;
 
         let hooks = tokio_quiche::settings::Hooks { connection_hook: Some(hook) };
-        let params = tokio_quiche::ConnectionParams::new_server(config.settings(), QuicConfig::placeholder_certificate(), hooks);
+        let params = tokio_quiche::ConnectionParams::new_server(config.settings(), QUICConfig::placeholder_certificate(), hooks);
 
-        let listeners = tokio_quiche::listen([udp], params, tokio_quiche::metrics::DefaultMetrics).map_err(Error::Io)?;
+        let listeners = tokio_quiche::listen([udp], params, tokio_quiche::metrics::DefaultMetrics).map_err(Error::IO)?;
         let incoming = listeners.into_iter().next().ok_or(Error::Closed)?.into_inner();
 
         Ok((incoming, address))
@@ -411,9 +411,9 @@ impl QuicListener {
 }
 
 /// The client side of a QUIC endpoint.
-pub struct QuicDialer;
+pub struct QUICDialer;
 
-impl QuicDialer {
+impl QUICDialer {
     /// Dials a QUIC connection over an already-connected UDP socket and
     /// drives `application` on it.
     ///
@@ -422,31 +422,31 @@ impl QuicDialer {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] when the socket cannot be adopted and
-    /// [`Error::Tls`] when the QUIC handshake fails.
-    pub async fn connect(host: &str, udp: tokio::net::UdpSocket, config: &QuicConfig, hook: Arc<dyn tokio_quiche::quic::ConnectionHook + Send + Sync>, application: impl ApplicationOverQuic) -> Result<tokio_quiche::QuicConnection, Error> {
-        let socket: tokio_quiche::socket::Socket<Arc<tokio::net::UdpSocket>, Arc<tokio::net::UdpSocket>> = udp.try_into().map_err(Error::Io)?;
+    /// Returns [`Error::IO`] when the socket cannot be adopted and
+    /// [`Error::TLS`] when the QUIC handshake fails.
+    pub async fn connect(host: &str, udp: tokio::net::UdpSocket, config: &QUICConfig, hook: Arc<dyn tokio_quiche::quic::ConnectionHook + Send + Sync>, application: impl ApplicationOverQuic) -> Result<tokio_quiche::QuicConnection, Error> {
+        let socket: tokio_quiche::socket::Socket<Arc<tokio::net::UdpSocket>, Arc<tokio::net::UdpSocket>> = udp.try_into().map_err(Error::IO)?;
 
         let hooks = tokio_quiche::settings::Hooks { connection_hook: Some(hook) };
-        let params = tokio_quiche::ConnectionParams::new_client(config.settings(), Some(QuicConfig::placeholder_certificate()), hooks);
+        let params = tokio_quiche::ConnectionParams::new_client(config.settings(), Some(QUICConfig::placeholder_certificate()), hooks);
 
         tokio_quiche::quic::connect_with_config(socket, Some(host), &params, application)
             .await
-            .map_err(|err| Error::Tls(err.to_string()))
+            .map_err(|err| Error::TLS(err.to_string()))
     }
 }
 
 /// Gives a QUIC server its TLS context.
-pub struct QuicServerTls {
+pub struct QUICServerTLS {
     /// The certificate chain and key to serve.
     pub identity: Identity,
     /// The ECH keys, if the server offers ECH.
-    pub ech: Option<EchKeys>,
+    pub ech: Option<ECHKeys>,
     /// The TLS details the context is built with.
-    pub tls: TlsConfig,
+    pub tls: TLSConfig,
 }
 
-impl tokio_quiche::quic::ConnectionHook for QuicServerTls {
+impl tokio_quiche::quic::ConnectionHook for QUICServerTLS {
     /// Builds the context, ignoring the certificate paths in the settings.
     ///
     /// A failure returns `None`, which `tokio-quiche` turns into a failed
@@ -457,14 +457,14 @@ impl tokio_quiche::quic::ConnectionHook for QuicServerTls {
 }
 
 /// Gives a QUIC client its TLS context.
-pub struct QuicClientTls {
+pub struct QUICClientTLS {
     /// The trusted roots, each DER or PEM; empty uses the platform trust store.
     pub roots: Vec<Vec<u8>>,
     /// The TLS details the context is built with.
-    pub tls: TlsConfig,
+    pub tls: TLSConfig,
 }
 
-impl tokio_quiche::quic::ConnectionHook for QuicClientTls {
+impl tokio_quiche::quic::ConnectionHook for QUICClientTLS {
     /// Builds the context, ignoring the certificate paths in the settings.
     ///
     /// A failure returns `None`, which `tokio-quiche` turns into a failed

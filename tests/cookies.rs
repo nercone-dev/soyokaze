@@ -1,11 +1,11 @@
 use std::time::{Duration, Instant};
 
 use soyokaze::cookies::{self, StoredCookie};
-use soyokaze::models::Url;
+use soyokaze::models::URL;
 use soyokaze::{Cookie, CookieJar, SameSite, SetCookie};
 
-fn url(text: &str) -> Url {
-    Url::parse(text).expect("a fixture URL did not parse")
+fn url(text: &str) -> URL {
+    URL::parse(text).expect("a fixture URL did not parse")
 }
 
 #[test]
@@ -29,11 +29,8 @@ fn cookie_parsing_trims_space_and_quotes_and_keeps_the_first_of_a_name() {
 
 #[test]
 fn parses_a_set_cookie_header() {
-    let cookie = SetCookie::parse(
-        "session=abc123; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Max-Age=3600; \
-         Domain=example.test; Path=/app; Secure; HttpOnly; SameSite=Lax",
-    )
-    .expect("a well-formed Set-Cookie did not parse");
+    let header = "session=abc123; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Max-Age=3600; Domain=example.test; Path=/app; Secure; HttpOnly; SameSite=Lax";
+    let cookie = SetCookie::parse(header).expect("a well-formed Set-Cookie did not parse");
 
     assert_eq!(cookie.name, "session");
     assert_eq!(cookie.value, "abc123");

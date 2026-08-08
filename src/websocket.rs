@@ -276,9 +276,9 @@ impl Frame {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when BoringSSL cannot reach a source of randomness.
+    /// Returns [`Error::TLS`] when BoringSSL cannot reach a source of randomness.
     pub fn random(out: &mut [u8]) -> Result<(), Error> {
-        boring::rand::rand_bytes(out).map_err(|_| Error::Tls("BoringSSL has no source of randomness".into()))
+        boring::rand::rand_bytes(out).map_err(|_| Error::TLS("BoringSSL has no source of randomness".into()))
     }
 
     /// A complete, unmasked frame.
@@ -408,7 +408,7 @@ impl Frame {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when no randomness is available.
+    /// Returns [`Error::TLS`] when no randomness is available.
     pub fn masking_key() -> Result<[u8; 4], Error> {
         let mut key = [0u8; 4];
         Frame::random(&mut key)?;
@@ -440,7 +440,7 @@ impl Upgrade {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when no randomness is available.
+    /// Returns [`Error::TLS`] when no randomness is available.
     pub fn nonce() -> Result<String, Error> {
         let mut key = [0u8; 16];
         Frame::random(&mut key)?;
@@ -771,7 +771,7 @@ impl AnyConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when no randomness is available for the nonce,
+    /// Returns [`Error::TLS`] when no randomness is available for the nonce,
     /// [`Error::Protocol`] when the server's answer does not check out or
     /// names no stream, and otherwise as [`Connection::send`],
     /// [`Connection::receive`] and [`AnyConnection::into_transport`].
@@ -937,8 +937,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when no randomness is available for the mask,
-    /// and [`Error::Io`] when the transport fails.
+    /// Returns [`Error::TLS`] when no randomness is available for the mask,
+    /// and [`Error::IO`] when the transport fails.
     pub async fn send(&mut self, mut frame: Frame) -> Result<(), Error> {
         frame.mask = if self.role.is_client() { Some(Frame::masking_key()?) } else { None };
 

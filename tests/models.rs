@@ -2,12 +2,12 @@ use std::str::FromStr;
 
 use bytes::Bytes;
 
-use soyokaze::models::{Body, HeaderCase, Headers, Message, Method, Port, Role, Url, Version};
+use soyokaze::models::{Body, HeaderCase, Headers, Message, Method, Port, Role, URL, Version};
 use soyokaze::{Error, SetCookie};
 
 #[test]
 fn parses_an_ordinary_url() {
-    let url = Url::parse("https://example.test/index.html?q=1#top").expect("a plain URL did not parse");
+    let url = URL::parse("https://example.test/index.html?q=1#top").expect("a plain URL did not parse");
 
     assert_eq!(url.scheme, "https");
     assert_eq!(url.host, "example.test");
@@ -18,19 +18,19 @@ fn parses_an_ordinary_url() {
 
 #[test]
 fn fills_in_the_default_port_and_target() {
-    let http = Url::parse("http://example.test").expect("a bare URL did not parse");
+    let http = URL::parse("http://example.test").expect("a bare URL did not parse");
     assert_eq!((http.port, http.target.as_str()), (80, "/"));
     assert!(!http.secure());
 
-    assert_eq!(Url::parse("wss://example.test").ok().map(|url| url.port), Some(443));
-    assert_eq!(Url::parse("ws://example.test").ok().map(|url| url.port), Some(80));
-    assert_eq!(Url::default_port("https"), 443);
-    assert_eq!(Url::default_port("anything-else"), 80);
+    assert_eq!(URL::parse("wss://example.test").ok().map(|url| url.port), Some(443));
+    assert_eq!(URL::parse("ws://example.test").ok().map(|url| url.port), Some(80));
+    assert_eq!(URL::default_port("https"), 443);
+    assert_eq!(URL::default_port("anything-else"), 80);
 }
 
 #[test]
 fn lowercases_the_scheme_and_drops_userinfo() {
-    let url = Url::parse("HTTPS://user:pass@example.test/").expect("a URL with userinfo did not parse");
+    let url = URL::parse("HTTPS://user:pass@example.test/").expect("a URL with userinfo did not parse");
 
     assert_eq!(url.scheme, "https");
     assert_eq!(url.host, "example.test");
@@ -38,22 +38,22 @@ fn lowercases_the_scheme_and_drops_userinfo() {
 
 #[test]
 fn parses_an_address_literal() {
-    let url = Url::parse("https://[2001:db8::1]:8443/path").expect("an IPv6 URL did not parse");
+    let url = URL::parse("https://[2001:db8::1]:8443/path").expect("an IPv6 URL did not parse");
 
     assert_eq!(url.host, "2001:db8::1");
     assert_eq!(url.port, 8443);
     assert_eq!(url.authority(), "[2001:db8::1]:8443");
 
-    let default = Url::parse("https://[2001:db8::1]/").expect("an IPv6 URL did not parse");
+    let default = URL::parse("https://[2001:db8::1]/").expect("an IPv6 URL did not parse");
     assert_eq!(default.authority(), "[2001:db8::1]");
 }
 
 #[test]
 fn omits_the_port_from_an_authority_when_it_is_the_default() {
-    let url = Url::parse("https://example.test/").expect("a URL did not parse");
+    let url = URL::parse("https://example.test/").expect("a URL did not parse");
     assert_eq!(url.authority(), "example.test");
 
-    let explicit = Url::parse("https://example.test:8443/").expect("a URL did not parse");
+    let explicit = URL::parse("https://example.test:8443/").expect("a URL did not parse");
     assert_eq!(explicit.authority(), "example.test:8443");
 }
 
@@ -66,7 +66,7 @@ fn refuses_a_url_it_cannot_use() {
         "https://[2001:db8::1/",
         "https://[2001:db8::1]x/",
     ] {
-        assert!(matches!(Url::parse(text), Err(Error::Protocol(_))), "{text:?} should not parse");
+        assert!(matches!(URL::parse(text), Err(Error::Protocol(_))), "{text:?} should not parse");
     }
 }
 
@@ -289,7 +289,7 @@ fn a_port_carries_exactly_the_versions_of_its_transport() {
     }
 
     let quic = Port::QUIC(443);
-    assert_eq!(quic.transport(), TransportKind::Quic);
+    assert_eq!(quic.transport(), TransportKind::QUIC);
     assert!(quic.carries(Version::V3_0));
     assert!(!quic.carries(Version::V1_1) && !quic.carries(Version::V2_0));
 }
@@ -301,7 +301,7 @@ fn a_version_names_the_transport_it_runs_over() {
     assert_eq!(Version::V1_0.transport(), TransportKind::Stream);
     assert_eq!(Version::V1_1.transport(), TransportKind::Stream);
     assert_eq!(Version::V2_0.transport(), TransportKind::Stream);
-    assert_eq!(Version::V3_0.transport(), TransportKind::Quic);
+    assert_eq!(Version::V3_0.transport(), TransportKind::QUIC);
 }
 
 #[test]
@@ -351,9 +351,9 @@ fn an_authority_is_written_the_same_way_from_parts_as_from_a_url() {
     ];
 
     for (scheme, host, port, expected) in cases {
-        assert_eq!(Url::authority_of(scheme, host, port), expected, "{scheme}://{host}:{port} produced the wrong authority");
+        assert_eq!(URL::authority_of(scheme, host, port), expected, "{scheme}://{host}:{port} produced the wrong authority");
 
-        let url = Url::parse(&format!("{scheme}://{}:{port}/", if host.contains(':') { format!("[{host}]") } else { host.to_owned() }))
+        let url = URL::parse(&format!("{scheme}://{}:{port}/", if host.contains(':') { format!("[{host}]") } else { host.to_owned() }))
             .expect("the URL did not parse");
         assert_eq!(url.authority(), expected, "a parsed URL and its parts must agree on the authority");
     }

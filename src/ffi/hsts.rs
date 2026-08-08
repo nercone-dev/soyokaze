@@ -1,7 +1,7 @@
 //! HTTP Strict Transport Security, from C.
 //!
-//! [`HstsPolicy`] is the `Strict-Transport-Security` field itself, crossing
-//! by value since it is three plain fields, and [`HstsStore`] is the
+//! [`HSTSPolicy`] is the `Strict-Transport-Security` field itself, crossing
+//! by value since it is three plain fields, and [`HSTSStore`] is the
 //! client-side memory of which hosts insist on TLS — the same two halves as
 //! [`crate::hsts`]. The store reads the clock itself, so the caller
 //! never passes a timestamp.
@@ -10,16 +10,16 @@ use std::time::Instant;
 
 use crate::ffi::models::Limits;
 use crate::ffi::{Buffer, Slice};
-use crate::hsts::HstsStore;
+use crate::hsts::HSTSStore;
 
 /// One `Strict-Transport-Security` policy.
 ///
-/// The C half of [`HstsPolicy`], field for field.
+/// The C half of [`HSTSPolicy`], field for field.
 ///
-/// [`HstsPolicy`]: crate::hsts::HstsPolicy
+/// [`HSTSPolicy`]: crate::hsts::HSTSPolicy
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct HstsPolicy {
+pub struct HSTSPolicy {
     /// How many seconds the policy holds for. Zero withdraws it.
     pub max_age: i64,
     /// Whether the policy covers subdomains as well as the host itself.
@@ -28,12 +28,12 @@ pub struct HstsPolicy {
     pub preload: bool,
 }
 
-impl HstsPolicy {
-    /// The [`HstsPolicy`] this stands for.
+impl HSTSPolicy {
+    /// The [`HSTSPolicy`] this stands for.
     ///
-    /// [`HstsPolicy`]: crate::hsts::HstsPolicy
-    pub fn parse(&self) -> crate::hsts::HstsPolicy {
-        crate::hsts::HstsPolicy {
+    /// [`HSTSPolicy`]: crate::hsts::HSTSPolicy
+    pub fn parse(&self) -> crate::hsts::HSTSPolicy {
+        crate::hsts::HSTSPolicy {
             max_age: self.max_age,
             include_subdomains: self.include_subdomains,
             preload: self.preload,
@@ -41,7 +41,7 @@ impl HstsPolicy {
     }
 
     /// The C half of `policy`.
-    pub fn build(policy: &crate::hsts::HstsPolicy) -> Self {
+    pub fn build(policy: &crate::hsts::HSTSPolicy) -> Self {
         Self {
             max_age: policy.max_age,
             include_subdomains: policy.include_subdomains,
@@ -62,7 +62,7 @@ impl HstsPolicy {
 /// `value` must either be null or point to `value_len` readable octets, and
 /// `out` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_hsts_policy_parse(value: *const u8, value_len: usize, out: *mut HstsPolicy) -> bool {
+pub unsafe extern "C" fn soyokaze_hsts_policy_parse(value: *const u8, value_len: usize, out: *mut HSTSPolicy) -> bool {
     if out.is_null() {
         return false;
     }
@@ -71,9 +71,9 @@ pub unsafe extern "C" fn soyokaze_hsts_policy_parse(value: *const u8, value_len:
         return false;
     };
 
-    match crate::hsts::HstsPolicy::parse(value) {
+    match crate::hsts::HSTSPolicy::parse(value) {
         Some(policy) => {
-            unsafe { *out = HstsPolicy::build(&policy) };
+            unsafe { *out = HSTSPolicy::build(&policy) };
             true
         }
         None => false,
@@ -84,16 +84,16 @@ pub unsafe extern "C" fn soyokaze_hsts_policy_parse(value: *const u8, value_len:
 ///
 /// # Safety
 ///
-/// `policy` must either be null or point to a readable [`HstsPolicy`].
+/// `policy` must either be null or point to a readable [`HSTSPolicy`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_hsts_policy_build(policy: *const HstsPolicy) -> Buffer {
+pub unsafe extern "C" fn soyokaze_hsts_policy_build(policy: *const HSTSPolicy) -> Buffer {
     match unsafe { policy.as_ref() } {
         Some(policy) => Buffer::new(policy.parse().build().into_bytes()),
         None => Buffer::EMPTY,
     }
 }
 
-/// Builds an empty [`HstsStore`].
+/// Builds an empty [`HSTSStore`].
 ///
 /// A null `limits` takes every default. The store reads the clock itself, so
 /// lifetimes count from the moment a policy is learned.
@@ -102,17 +102,17 @@ pub unsafe extern "C" fn soyokaze_hsts_policy_build(policy: *const HstsPolicy) -
 ///
 /// `limits` must either be null or point to a readable [`Limits`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_hsts_store_new(limits: *const Limits) -> *mut HstsStore {
-    Box::into_raw(Box::new(HstsStore::new().with_limits(unsafe { Limits::or_default(limits) })))
+pub unsafe extern "C" fn soyokaze_hsts_store_new(limits: *const Limits) -> *mut HSTSStore {
+    Box::into_raw(Box::new(HSTSStore::new().with_limits(unsafe { Limits::or_default(limits) })))
 }
 
-/// Releases an [`HstsStore`].
+/// Releases an [`HSTSStore`].
 ///
 /// # Safety
 ///
 /// `store` must come from `soyokaze_hsts_store_new` and not have been freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_hsts_store_free(store: *mut HstsStore) {
+pub unsafe extern "C" fn soyokaze_hsts_store_free(store: *mut HSTSStore) {
     if !store.is_null() {
         drop(unsafe { Box::from_raw(store) });
     }
@@ -129,7 +129,7 @@ pub unsafe extern "C" fn soyokaze_hsts_store_free(store: *mut HstsStore) {
 /// `store` must be a handle that has not been freed, and `host` and `header`
 /// must point to their stated number of readable octets.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_hsts_store_learn(store: *const HstsStore, host: *const u8, host_len: usize, header: *const u8, header_len: usize, secure: bool) -> bool {
+pub unsafe extern "C" fn soyokaze_hsts_store_learn(store: *const HSTSStore, host: *const u8, host_len: usize, header: *const u8, header_len: usize, secure: bool) -> bool {
     let (Some(store), Some(host), Some(header)) = (unsafe { store.as_ref() }, unsafe { Slice::borrow_text(host, host_len) }, unsafe { Slice::borrow_text(header, header_len) })
     else {
         return false;
@@ -146,7 +146,7 @@ pub unsafe extern "C" fn soyokaze_hsts_store_learn(store: *const HstsStore, host
 /// `store` must either be null or be a handle that has not been freed, and
 /// `host` must point to `host_len` readable octets.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_hsts_store_secure(store: *const HstsStore, host: *const u8, host_len: usize) -> bool {
+pub unsafe extern "C" fn soyokaze_hsts_store_secure(store: *const HSTSStore, host: *const u8, host_len: usize) -> bool {
     let (Some(store), Some(host)) = (unsafe { store.as_ref() }, unsafe { Slice::borrow_text(host, host_len) }) else {
         return false;
     };
@@ -160,7 +160,7 @@ pub unsafe extern "C" fn soyokaze_hsts_store_secure(store: *const HstsStore, hos
 ///
 /// `store` must either be null or be a handle that has not been freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_hsts_store_prune(store: *const HstsStore) {
+pub unsafe extern "C" fn soyokaze_hsts_store_prune(store: *const HSTSStore) {
     if let Some(store) = unsafe { store.as_ref() } {
         store.prune(Instant::now());
     }

@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use crate::helpers::sync::lock;
+use crate::helpers::sync::Lock;
 
 /// The per-address bookkeeping a [`Gate`] keeps behind its lock.
 pub struct GateState {
@@ -100,7 +100,7 @@ impl Gate {
         }
 
         if let Some(ip) = ip {
-            let mut state = lock(&self.state);
+            let mut state = Lock::on(&self.state);
 
             let count = state.per_ip.get(&ip).copied().unwrap_or(0);
             let over_ip = self.max_connections_per_ip != 0 && count >= self.max_connections_per_ip;
@@ -164,7 +164,7 @@ impl Gate {
         self.connections.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
 
         if let Some(ip) = ip {
-            let mut state = lock(&self.state);
+            let mut state = Lock::on(&self.state);
             if let Some(count) = state.per_ip.get_mut(&ip) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
@@ -180,7 +180,7 @@ impl Gate {
     /// memory on a server that has gone quiet.
     pub fn sweep(&self, now: std::time::Instant) {
         let window = self.window();
-        let mut state = lock(&self.state);
+        let mut state = Lock::on(&self.state);
 
         state.history.retain(|_, record| {
             while record.front().is_some_and(|front| now.duration_since(*front).as_secs_f64() > window) {

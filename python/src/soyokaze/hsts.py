@@ -1,18 +1,18 @@
 """HTTP Strict Transport Security.
 
-:class:`HstsPolicy` is the ``Strict-Transport-Security`` field itself — a
+:class:`HSTSPolicy` is the ``Strict-Transport-Security`` field itself — a
 server builds one to send, a client parses one it received — and
-:class:`HstsStore` is the client-side memory of which hosts insist on TLS.
+:class:`HSTSStore` is the client-side memory of which hosts insist on TLS.
 """
 
 import ctypes
 
 from . import ffi
-from .models import limits_argument, limits_pointer
+from .models import Limits
 from .errors import ProtocolError
 from .ffi import library
 
-class HstsPolicy:
+class HSTSPolicy:
     """One ``Strict-Transport-Security`` policy."""
 
     def __init__(self, max_age, include_subdomains=False, preload=False):
@@ -23,21 +23,21 @@ class HstsPolicy:
     @classmethod
     def parse(cls, value):
         """Reads a field value, raising :class:`ProtocolError` when it cannot be trusted."""
-        out = ffi.HstsPolicy()
-        encoded = ffi.encoded(value)
+        out = ffi.HSTSPolicy()
+        encoded = ffi.Library.encoded(value)
         if not library.soyokaze_hsts_policy_parse(encoded, len(encoded), ctypes.byref(out)):
             raise ProtocolError("the policy cannot be trusted")
         return cls(out.max_age, out.include_subdomains, out.preload)
 
     def build(self):
         """The field value as text."""
-        struct = ffi.HstsPolicy(self.max_age, self.include_subdomains, self.preload)
-        return ffi.take(library.soyokaze_hsts_policy_build(ctypes.byref(struct))).decode()
+        struct = ffi.HSTSPolicy(self.max_age, self.include_subdomains, self.preload)
+        return library.soyokaze_hsts_policy_build(ctypes.byref(struct)).take().decode()
 
     def __repr__(self):
-        return f"HstsPolicy({self.build()!r})"
+        return f"HSTSPolicy({self.build()!r})"
 
-class HstsStore:
+class HSTSStore:
     """A client-side record of which hosts insist on TLS.
 
     The store reads the clock itself, so lifetimes count from the moment a
@@ -49,8 +49,8 @@ class HstsStore:
 
     def __init__(self, limits=None):
         """An empty store, bounded by ``limits`` or the defaults."""
-        struct = limits_argument(limits)
-        self.handle = library.soyokaze_hsts_store_new(limits_pointer(struct))
+        struct = Limits.argument(limits)
+        self.handle = library.soyokaze_hsts_store_new(Limits.pointer(struct))
 
     def __del__(self):
         if getattr(self, "handle", None):
@@ -63,12 +63,12 @@ class HstsStore:
         Ignored outright unless the response arrived over a secure
         transport, since otherwise the field could have been injected.
         """
-        host, header = ffi.encoded(host), ffi.encoded(header)
+        host, header = ffi.Library.encoded(host), ffi.Library.encoded(header)
         library.soyokaze_hsts_store_learn(self.handle, host, len(host), header, len(header), secure)
 
     def secure(self, host):
         """Whether ``host`` must be reached over TLS."""
-        encoded = ffi.encoded(host)
+        encoded = ffi.Library.encoded(host)
         return library.soyokaze_hsts_store_secure(self.handle, encoded, len(encoded))
 
     def prune(self):

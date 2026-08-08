@@ -1,7 +1,7 @@
 """The types every HTTP version shares.
 
 :class:`Message` is a request or a response, whichever version framed it, and
-:class:`Url`, :class:`Version`, :class:`Method` and :class:`Port` are the
+:class:`URL`, :class:`Version`, :class:`Method` and :class:`Port` are the
 pieces around it — the same vocabulary as the crate's ``models`` module.
 :class:`Message` also extends with the constructors in :mod:`responses`, the
 same way it does in the crate.
@@ -12,9 +12,10 @@ import enum
 import pathlib
 
 from . import ffi
-from .errors import InvalidError, error_out, raise_for
+from .errors import Error, InvalidError
 from .ffi import library
-from .runtime import default_runtime
+from .responses import ResponseMixin
+from .runtime import Runtime
 
 class Version(enum.IntEnum):
     """An HTTP version."""
@@ -114,7 +115,7 @@ class Port:
         struct.number = self.number
 
         if self.path is not None:
-            encoded = ffi.encoded(self.path)
+            encoded = ffi.Library.encoded(self.path)
             struct.path = encoded
             struct.path_len = len(encoded)
             struct.keepalive = encoded
@@ -124,26 +125,27 @@ class Port:
 
         return struct
 
+    @classmethod
+    def array(cls, ports):
+        """A C array of ``soyokaze_port_t`` and the structs keeping it alive."""
+        structs = [port.build() for port in ports]
+        array = (ffi.Port * len(structs))(*structs)
+        return array, structs
+
     def __repr__(self):
         if self.kind == PortKind.UDS:
             return f"Port.UDS({self.path!r})"
         return f"Port.{self.kind.name}({self.number})"
 
-def ports_argument(ports):
-    """A C array of ``soyokaze_port_t`` and the structs keeping it alive."""
-    structs = [port.build() for port in ports]
-    array = (ffi.Port * len(structs))(*structs)
-    return array, structs
-
-class Url:
+class URL:
     """An absolute URL, split into the parts a request needs."""
 
     def __init__(self, url):
         """Parses an absolute URL, raising :class:`ProtocolError` when it will not."""
         handle = ctypes.c_void_p()
-        error = error_out()
-        text = ffi.encoded(url)
-        raise_for(library.soyokaze_url_parse(text, len(text), ctypes.byref(handle), ctypes.byref(error)), error)
+        error = Error.out()
+        text = ffi.Library.encoded(url)
+        Error.raise_for(library.soyokaze_url_parse(text, len(text), ctypes.byref(handle), ctypes.byref(error)), error)
         self.handle = handle
 
     def __del__(self):
@@ -177,34 +179,10 @@ class Url:
 
     def authority(self):
         """The authority as it belongs in a ``Host`` field."""
-        return ffi.take(library.soyokaze_url_authority(self.handle)).decode()
+        return library.soyokaze_url_authority(self.handle).take().decode()
 
     def __repr__(self):
-        return f"Url({self.scheme}://{self.authority()}{self.target})"
-
-def body_setter(message, body):
-    """Sets a message body from whatever Python value stands for one.
-
-    ``bytes`` become an in-memory data body, ``str`` an in-memory text body,
-    and :class:`pathlib.Path` a file read only when the body is sent — the
-    three variants of the crate's ``Body``.
-    """
-    if isinstance(body, pathlib.Path):
-        encoded = ffi.encoded(str(body))
-        accepted = library.soyokaze_message_set_body_file(message.handle, encoded, len(encoded))
-    elif isinstance(body, str):
-        encoded = body.encode()
-        accepted = library.soyokaze_message_set_body_text(message.handle, encoded, len(encoded))
-    else:
-        encoded = bytes(body)
-        accepted = library.soyokaze_message_set_body_data(message.handle, encoded, len(encoded))
-
-    if not accepted:
-        raise InvalidError("the body was refused")
-
-# Imported here, after Version, since responses.py needs it and would
-# otherwise see this module only partially initialized.
-from .responses import ResponseMixin
+        return f"URL({self.scheme}://{self.authority()}{self.target})"
 
 class Message(ResponseMixin):
     """One HTTP request or response, whichever version framed it.
@@ -235,7 +213,7 @@ class Message(ResponseMixin):
     @classmethod
     def request(cls, method, target, version=Version.V1_1):
         """A request for ``target``."""
-        encoded = ffi.encoded(target)
+        encoded = ffi.Library.encoded(target)
         handle = library.soyokaze_message_request(int(Method(method)), encoded, len(encoded), int(version))
         if not handle:
             raise InvalidError("the target was refused")
@@ -245,6 +223,25 @@ class Message(ResponseMixin):
     def response(cls, status_code, version=Version.V1_1):
         """A response carrying ``status_code``."""
         return cls(handle=library.soyokaze_message_response(status_code, int(version)))
+
+    @classmethod
+    def version_code(cls, version):
+        """The wire number for a version, or the default when none was named."""
+        return int(Version.V1_1 if version is None else Version(version))
+
+    @classmethod
+    def argument(cls, headers, body, version=Version.V1_1):
+        """The consumed request handle for a fetch, or ``None`` when both are absent."""
+        if headers is None and body is None:
+            return None
+
+        message = cls(version)
+        for name, value in headers or []:
+            message.append_header(name, value)
+        if body is not None:
+            message.set_body(body)
+
+        return message.take()
 
     @property
     def version(self):
@@ -357,24 +354,24 @@ class Message(ResponseMixin):
         The name is matched case-insensitively; an absent field is ``None``,
         which is not the same as a field that is there and empty.
         """
-        encoded = ffi.encoded(name)
+        encoded = ffi.Library.encoded(name)
         return library.soyokaze_message_header(self.handle, encoded, len(encoded)).text()
 
     def append_header(self, name, value):
         """Adds a header field, keeping any already stored under the same name."""
-        name, value = ffi.encoded(name), ffi.encoded(value)
+        name, value = ffi.Library.encoded(name), ffi.Library.encoded(value)
         if not library.soyokaze_message_append_header(self.handle, name, len(name), value, len(value)):
             raise InvalidError("the field was refused")
 
     def insert_header(self, name, value):
         """Adds a header field, dropping any already stored under the same name."""
-        name, value = ffi.encoded(name), ffi.encoded(value)
+        name, value = ffi.Library.encoded(name), ffi.Library.encoded(value)
         if not library.soyokaze_message_insert_header(self.handle, name, len(name), value, len(value)):
             raise InvalidError("the field was refused")
 
     def remove_header(self, name):
         """Drops every header field stored under ``name``, reporting whether any were there."""
-        encoded = ffi.encoded(name)
+        encoded = ffi.Library.encoded(name)
         return library.soyokaze_message_remove_header(self.handle, encoded, len(encoded))
 
     def trailers(self):
@@ -387,29 +384,45 @@ class Message(ResponseMixin):
 
     def trailer(self, name):
         """The first trailer value stored under ``name``, or ``None``."""
-        encoded = ffi.encoded(name)
+        encoded = ffi.Library.encoded(name)
         return library.soyokaze_message_trailer(self.handle, encoded, len(encoded)).text()
 
     def append_trailer(self, name, value):
         """Adds a trailer field, keeping any already stored under the same name."""
-        name, value = ffi.encoded(name), ffi.encoded(value)
+        name, value = ffi.Library.encoded(name), ffi.Library.encoded(value)
         if not library.soyokaze_message_append_trailer(self.handle, name, len(name), value, len(value)):
             raise InvalidError("the field was refused")
 
     def insert_trailer(self, name, value):
         """Adds a trailer field, dropping any already stored under the same name."""
-        name, value = ffi.encoded(name), ffi.encoded(value)
+        name, value = ffi.Library.encoded(name), ffi.Library.encoded(value)
         if not library.soyokaze_message_insert_trailer(self.handle, name, len(name), value, len(value)):
             raise InvalidError("the field was refused")
 
     def remove_trailer(self, name):
         """Drops every trailer field stored under ``name``, reporting whether any were there."""
-        encoded = ffi.encoded(name)
+        encoded = ffi.Library.encoded(name)
         return library.soyokaze_message_remove_trailer(self.handle, encoded, len(encoded))
 
     def set_body(self, body):
-        """Sets the payload; see :func:`body_setter` for what a value means."""
-        body_setter(self, body)
+        """Sets the payload from whatever Python value stands for one.
+
+        ``bytes`` become an in-memory data body, ``str`` an in-memory text
+        body, and :class:`pathlib.Path` a file read only when the body is
+        sent — the three variants of the crate's ``Body``.
+        """
+        if isinstance(body, pathlib.Path):
+            encoded = ffi.Library.encoded(str(body))
+            accepted = library.soyokaze_message_set_body_file(self.handle, encoded, len(encoded))
+        elif isinstance(body, str):
+            encoded = body.encode()
+            accepted = library.soyokaze_message_set_body_text(self.handle, encoded, len(encoded))
+        else:
+            encoded = bytes(body)
+            accepted = library.soyokaze_message_set_body_data(self.handle, encoded, len(encoded))
+
+        if not accepted:
+            raise InvalidError("the body was refused")
 
     def body_len(self):
         """How long the body is, or ``None`` when there is none or it is an unread file."""
@@ -418,11 +431,11 @@ class Message(ResponseMixin):
 
     def body(self, runtime=None):
         """The body as octets, reading the file behind it if there is one."""
-        runtime = runtime if runtime is not None else default_runtime()
+        runtime = runtime if runtime is not None else Runtime.default()
         out = ffi.Buffer()
-        error = error_out()
-        raise_for(library.soyokaze_message_body(runtime.handle, self.handle, ctypes.byref(out), ctypes.byref(error)), error)
-        return ffi.take(out)
+        error = Error.out()
+        Error.raise_for(library.soyokaze_message_body(runtime.handle, self.handle, ctypes.byref(out), ctypes.byref(error)), error)
+        return out.take()
 
     def __repr__(self):
         if self.is_request():
@@ -430,8 +443,6 @@ class Message(ResponseMixin):
         if self.is_response():
             return f"Message({self.status_code} {self.version})"
         return f"Message({self.version})"
-
-FIELDS = [name for name, kind in ffi.Limits._fields_]
 
 class Limits:
     """What one connection is allowed to spend on the peer's behalf.
@@ -441,32 +452,36 @@ class Limits:
     the ceilings to change: ``Limits(max_header_count=32)``.
     """
 
+    FIELDS = [name for name, kind in ffi.Limits._fields_]
+
     def __init__(self, **ceilings):
         defaults = library.soyokaze_limits_default()
 
-        for name in FIELDS:
+        for name in self.FIELDS:
             setattr(self, name, getattr(defaults, name))
 
         for name, value in ceilings.items():
-            if name not in FIELDS:
+            if name not in self.FIELDS:
                 raise TypeError(f"{name!r} is not a limit")
             setattr(self, name, value)
 
     def build(self):
         """The ``soyokaze_limits_t`` this stands for."""
         struct = ffi.Limits()
-        for name in FIELDS:
+        for name in self.FIELDS:
             setattr(struct, name, getattr(self, name))
         return struct
 
-def limits_argument(limits):
-    """The ``soyokaze_limits_t`` for an optional :class:`Limits`, or ``None``.
+    @classmethod
+    def argument(cls, limits):
+        """The ``soyokaze_limits_t`` for an optional :class:`Limits`, or ``None``.
 
-    The struct is returned itself rather than by reference, so the caller can
-    keep it alive for as long as the call needs it.
-    """
-    return limits.build() if limits is not None else None
+        The struct is returned itself rather than by reference, so the caller
+        can keep it alive for as long as the call needs it.
+        """
+        return limits.build() if limits is not None else None
 
-def limits_pointer(struct):
-    """A pointer to an optional struct from :func:`limits_argument`."""
-    return ctypes.byref(struct) if struct is not None else None
+    @classmethod
+    def pointer(cls, struct):
+        """A pointer to an optional struct from :meth:`argument`."""
+        return ctypes.byref(struct) if struct is not None else None

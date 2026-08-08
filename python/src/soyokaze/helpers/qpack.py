@@ -9,9 +9,9 @@ rides back. Both cross here as raw octets, exactly as they travel.
 import ctypes
 
 from .. import ffi
-from ..errors import InvalidError, error_out, raise_for
+from ..errors import Error, InvalidError
 from ..ffi import library
-from .fields import fields_argument, fields_taken
+from .fields import Fields
 
 class Encoder:
     """A QPACK encoder with its dynamic table and instruction stream."""
@@ -34,7 +34,7 @@ class Encoder:
         instructions = ffi.Buffer()
         if not library.soyokaze_qpack_encoder_set_max_capacity(self.handle, max_capacity, ctypes.byref(instructions)):
             raise InvalidError("the capacity was refused")
-        return ffi.take(instructions)
+        return instructions.take()
 
     def set_capacity_limit(self, capacity_limit):
         """Bounds the capacity the encoder keeps, whatever the peer permits.
@@ -45,7 +45,7 @@ class Encoder:
         instructions = ffi.Buffer()
         if not library.soyokaze_qpack_encoder_set_capacity_limit(self.handle, capacity_limit, ctypes.byref(instructions)):
             raise InvalidError("the capacity limit was refused")
-        return ffi.take(instructions)
+        return instructions.take()
 
     def set_max_outstanding_sections(self, max_sections):
         """Caps how many unacknowledged sections the encoder tracks."""
@@ -62,18 +62,18 @@ class Encoder:
         and whatever instruction octets the encoding produced for the
         encoder stream.
         """
-        array, slices = fields_argument(fields)
+        array, slices = Fields.argument(fields)
         block = ffi.Buffer()
         instructions = ffi.Buffer()
         if not library.soyokaze_qpack_encode(self.handle, stream_id, array, len(fields), ctypes.byref(block), ctypes.byref(instructions)):
             raise InvalidError("the fields were refused")
-        return ffi.take(block), ffi.take(instructions)
+        return block.take(), instructions.take()
 
     def on_decoder_instructions(self, data):
         """Feeds the encoder what arrived on the decoder stream."""
-        error = error_out()
-        data = ffi.encoded(data)
-        raise_for(library.soyokaze_qpack_encoder_on_decoder_instructions(self.handle, data, len(data), ctypes.byref(error)), error)
+        error = Error.out()
+        data = ffi.Library.encoded(data)
+        Error.raise_for(library.soyokaze_qpack_encoder_on_decoder_instructions(self.handle, data, len(data), ctypes.byref(error)), error)
 
     def cancel(self, stream_id):
         """Forgets the outstanding sections of a stream that was reset."""
@@ -113,10 +113,10 @@ class Decoder:
         decoder stream — or empty octets when nothing needs saying.
         """
         instructions = ffi.Buffer()
-        error = error_out()
-        data = ffi.encoded(data)
-        raise_for(library.soyokaze_qpack_decoder_on_encoder_instructions(self.handle, data, len(data), ctypes.byref(instructions), ctypes.byref(error)), error)
-        return ffi.take(instructions)
+        error = Error.out()
+        data = ffi.Library.encoded(data)
+        Error.raise_for(library.soyokaze_qpack_decoder_on_encoder_instructions(self.handle, data, len(data), ctypes.byref(instructions), ctypes.byref(error)), error)
+        return instructions.take()
 
     def decode(self, stream_id, block):
         """Decodes one block.
@@ -127,7 +127,7 @@ class Decoder:
         """
         out = ctypes.c_void_p()
         instructions = ffi.Buffer()
-        error = error_out()
-        block = ffi.encoded(block)
-        raise_for(library.soyokaze_qpack_decode(self.handle, stream_id, block, len(block), ctypes.byref(out), ctypes.byref(instructions), ctypes.byref(error)), error)
-        return fields_taken(out), ffi.take(instructions)
+        error = Error.out()
+        block = ffi.Library.encoded(block)
+        Error.raise_for(library.soyokaze_qpack_decode(self.handle, stream_id, block, len(block), ctypes.byref(out), ctypes.byref(instructions), ctypes.byref(error)), error)
+        return Fields.taken(out), instructions.take()

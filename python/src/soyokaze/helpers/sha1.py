@@ -9,5 +9,5 @@ from ..ffi import library
 
 def sha1(data):
     """The SHA-1 digest of ``data``. Always 20 octets."""
-    data = ffi.encoded(data)
-    return ffi.take(library.soyokaze_sha1(data, len(data)))
+    data = ffi.Library.encoded(data)
+    return library.soyokaze_sha1(data, len(data)).take()

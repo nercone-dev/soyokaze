@@ -11,7 +11,7 @@
 //! encoder stream catches up, bounded by [`Limits::qpack_block_timeout`].
 //!
 //! The design differs from HTTP/1 and HTTP/2 in one respect: the QUIC driver
-//! drives the connection through [`QuicApplication`] callbacks rather than
+//! drives the connection through [`QUICApplication`] callbacks rather than
 //! letting this crate own the read loop. So the work is split in two —
 //! [`H3Worker`] runs inside those callbacks, and [`H3Connection`] is the
 //! handle a caller holds, talking to the worker over channels. Everything that
@@ -112,8 +112,8 @@ use crate::models::{Body, ConnectionID, Headers, Limits, Message, Method, Role, 
 use crate::tls::Security;
 use crate::protocol::base::{Connection, Stream};
 use crate::protocol::common::{self, Error};
-use crate::protocol::quic::{Handshake, QuicApplication, QuicConnection, QuicError, QuicGuard, QuicHandshake, QuicOutcome, QuicTransport, StreamId, StreamRead, StreamWrite, Varint};
-use crate::helpers::sync;
+use crate::protocol::quic::{Handshake, QUICApplication, QUICConnection, QUICError, QUICGuard, QUICHandshake, QUICOutcome, QUICTransport, QUICStreamID, StreamRead, StreamWrite, Varint};
+use crate::helpers::sync::{Lock, Timeout};
 
 /// What is known about one request stream.
 #[derive(Default)]
@@ -155,7 +155,7 @@ impl StreamState {
 ///
 /// This is where the protocol itself lives: framing, QPACK, settings, and the
 /// per-stream state. It holds no QUIC handle, so it can be driven from inside
-/// the [`QuicApplication`] callbacks where the connection is only borrowed.
+/// the [`QUICApplication`] callbacks where the connection is only borrowed.
 /// Octets go in through the `on_*_bytes` methods and come back out through the
 /// `take_*` ones, leaving the caller to do the actual sending.
 pub struct H3Session {
@@ -246,7 +246,7 @@ impl H3Session {
             encoder.queue(&[instruction]);
         }
 
-        let next_stream_id = StreamId::first_bidi(role);
+        let next_stream_id = QUICStreamID::first_bidi(role);
 
         Self {
             role,
@@ -283,7 +283,7 @@ impl H3Session {
     /// keeps the two ends from colliding.
     pub fn open(&mut self) -> StreamID {
         let stream_id = StreamID(self.next_stream_id);
-        self.next_stream_id += StreamId::STEP;
+        self.next_stream_id += QUICStreamID::STEP;
         self.streams.entry(stream_id).or_default();
         stream_id
     }
@@ -720,7 +720,7 @@ impl H3Session {
         let mut message = common::Fields::into_message(fields, Version::V3_0).map_err(|err| err.on_stream(stream_id, Code::MESSAGE_ERROR))?;
         message.stream_id = Some(stream_id);
         message.connection_id = Some(id);
-        sync::lock(&self.security).apply(&mut message);
+        Lock::on(&self.security).apply(&mut message);
 
         if message.is_request() {
             state.method = message.method;
@@ -752,8 +752,6 @@ impl H3Session {
         Bytes::from(self.decoder.take_decoder_stream())
     }
 }
-
-
 
 /// What an [`H3Connection`] asks its [`H3Worker`] to do.
 ///
@@ -805,7 +803,7 @@ pub struct H3Connection {
     /// The limits this connection holds itself to.
     pub limits: H3Limits,
     /// Keeps the QUIC connection alive for as long as this handle exists.
-    pub guard: Option<std::sync::Arc<QuicGuard>>,
+    pub guard: Option<std::sync::Arc<QUICGuard>>,
     /// The settings this end advertised, as the paired [`H3Session`] holds them.
     ///
     /// A copy rather than a borrow: the session itself lives in the worker,
@@ -887,12 +885,12 @@ impl H3Connection {
     /// so this is only for a caller building a session by hand; a connection
     /// paired with a worker fills it in for itself.
     pub fn with_security(self, security: Security) -> Self {
-        *sync::lock(&self.security) = security;
+        *Lock::on(&self.security) = security;
         self
     }
 
     /// Attaches the handle that keeps the QUIC connection alive.
-    pub fn with_guard(mut self, guard: std::sync::Arc<QuicGuard>) -> Self {
+    pub fn with_guard(mut self, guard: std::sync::Arc<QUICGuard>) -> Self {
         self.guard = Some(guard);
         self
     }
@@ -904,13 +902,13 @@ impl H3Connection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] when a [`Body::File`] cannot be read, and
+    /// Returns [`Error::IO`] when a [`Body::File`] cannot be read, and
     /// [`Error::Closed`] when the worker is gone. Failures in framing itself
     /// surface later, through [`H3Connection::receive_message`].
     pub async fn send_message(&mut self, message: Message) -> Result<(), Error> {
         let mut message = message;
         self.request_finalizer.finalize(self.role, &mut message);
-        self.response_finalizer.finalize(self.role, sync::lock(&self.security).secure, &mut message);
+        self.response_finalizer.finalize(self.role, Lock::on(&self.security).secure, &mut message);
 
         if let Some(body) = message.body.take() {
             message.body = Some(Body::Data(body.into_bytes().await?));
@@ -1041,14 +1039,14 @@ pub struct H3Stream {
     /// Whether the peer has finished sending.
     pub eof: bool,
     /// Keeps the QUIC connection alive for as long as this stream exists.
-    pub guard: Option<std::sync::Arc<QuicGuard>>,
+    pub guard: Option<std::sync::Arc<QUICGuard>>,
     /// Where a reset is sent, when the worker is still reachable.
     pub commands: Option<tokio::sync::mpsc::Sender<H3Command>>,
 }
 
 impl H3Stream {
     /// A stream over the given write and read channels.
-    pub fn new(id: StreamID, writes: tokio::sync::mpsc::Sender<RawWrite>, reads: tokio::sync::mpsc::Receiver<(Bytes, bool)>, guard: Option<std::sync::Arc<QuicGuard>>) -> Self {
+    pub fn new(id: StreamID, writes: tokio::sync::mpsc::Sender<RawWrite>, reads: tokio::sync::mpsc::Receiver<(Bytes, bool)>, guard: Option<std::sync::Arc<QUICGuard>>) -> Self {
         Self { id, writes, reads, reserving: None, buffer: BytesMut::new(), eof: false, guard, commands: None }
     }
 
@@ -1090,7 +1088,7 @@ impl H3Stream {
     }
 
     /// The handle keeping the QUIC connection alive, if there is one.
-    pub fn guard(&self) -> Option<&std::sync::Arc<QuicGuard>> {
+    pub fn guard(&self) -> Option<&std::sync::Arc<QUICGuard>> {
         self.guard.as_ref()
     }
 }
@@ -1178,26 +1176,25 @@ impl Connection for H3Connection {
     }
 
     fn security(&self) -> Security {
-        *sync::lock(&self.security)
+        *Lock::on(&self.security)
     }
 
     async fn send(&mut self, message: Message) -> Result<(), Error> {
         let timeout = self.limits.send_timeout;
         let sending = std::pin::pin!(self.send_message(message));
-        sync::Timeout::within(timeout, sending).await?
+        Timeout::within(timeout, sending).await?
     }
 
     async fn receive(&mut self) -> Result<Message, Error> {
         let timeout = self.limits.receive_timeout;
         let receiving = std::pin::pin!(self.receive_message());
-        sync::Timeout::within(timeout, receiving).await?
+        Timeout::within(timeout, receiving).await?
     }
 
     async fn close(&mut self) {
         let _ = self.commands.send(H3Command::Close).await;
     }
 }
-
 
 /// A unidirectional stream the peer opened, before and after its kind is known.
 ///
@@ -1225,7 +1222,7 @@ pub enum Side {
 
 /// The half of an HTTP/3 connection that runs inside the QUIC driver.
 ///
-/// Implements [`QuicApplication`], so the QUIC driver calls into it as the
+/// Implements [`QUICApplication`], so the QUIC driver calls into it as the
 /// QUIC connection makes progress. It owns the [`H3Session`] and does the
 /// actual reading and writing; the caller's [`H3Connection`] talks to it over
 /// channels.
@@ -1301,13 +1298,13 @@ pub struct H3Worker {
 
 impl H3Worker {
     /// Boxes an [`Error`] as the error type the QUIC driver expects.
-    pub fn boxed(error: Error) -> QuicError {
+    pub fn boxed(error: Error) -> QUICError {
         Box::new(error)
     }
 
     /// A worker over `session`, wired to a connection handle's channels.
     pub fn new(session: H3Session, commands: tokio::sync::mpsc::Receiver<H3Command>, events: tokio::sync::mpsc::Sender<H3Event>, raw_writes: tokio::sync::mpsc::Receiver<(StreamID, Bytes, bool)>) -> Self {
-        let next_uni = StreamId::first_uni(session.role);
+        let next_uni = QUICStreamID::first_uni(session.role);
 
         Self {
             session,
@@ -1364,7 +1361,7 @@ impl H3Worker {
     ///
     /// The error is described before it is sent, so the description survives
     /// even if the handle is gone and the event is dropped.
-    pub fn fail(&mut self, error: Error) -> QuicError {
+    pub fn fail(&mut self, error: Error) -> QUICError {
         let description = error.to_string();
         let _ = self.events.try_send(H3Event::Failed(error));
         Box::new(std::io::Error::other(description))
@@ -1379,7 +1376,7 @@ impl H3Worker {
             return None;
         }
 
-        let wait = sync::Timeout::duration(self.session.limits.qpack_block_timeout)?;
+        let wait = Timeout::duration(self.session.limits.qpack_block_timeout)?;
         let earliest = self.session.blocked_since.values().min()?;
         Some(*earliest + wait)
     }
@@ -1403,7 +1400,7 @@ impl H3Worker {
     /// Clients get 2, 6, 10, ... and servers 3, 7, 11, ....
     pub fn alloc_uni(&mut self) -> u64 {
         let id = self.next_uni;
-        self.next_uni += StreamId::STEP;
+        self.next_uni += QUICStreamID::STEP;
         id
     }
 
@@ -1413,7 +1410,7 @@ impl H3Worker {
     ///
     /// Returns [`Error::Protocol`] for [`StreamKind::Request`], which is
     /// bidirectional, and otherwise as [`H3Worker::write`].
-    pub fn open_uni(&mut self, transport: &mut impl QuicTransport, stream_id: u64, kind: StreamKind) -> Result<(), Error> {
+    pub fn open_uni(&mut self, transport: &mut impl QUICTransport, stream_id: u64, kind: StreamKind) -> Result<(), Error> {
         let code = kind
             .code()
             .ok_or_else(|| Error::Protocol(format!("{kind:?} is not a unidirectional stream type")))?;
@@ -1428,7 +1425,7 @@ impl H3Worker {
     /// # Errors
     ///
     /// As [`H3Worker::flush_stream`].
-    pub fn write(&mut self, transport: &mut impl QuicTransport, stream_id: u64, data: &[u8], fin: bool) -> Result<(), Error> {
+    pub fn write(&mut self, transport: &mut impl QUICTransport, stream_id: u64, data: &[u8], fin: bool) -> Result<(), Error> {
         let entry = self.outbound.entry(stream_id).or_default();
         entry.0.extend_from_slice(data);
         entry.1 |= fin;
@@ -1444,9 +1441,9 @@ impl H3Worker {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] when QUIC fails for any reason other than the
+    /// Returns [`Error::IO`] when QUIC fails for any reason other than the
     /// stream being blocked or stopped.
-    pub fn flush_stream(&mut self, transport: &mut impl QuicTransport, stream_id: u64) -> Result<(), Error> {
+    pub fn flush_stream(&mut self, transport: &mut impl QUICTransport, stream_id: u64) -> Result<(), Error> {
         let Some((buffer, fin)) = self.outbound.get_mut(&stream_id) else {
             return Ok(());
         };
@@ -1483,7 +1480,7 @@ impl H3Worker {
     /// # Errors
     ///
     /// As [`H3Session::encode_message_into`] and [`H3Worker::write`].
-    pub fn execute(&mut self, transport: &mut impl QuicTransport, command: H3Command) -> Result<(), Error> {
+    pub fn execute(&mut self, transport: &mut impl QUICTransport, command: H3Command) -> Result<(), Error> {
         match command {
             H3Command::Send(message) => {
                 let stream_id = message.stream_id.unwrap_or_else(|| self.session.open());
@@ -1548,7 +1545,7 @@ impl H3Worker {
     /// Returns [`Error::Stream`] when a tunnel cannot take the octets, and
     /// otherwise as [`H3Worker::reject`], [`H3Session::on_stream_bytes`],
     /// [`H3Worker::goaway`] and [`H3Worker::feed_uni`].
-    pub fn dispatch(&mut self, transport: &mut impl QuicTransport, stream_id: u64, data: &[u8], fin: bool) -> Result<(), Error> {
+    pub fn dispatch(&mut self, transport: &mut impl QUICTransport, stream_id: u64, data: &[u8], fin: bool) -> Result<(), Error> {
         if let Some(sink) = self.tunnels.get(&stream_id) {
             if sink.try_send((Bytes::copy_from_slice(data), fin)).is_err() {
                 return Err(Error::stream(StreamID(stream_id), Code::EXCESSIVE_LOAD, "the tunnel could not take the octets"));
@@ -1562,7 +1559,7 @@ impl H3Worker {
             return Ok(());
         }
 
-        if StreamId::is_bidi(stream_id) {
+        if QUICStreamID::is_bidi(stream_id) {
             if self.session.goaway_sent.is_some_and(|id| stream_id >= id) && !self.session.streams.contains_key(&StreamID(stream_id)) {
                 return self.reject(transport, stream_id);
             }
@@ -1586,14 +1583,14 @@ impl H3Worker {
     /// # Errors
     ///
     /// As [`H3Worker::write`].
-    pub fn goaway(&mut self, transport: &mut impl QuicTransport) -> Result<(), Error> {
+    pub fn goaway(&mut self, transport: &mut impl QUICTransport) -> Result<(), Error> {
         let limit = self.session.limits.max_requests_per_connection;
 
         if self.session.role.is_client() || self.session.goaway_sent.is_some() || limit == 0 || self.session.total_streams < limit {
             return Ok(());
         }
 
-        let id = self.session.highest_peer_stream_id + StreamId::STEP;
+        let id = self.session.highest_peer_stream_id + QUICStreamID::STEP;
         let mut frame = BytesMut::new();
         Frame::GoAway { id }.encode_into(&mut frame);
 
@@ -1611,9 +1608,9 @@ impl H3Worker {
     ///
     /// Returns [`Error::Limit`] when the peer keeps opening streams past the
     /// GOAWAY instead of winding down, having first closed the connection.
-    pub fn reject(&mut self, transport: &mut impl QuicTransport, stream_id: u64) -> Result<(), Error> {
+    pub fn reject(&mut self, transport: &mut impl QUICTransport, stream_id: u64) -> Result<(), Error> {
         if stream_id >= self.rejected_floor {
-            self.rejected_floor = stream_id + StreamId::STEP;
+            self.rejected_floor = stream_id + QUICStreamID::STEP;
             self.rejected = self.rejected.saturating_add(1);
         }
 
@@ -1633,7 +1630,7 @@ impl H3Worker {
     /// everything owed has been handed to QUIC the connection is done: it is
     /// closed cleanly and the handle is told [`Error::Closed`], exactly as an
     /// HTTP/2 connection reports itself once its GOAWAY drains.
-    pub fn wind_down(&mut self, transport: &mut impl QuicTransport) {
+    pub fn wind_down(&mut self, transport: &mut impl QUICTransport) {
         if self.drained || self.session.goaway.is_none() {
             return;
         }
@@ -1653,7 +1650,7 @@ impl H3Worker {
     /// # Errors
     ///
     /// As [`H3Worker::feed_uni_bytes`].
-    pub fn feed_uni(&mut self, transport: &mut impl QuicTransport, stream_id: u64, data: &[u8], fin: bool) -> Result<(), Error> {
+    pub fn feed_uni(&mut self, transport: &mut impl QUICTransport, stream_id: u64, data: &[u8], fin: bool) -> Result<(), Error> {
         let outcome = self.feed_uni_bytes(transport, stream_id, data);
 
         if fin {
@@ -1674,7 +1671,7 @@ impl H3Worker {
     /// Returns [`Error::Limit`] past [`Limits::max_peer_uni_streams`],
     /// [`Error::Protocol`] when the prefix grows past [`Varint::MAX_SIZE`]
     /// without decoding, and otherwise as [`H3Worker::feed_uni_kind`].
-    pub fn feed_uni_bytes(&mut self, transport: &mut impl QuicTransport, stream_id: u64, data: &[u8]) -> Result<(), Error> {
+    pub fn feed_uni_bytes(&mut self, transport: &mut impl QUICTransport, stream_id: u64, data: &[u8]) -> Result<(), Error> {
         if self.peer_uni.get(&stream_id).is_some_and(|uni| uni.abandoned) {
             return Ok(());
         }
@@ -1736,7 +1733,7 @@ impl H3Worker {
     }
 
     /// Closes the connection with `Code::EXCESSIVE_LOAD` and builds the matching error.
-    pub fn overloaded(&mut self, transport: &mut impl QuicTransport, reason: impl Into<String>) -> Error {
+    pub fn overloaded(&mut self, transport: &mut impl QUICTransport, reason: impl Into<String>) -> Error {
         let _ = transport.close(Code::EXCESSIVE_LOAD, b"");
         Error::Limit(reason.into())
     }
@@ -1745,7 +1742,7 @@ impl H3Worker {
     ///
     /// The code comes from the error where it carries one, and falls back to
     /// `Code::MESSAGE_ERROR`.
-    pub fn reset_stream(&mut self, transport: &mut impl QuicTransport, stream_id: u64, error: &Error) {
+    pub fn reset_stream(&mut self, transport: &mut impl QUICTransport, stream_id: u64, error: &Error) {
         self.forget_stream(stream_id);
 
         let code = match error {
@@ -1762,7 +1759,7 @@ impl H3Worker {
     /// # Errors
     ///
     /// As [`H3Worker::drain_side_channel`].
-    pub fn drain_side_channels(&mut self, transport: &mut impl QuicTransport) -> Result<(), Error> {
+    pub fn drain_side_channels(&mut self, transport: &mut impl QUICTransport) -> Result<(), Error> {
         self.drain_side_channel(transport, Side::Encoder)?;
         self.drain_side_channel(transport, Side::Decoder)
     }
@@ -1777,7 +1774,7 @@ impl H3Worker {
     /// # Errors
     ///
     /// As [`H3Worker::write`].
-    pub fn drain_side_channel(&mut self, transport: &mut impl QuicTransport, side: Side) -> Result<(), Error> {
+    pub fn drain_side_channel(&mut self, transport: &mut impl QUICTransport, side: Side) -> Result<(), Error> {
         let (pending, stream_id) = match side {
             Side::Encoder => (!self.session.encoder.encoder_stream().is_empty(), self.local_encoder),
             Side::Decoder => (!self.session.decoder.decoder_stream().is_empty(), self.local_decoder),
@@ -1803,15 +1800,15 @@ impl H3Worker {
     }
 }
 
-impl QuicApplication for H3Worker {
+impl QUICApplication for H3Worker {
     /// Opens the three streams HTTP/3 needs and sends the opening SETTINGS.
     ///
     /// Called once the QUIC handshake completes, which is the first moment a
     /// stream can be opened — and the first moment the transport facts exist
     /// to be read, which is when [`H3Session::security`] is stamped.
-    fn on_conn_established(&mut self, qconn: &mut QuicConnection, _handshake: &QuicHandshake) -> QuicOutcome<()> {
+    fn on_conn_established(&mut self, qconn: &mut QUICConnection, _handshake: &QUICHandshake) -> QUICOutcome<()> {
         self.established = true;
-        *sync::lock(&self.session.security) = Handshake::of(qconn).security();
+        *Lock::on(&self.session.security) = Handshake::of(qconn).security();
 
         self.local_control = self.alloc_uni();
         self.local_encoder = self.alloc_uni();
@@ -1845,7 +1842,7 @@ impl QuicApplication for H3Worker {
     /// writes are only taken while [`H3Worker::accepting_writes`], which is
     /// how back pressure reaches a tunnel. Once the connection handle is gone
     /// the command arm is dropped, so a closed channel does not spin.
-    async fn wait_for_data(&mut self, _qconn: &mut QuicConnection) -> QuicOutcome<()> {
+    async fn wait_for_data(&mut self, _qconn: &mut QUICConnection) -> QUICOutcome<()> {
         let deadline = self.block_deadline();
 
         tokio::select! {
@@ -1878,12 +1875,12 @@ impl QuicApplication for H3Worker {
     }
 
     /// Reads every readable stream and delivers whatever messages complete.
-    fn process_reads(&mut self, qconn: &mut QuicConnection) -> QuicOutcome<()> {
+    fn process_reads(&mut self, qconn: &mut QUICConnection) -> QUICOutcome<()> {
         let mut read = std::mem::take(&mut self.read);
         let mut readable = std::mem::take(&mut self.readable);
 
         readable.clear();
-        readable.extend(QuicTransport::readable(qconn));
+        readable.extend(QUICTransport::readable(qconn));
 
         let outcome = self.drain_reads(qconn, &readable, &mut read);
 
@@ -1902,9 +1899,9 @@ impl QuicApplication for H3Worker {
     /// Checks the QPACK block deadline first: a stream that has waited too
     /// long takes the connection down with `Code::QPACK_DECOMPRESSION_FAILED`, since
     /// the peer has left the decoder unable to make progress.
-    fn process_writes(&mut self, qconn: &mut QuicConnection) -> QuicOutcome<()> {
+    fn process_writes(&mut self, qconn: &mut QUICConnection) -> QUICOutcome<()> {
         if let Some(error) = self.expired_block() {
-            let _ = QuicTransport::close(qconn, Code::QPACK_DECOMPRESSION_FAILED, b"");
+            let _ = QUICTransport::close(qconn, Code::QPACK_DECOMPRESSION_FAILED, b"");
             return Err(self.fail(error));
         }
 
@@ -1989,7 +1986,7 @@ impl H3Worker {
     ///
     /// Any connection-fatal failure, already reported to the connection
     /// handle by [`H3Worker::fail`].
-    pub fn drain_reads(&mut self, transport: &mut impl QuicTransport, readable: &[u64], read: &mut [u8]) -> Result<(), QuicError> {
+    pub fn drain_reads(&mut self, transport: &mut impl QUICTransport, readable: &[u64], read: &mut [u8]) -> Result<(), QUICError> {
         for stream_id in readable.iter().copied() {
             loop {
                 if self.tunnels.get(&stream_id).is_some_and(|sink| sink.capacity() == 0) {

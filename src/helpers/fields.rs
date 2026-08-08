@@ -54,7 +54,6 @@ impl HeaderField {
     }
 }
 
-
 /// An FNV-1a hasher for the short keys a field index is built on.
 ///
 /// Field names are a handful of octets, where a hash tuned for long inputs

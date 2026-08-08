@@ -10,7 +10,6 @@
 //!
 //! [`base`]: crate::protocol::base
 
-
 use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -215,7 +214,7 @@ impl Buffer {
     /// # Errors
     ///
     /// Returns [`Error::Timeout`] when nothing arrives in time, and
-    /// [`Error::Io`] when the transport fails.
+    /// [`Error::IO`] when the transport fails.
     pub async fn fill<T>(&mut self, transport: &mut T, timeout: f64) -> Result<bool, Error>
     where
         T: AsyncRead + Unpin,
@@ -455,23 +454,15 @@ impl Fields {
 
             match pseudo {
                 PSEUDO_METHOD => {
-                    message.method = Some(
-                        field
-                            .value
-                            .parse()
-                            .map_err(|_| Error::Protocol(format!("method {:?} is not recognised", field.value)))?,
-                    );
+                    let method = field.value.parse().map_err(|_| Error::Protocol(format!("method {:?} is not recognised", field.value)))?;
+                    message.method = Some(method);
                 }
                 PSEUDO_STATUS => {
                     if field.value.len() != 3 || !field.value.bytes().all(|byte| byte.is_ascii_digit()) {
                         return Err(Error::Protocol(format!("status {:?} is not three digits", field.value)));
                     }
-                    message.status_code = Some(
-                        field
-                            .value
-                            .parse()
-                            .map_err(|_| Error::Protocol(format!("status {:?} is not three digits", field.value)))?,
-                    );
+                    let status_code = field.value.parse().map_err(|_| Error::Protocol(format!("status {:?} is not three digits", field.value)))?;
+                    message.status_code = Some(status_code);
                 }
                 PSEUDO_SCHEME => message.security.secure = field.value == "https",
                 PSEUDO_AUTHORITY => authority = Some(field.value.clone()),

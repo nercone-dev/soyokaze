@@ -453,7 +453,7 @@ where
     /// # Errors
     ///
     /// Returns [`Error::Timeout`] past [`Limits::write_timeout`], and
-    /// [`Error::Io`] when the transport fails.
+    /// [`Error::IO`] when the transport fails.
     pub async fn flush_out(&mut self) -> Result<(), Error> {
         if self.out.is_empty() {
             return Ok(());
@@ -559,13 +559,10 @@ where
             }
         };
 
-        self.streams.entry(stream_id).or_insert_with(|| {
-            H2Stream::new(
-                stream_id,
-                self.settings_local.initial_window_size as i64,
-                self.settings_remote.initial_window_size as i64,
-            )
-        });
+        let window_local = self.settings_local.initial_window_size as i64;
+        let window_remote = self.settings_remote.initial_window_size as i64;
+
+        self.streams.entry(stream_id).or_insert_with(|| H2Stream::new(stream_id, window_local, window_remote));
 
         let fields = common::Fields::of(&message)?;
 

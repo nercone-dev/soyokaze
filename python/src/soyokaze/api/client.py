@@ -9,12 +9,11 @@ itself is wanted, mirroring the crate's ``api::client`` module.
 import ctypes
 
 from .. import ffi
-from ..errors import InvalidError, error_out, raise_for
+from ..errors import Error, InvalidError
 from ..ffi import library
-from ..models import Message, Method, Role, Version
-from ..runtime import default_runtime
+from ..models import Limits, Message, Method, Role, Version
+from ..runtime import Runtime
 from ..websocket import WebSocketConnection
-from ..models import Limits
 
 class ClientLimits:
     """The limits a client applies on top of the per-message :class:`Limits`."""
@@ -69,7 +68,7 @@ class ClientConfig:
         struct.hsts = self.hsts
 
         if self.roots is not None:
-            slices = [ffi.slice_of(ffi.encoded(root)) for root in self.roots]
+            slices = [ffi.Slice.of(ffi.Library.encoded(root)) for root in self.roots]
             array = (ffi.Slice * len(slices))(*slices)
             keepalive.extend((slices, array))
             struct.roots = array
@@ -83,9 +82,9 @@ class ClientConfig:
         if self.ech is not None:
             entries = []
             for host, config_list in self.ech.items():
-                entry = ffi.EchEntry(ffi.slice_of(ffi.encoded(host)), ffi.slice_of(ffi.encoded(config_list)))
+                entry = ffi.ECHEntry(ffi.Slice.of(ffi.Library.encoded(host)), ffi.Slice.of(ffi.Library.encoded(config_list)))
                 entries.append(entry)
-            array = (ffi.EchEntry * len(entries))(*entries)
+            array = (ffi.ECHEntry * len(entries))(*entries)
             keepalive.extend((entries, array))
             struct.ech = array
             struct.ech_count = len(entries)
@@ -121,7 +120,7 @@ class Connection:
 
     def id(self):
         """The connection's identifier."""
-        return ffi.take(library.soyokaze_connection_id(self.handle))
+        return library.soyokaze_connection_id(self.handle).take()
 
     def reusable(self):
         """Whether another message may go over the connection."""
@@ -133,8 +132,8 @@ class Connection:
         The raw half of :meth:`Client.request`, for pipelining requests or
         streaming responses by hand. ``message`` is consumed.
         """
-        error = error_out()
-        raise_for(library.soyokaze_connection_send(self.runtime.handle, self.handle, message.take(), ctypes.byref(error)), error)
+        error = Error.out()
+        Error.raise_for(library.soyokaze_connection_send(self.runtime.handle, self.handle, message.take(), ctypes.byref(error)), error)
 
     def receive(self):
         """Receives the next message.
@@ -143,8 +142,8 @@ class Connection:
         handed over rather than read past.
         """
         out = ctypes.c_void_p()
-        error = error_out()
-        raise_for(library.soyokaze_connection_receive(self.runtime.handle, self.handle, ctypes.byref(out), ctypes.byref(error)), error)
+        error = Error.out()
+        Error.raise_for(library.soyokaze_connection_receive(self.runtime.handle, self.handle, ctypes.byref(out), ctypes.byref(error)), error)
         return Message(handle=out)
 
     def open_websocket(self, authority, target, limits=None):
@@ -158,28 +157,15 @@ class Connection:
         self.handle = None
 
         out = ctypes.c_void_p()
-        error = error_out()
-        authority, target = ffi.encoded(authority), ffi.encoded(target)
-        raise_for(library.soyokaze_connection_open_websocket(self.runtime.handle, handle, authority, len(authority), target, len(target), ctypes.byref(limits) if limits is not None else None, ctypes.byref(out), ctypes.byref(error)), error)
+        error = Error.out()
+        authority, target = ffi.Library.encoded(authority), ffi.Library.encoded(target)
+        Error.raise_for(library.soyokaze_connection_open_websocket(self.runtime.handle, handle, authority, len(authority), target, len(target), ctypes.byref(limits) if limits is not None else None, ctypes.byref(out), ctypes.byref(error)), error)
         return WebSocketConnection(out)
 
     def close(self):
         """Closes the connection, leaving the object to be dropped."""
         if self.handle:
             library.soyokaze_connection_close(self.runtime.handle, self.handle)
-
-def request_argument(headers, body, version):
-    """The consumed request handle for a fetch, or ``None`` when both are absent."""
-    if headers is None and body is None:
-        return None
-
-    message = Message(version)
-    for name, value in headers or []:
-        message.append_header(name, value)
-    if body is not None:
-        message.set_body(body)
-
-    return message.take()
 
 class Client:
     """An HTTP client.
@@ -190,7 +176,7 @@ class Client:
     """
 
     def __init__(self, config=None, runtime=None):
-        self.runtime = runtime if runtime is not None else default_runtime()
+        self.runtime = runtime if runtime is not None else Runtime.default()
 
         struct = config.build() if config is not None else None
         self.handle = library.soyokaze_client_new(ctypes.byref(struct) if struct is not None else None)
@@ -212,12 +198,12 @@ class Client:
         ``headers`` is an iterable of name and value pairs, and ``body`` is
         whatever :meth:`Message.set_body` accepts.
         """
-        request = request_argument(headers, body, Version.V1_1)
+        request = Message.argument(headers, body, Version.V1_1)
 
         out = ctypes.c_void_p()
-        error = error_out()
-        encoded = ffi.encoded(url)
-        raise_for(library.soyokaze_client_fetch(self.runtime.handle, self.handle, int(Method(method)), encoded, len(encoded), request, ctypes.byref(out), ctypes.byref(error)), error)
+        error = Error.out()
+        encoded = ffi.Library.encoded(url)
+        Error.raise_for(library.soyokaze_client_fetch(self.runtime.handle, self.handle, int(Method(method)), encoded, len(encoded), request, ctypes.byref(out), ctypes.byref(error)), error)
         return Message(handle=out)
 
     def get(self, url):
@@ -241,10 +227,10 @@ class Client:
         return self.fetch(Method.DELETE, url)
 
     def open(self, url):
-        """Opens a connection for a :class:`Url`, taking the transport from its scheme."""
+        """Opens a connection for a :class:`URL`, taking the transport from its scheme."""
         out = ctypes.c_void_p()
-        error = error_out()
-        raise_for(library.soyokaze_client_open(self.runtime.handle, self.handle, url.handle, ctypes.byref(out), ctypes.byref(error)), error)
+        error = Error.out()
+        Error.raise_for(library.soyokaze_client_open(self.runtime.handle, self.handle, url.handle, ctypes.byref(out), ctypes.byref(error)), error)
         return Connection(out, self.runtime)
 
     def connect(self, host, port):
@@ -253,10 +239,10 @@ class Client:
         The port decides the transport, and so which versions are available.
         """
         out = ctypes.c_void_p()
-        error = error_out()
-        encoded = ffi.encoded(host)
+        error = Error.out()
+        encoded = ffi.Library.encoded(host)
         struct = port.build()
-        raise_for(library.soyokaze_client_connect(self.runtime.handle, self.handle, encoded, len(encoded), ctypes.byref(struct), ctypes.byref(out), ctypes.byref(error)), error)
+        Error.raise_for(library.soyokaze_client_connect(self.runtime.handle, self.handle, encoded, len(encoded), ctypes.byref(struct), ctypes.byref(out), ctypes.byref(error)), error)
         return Connection(out, self.runtime)
 
     def request(self, connection, request):
@@ -265,8 +251,8 @@ class Client:
         Informational (1xx) responses are read past. ``request`` is consumed.
         """
         out = ctypes.c_void_p()
-        error = error_out()
-        raise_for(library.soyokaze_client_request(self.runtime.handle, self.handle, connection.handle, request.take(), ctypes.byref(out), ctypes.byref(error)), error)
+        error = Error.out()
+        Error.raise_for(library.soyokaze_client_request(self.runtime.handle, self.handle, connection.handle, request.take(), ctypes.byref(out), ctypes.byref(error)), error)
         return Message(handle=out)
 
     def websocket(self, url):
@@ -276,7 +262,7 @@ class Client:
         upgrade, or extended CONNECT over HTTP/2 and HTTP/3.
         """
         out = ctypes.c_void_p()
-        error = error_out()
-        encoded = ffi.encoded(url)
-        raise_for(library.soyokaze_client_websocket(self.runtime.handle, self.handle, encoded, len(encoded), ctypes.byref(out), ctypes.byref(error)), error)
+        error = Error.out()
+        encoded = ffi.Library.encoded(url)
+        Error.raise_for(library.soyokaze_client_websocket(self.runtime.handle, self.handle, encoded, len(encoded), ctypes.byref(out), ctypes.byref(error)), error)
         return WebSocketConnection(out)

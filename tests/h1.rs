@@ -2,7 +2,7 @@ use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use soyokaze::models::Limits;
-use soyokaze::hsts::HstsPolicy;
+use soyokaze::hsts::HSTSPolicy;
 use soyokaze::models::{Body, ConnectionID, HeaderCase, Headers, Message, Method, Role, Version};
 use soyokaze::tls::Security;
 use soyokaze::protocol::base::Connection;
@@ -214,10 +214,8 @@ fn a_chunked_transfer_coding_frames_the_body() {
 
 #[test]
 fn refuses_a_message_framed_two_ways_at_once() {
-    let smuggled = with_headers(
-        Message::request(Method::POST, "/", Version::V1_1),
-        &[("content-length", "5"), ("transfer-encoding", "chunked")],
-    );
+    let framing = [("content-length", "5"), ("transfer-encoding", "chunked")];
+    let smuggled = with_headers(Message::request(Method::POST, "/", Version::V1_1), &framing);
 
     assert!(refuses_framing(&smuggled), "request smuggling must be refused");
 }
@@ -286,7 +284,7 @@ async fn a_configured_hsts_policy_rides_only_on_a_secure_transport() {
 
         let mut client = H1Connection::new(client_pipe, Role::UserAgent, id(), limits());
         let mut server = H1Connection::new(server_pipe, Role::Origin, id(), limits())
-            .with_response_finalizer(soyokaze::finalizer::ResponseFinalizer::new(Some(HstsPolicy::new(600))))
+            .with_response_finalizer(soyokaze::finalizer::ResponseFinalizer::new(Some(HSTSPolicy::new(600))))
             .with_security(Security { secure, ..Security::default() });
 
         client.send(Message::request(Method::GET, "/", Version::V1_1)).await.expect("the request did not send");
@@ -309,17 +307,10 @@ async fn a_chunked_body_and_its_trailers_arrive() {
     let (client_pipe, mut server_pipe) = tokio::io::duplex(64 * 1024);
     let mut client = H1Connection::new(client_pipe, Role::UserAgent, id(), limits());
 
+    let response = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\nx-checksum: deadbeef\r\n\r\n";
+
     server_pipe
-        .write_all(
-            b"HTTP/1.1 200 OK\r\n\
-              transfer-encoding: chunked\r\n\
-              \r\n\
-              5\r\nhello\r\n\
-              6\r\n world\r\n\
-              0\r\n\
-              x-checksum: deadbeef\r\n\
-              \r\n",
-        )
+        .write_all(response)
         .await
         .expect("the fixture did not write");
 
@@ -822,7 +813,6 @@ fn an_unknown_connection_token_is_ignored() {
     assert!(h1::Persistence::keep_alive(Some(&headers), Version::V1_1));
     assert!(!h1::Persistence::keep_alive(Some(&headers), Version::V1_0), "HTTP/1.0 still needs keep-alive");
 }
-
 
 /// A connection carries the ceilings it uses, and no others.
 ///

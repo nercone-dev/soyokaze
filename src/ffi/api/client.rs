@@ -8,12 +8,11 @@ use crate::api::client::Client;
 use crate::ffi::models::Limits;
 use crate::ffi::errors::{ErrorHandle, Status};
 use crate::ffi::models::Port;
-use crate::ffi::tls::{EchEntry, TlsConfig};
+use crate::ffi::tls::{ECHEntry, TLSConfig};
 use crate::ffi::websocket::WebSocket;
 use crate::ffi::{Buffer, Runtime, Slice};
-use crate::models::{Message, Method, Role, Url, Version};
+use crate::models::{Message, Method, Role, URL, Version};
 use crate::protocol::base::{AnyConnection, Connection};
-
 
 /// The limits a client applies on top of the per-message [`Limits`].
 ///
@@ -52,7 +51,6 @@ pub extern "C" fn soyokaze_client_limits_default() -> ClientLimits {
     ClientLimits::build(&crate::api::client::ClientLimits::default())
 }
 
-
 /// How a [`Client`] is configured.
 ///
 /// Passing null wherever one of these is asked for takes every default:
@@ -87,10 +85,10 @@ pub struct ClientConfig {
 
     /// The TLS details every context is built with. Null takes every default,
     /// as `soyokaze_tls_config_default` hands them out.
-    pub tls: *const TlsConfig,
+    pub tls: *const TLSConfig,
 
     /// The ECH configuration lists to use when dialling each host.
-    pub ech: *const EchEntry,
+    pub ech: *const ECHEntry,
     /// How many entries `ech` holds.
     pub ech_count: usize,
 }
@@ -294,7 +292,7 @@ pub unsafe extern "C" fn soyokaze_client_delete(runtime: *mut Runtime, client: *
 /// `runtime`, `client` and `url` must be handles that have not been freed, and
 /// `out` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_client_open(runtime: *mut Runtime, client: *const Client, url: *const Url, out: *mut *mut AnyConnection, error: *mut *mut ErrorHandle) -> Status {
+pub unsafe extern "C" fn soyokaze_client_open(runtime: *mut Runtime, client: *const Client, url: *const URL, out: *mut *mut AnyConnection, error: *mut *mut ErrorHandle) -> Status {
     let (Some(runtime), Some(client), Some(url)) = (unsafe { runtime.as_ref() }, unsafe { client.as_ref() }, unsafe { url.as_ref() })
     else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
@@ -444,7 +442,6 @@ pub unsafe extern "C" fn soyokaze_connection_role(connection: *const AnyConnecti
         None => Role::build(Role::UserAgent),
     }
 }
-
 
 /// The connection's identifier, owned by the caller.
 ///

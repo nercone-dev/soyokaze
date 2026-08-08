@@ -118,7 +118,6 @@ impl StaticTable {
     }
 }
 
-
 /// The table of fields built up over one direction of a connection.
 ///
 /// Entries are indexed from the most recent, so an index means something

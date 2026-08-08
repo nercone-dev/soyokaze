@@ -1,6 +1,6 @@
 //! The vocabulary a message is held in.
 //!
-//! [`Headers`], [`Message`], [`Url`] and the message-level concerns built on
+//! [`Headers`], [`Message`], [`URL`] and the message-level concerns built on
 //! them — cookies, HSTS, and what a response is finalised with. These sit
 //! between the codecs and the connections: every request crosses all of them
 //! once, whichever version framed it.
@@ -16,8 +16,8 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use soyokaze::cookies::{Cookie, CookieJar, SetCookie};
-use soyokaze::hsts::{HstsPolicy, HstsStore};
-use soyokaze::models::{Headers, Message, Method, Url, Version};
+use soyokaze::hsts::{HSTSPolicy, HSTSStore};
+use soyokaze::models::{Headers, Message, Method, URL, Version};
 use soyokaze::responses::Status;
 use soyokaze::DateCache;
 
@@ -81,18 +81,18 @@ fn messages() {
         request
     });
 
-    let mut group = Group::new("models::Url::parse");
+    let mut group = Group::new("models::URL::parse");
     for (name, url) in [
         ("origin only", "https://www.example.com/"),
         ("a long path", "https://www.example.com/assets/app.7f3c9a2b.module.js?v=3&locale=en-GB"),
         ("an explicit port", "https://www.example.com:8443/index.html"),
         ("an IPv6 literal", "https://[2001:db8::1]:8443/index.html"),
     ] {
-        group.throughput(name, url.len(), || Url::parse(black_box(url)));
+        group.throughput(name, url.len(), || URL::parse(black_box(url)));
     }
 
-    let parsed = Url::parse("https://www.example.com:8443/index.html").expect("the fixture URL did not parse");
-    group.time("Url::authority", || black_box(&parsed).authority());
+    let parsed = URL::parse("https://www.example.com:8443/index.html").expect("the fixture URL did not parse");
+    group.time("URL::authority", || black_box(&parsed).authority());
 }
 
 fn cookies() {
@@ -111,7 +111,7 @@ fn cookies() {
     group.throughput("build (every attribute)", SET_COOKIE.len(), || black_box(&set).build());
 
     let mut group = Group::new("cookies::CookieJar");
-    let url = Url::parse("https://www.example.com/index.html").expect("the fixture URL did not parse");
+    let url = URL::parse("https://www.example.com/index.html").expect("the fixture URL did not parse");
     let now = Instant::now();
 
     group.time("learn (one cookie)", || {
@@ -132,22 +132,22 @@ fn cookies() {
 }
 
 fn hsts() {
-    let mut group = Group::new("hsts::HstsPolicy");
-    group.time("parse", || HstsPolicy::parse(black_box("max-age=31536000; includeSubDomains; preload")));
+    let mut group = Group::new("hsts::HSTSPolicy");
+    group.time("parse", || HSTSPolicy::parse(black_box("max-age=31536000; includeSubDomains; preload")));
 
-    let policy = HstsPolicy::parse("max-age=31536000; includeSubDomains").expect("the fixture policy did not parse");
+    let policy = HSTSPolicy::parse("max-age=31536000; includeSubDomains").expect("the fixture policy did not parse");
     group.time("build", || black_box(&policy).build());
 
-    let mut group = Group::new("hsts::HstsStore");
+    let mut group = Group::new("hsts::HSTSStore");
     let now = Instant::now();
 
-    let store = HstsStore::new();
+    let store = HSTSStore::new();
     store.learn("www.example.com", "max-age=31536000; includeSubDomains", true, now);
     group.time("secure (an exact match)", || store.secure(black_box("www.example.com"), now));
     group.time("secure (a subdomain)", || store.secure(black_box("api.www.example.com"), now));
     group.time("secure (a host never seen)", || store.secure(black_box("other.example"), now));
 
-    let crowded = HstsStore::new();
+    let crowded = HSTSStore::new();
     for index in 0..1_000 {
         crowded.learn(&format!("host{index}.example"), "max-age=31536000", true, now);
     }
@@ -163,7 +163,7 @@ fn finalizing() {
     group.time("format", || DateCache::format(black_box(1_382_386_401)));
 
     let mut group = Group::new("message finalizing");
-    let policy = HstsPolicy::new(31_536_000);
+    let policy = HSTSPolicy::new(31_536_000);
     let section = Section::response();
 
     group.time("finalize_response (plaintext)", || {

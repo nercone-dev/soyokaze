@@ -1,7 +1,7 @@
 //! HTTP Strict Transport Security.
 //!
-//! [`HstsPolicy`] is the `Strict-Transport-Security` field itself: a server
-//! builds one to send, a client parses one it received. [`HstsStore`] is the
+//! [`HSTSPolicy`] is the `Strict-Transport-Security` field itself: a server
+//! builds one to send, a client parses one it received. [`HSTSStore`] is the
 //! client-side memory of which hosts have asked to be reached over TLS only,
 //! which a [`Client`] consults before it dials.
 //!
@@ -12,14 +12,13 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::helpers::sync::lock;
+use crate::helpers::sync::Lock;
 use crate::helpers::text::Text;
 use crate::models::Limits;
 
-
 /// One `Strict-Transport-Security` policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HstsPolicy {
+pub struct HSTSPolicy {
     /// How many seconds the policy holds for. Zero withdraws it.
     pub max_age: i64,
     /// Whether the policy covers subdomains as well as the host itself.
@@ -28,11 +27,11 @@ pub struct HstsPolicy {
     pub preload: bool,
 }
 
-impl HstsPolicy {
+impl HSTSPolicy {
     /// Appends as much of `part` to `out` as fits, advancing `written`.
     ///
     /// Truncates rather than growing or failing, which is what lets
-    /// [`HstsPolicy::value`] build its field value on the stack.
+    /// [`HSTSPolicy::value`] build its field value on the stack.
     pub fn append(out: &mut [u8], written: &mut usize, part: &[u8]) {
         let end = (*written + part.len()).min(out.len());
         out[*written..end].copy_from_slice(&part[..end - *written]);
@@ -134,24 +133,24 @@ impl HstsPolicy {
     }
 }
 
-/// The ceilings an [`HstsStore`] keeps itself under.
+/// The ceilings an [`HSTSStore`] keeps itself under.
 ///
 /// The store's own, for the same reason [`CookieLimits`] is the jar's.
 ///
 /// [`CookieLimits`]: crate::cookies::CookieLimits
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HstsLimits {
+pub struct HSTSLimits {
     /// The number of hosts one store may remember.
     pub max_hsts_entries: u32,
 }
 
-impl Default for HstsLimits {
+impl Default for HSTSLimits {
     fn default() -> Self {
         Self { max_hsts_entries: 4096 }
     }
 }
 
-impl From<Limits> for HstsLimits {
+impl From<Limits> for HSTSLimits {
     fn from(limits: Limits) -> Self {
         Self { max_hsts_entries: limits.max_hsts_entries }
     }
@@ -161,25 +160,25 @@ impl From<Limits> for HstsLimits {
 ///
 /// The store is shared and internally locked, so a [`Client`] can consult the
 /// same store from every request. It holds at most
-/// [`HstsLimits::max_hsts_entries`] hosts, evicting whichever expires soonest
+/// [`HSTSLimits::max_hsts_entries`] hosts, evicting whichever expires soonest
 /// to make room.
 ///
 /// [`Client`]: crate::api::client::Client
-pub struct HstsStore {
+pub struct HSTSStore {
     /// Host to expiry and whether the policy covers subdomains.
     pub entries: Mutex<HashMap<String, (Instant, bool)>>,
     /// The ceilings the store keeps itself under.
-    pub limits: HstsLimits,
+    pub limits: HSTSLimits,
 }
 
-impl HstsStore {
-    /// An empty store with the default [`HstsLimits`].
+impl HSTSStore {
+    /// An empty store with the default [`HSTSLimits`].
     pub fn new() -> Self {
-        Self { entries: Mutex::new(HashMap::new()), limits: HstsLimits::default() }
+        Self { entries: Mutex::new(HashMap::new()), limits: HSTSLimits::default() }
     }
 
     /// The same store, bounded by `limits`.
-    pub fn with_limits(mut self, limits: impl Into<HstsLimits>) -> Self {
+    pub fn with_limits(mut self, limits: impl Into<HSTSLimits>) -> Self {
         self.limits = limits.into();
         self
     }
@@ -214,11 +213,11 @@ impl HstsStore {
             return;
         };
 
-        let Some(policy) = HstsPolicy::parse(header) else {
+        let Some(policy) = HSTSPolicy::parse(header) else {
             return;
         };
 
-        let mut entries = lock(&self.entries);
+        let mut entries = Lock::on(&self.entries);
 
         if policy.max_age <= 0 {
             entries.remove(&name);
@@ -250,7 +249,7 @@ impl HstsStore {
             return false;
         };
 
-        let mut entries = lock(&self.entries);
+        let mut entries = Lock::on(&self.entries);
         entries.retain(|_, (expiry, _)| *expiry > now);
 
         entries.iter().any(|(stored, (_, include_subdomains))| {
@@ -260,11 +259,11 @@ impl HstsStore {
 
     /// Drops every entry that has expired by `now`.
     pub fn prune(&self, now: Instant) {
-        lock(&self.entries).retain(|_, (expiry, _)| *expiry > now);
+        Lock::on(&self.entries).retain(|_, (expiry, _)| *expiry > now);
     }
 }
 
-impl Default for HstsStore {
+impl Default for HSTSStore {
     fn default() -> Self {
         Self::new()
     }

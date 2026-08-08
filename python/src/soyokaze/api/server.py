@@ -13,16 +13,12 @@ import ctypes
 import traceback
 
 from .. import ffi
-from ..errors import InvalidError, error_out, raise_for
+from ..errors import Error, InvalidError
 from ..ffi import library
-from ..models import Message, Version, ports_argument
-from ..runtime import default_runtime
+from ..models import Limits, Message, Port, Version
+from ..runtime import Runtime
 from ..websocket import WebSocketConnection
-from ..models import Limits
-
-def cores():
-    """How many threads the machine can run at once, or 1 if that cannot be found."""
-    return library.soyokaze_cores()
+from .cluster import Cluster
 
 class ServerLimits:
     """The limits a server applies on top of the per-message :class:`Limits`.
@@ -70,15 +66,15 @@ class ServerConfig:
     admission limits, ``SO_REUSEPORT`` on, and no identity, which leaves a
     TCP port in plaintext and a QUIC port unservable.
 
-    ``identity`` is an :class:`Identity`, ``tls`` a :class:`TlsConfig`,
-    ``ech`` an :class:`EchKeys`, and ``hsts`` an :class:`HstsPolicy`;
+    ``identity`` is an :class:`Identity`, ``tls`` a :class:`TLSConfig`,
+    ``ech`` an :class:`ECHKeys`, and ``hsts`` an :class:`HSTSPolicy`;
     ``certificate`` and ``key`` are the blob shorthand for an identity of one
     chain entry.
 
     :class:`Identity`: soyokaze.tls.Identity
-    :class:`TlsConfig`: soyokaze.tls.TlsConfig
-    :class:`EchKeys`: soyokaze.tls.EchKeys
-    :class:`HstsPolicy`: soyokaze.hsts.HstsPolicy
+    :class:`TLSConfig`: soyokaze.tls.TLSConfig
+    :class:`ECHKeys`: soyokaze.tls.ECHKeys
+    :class:`HSTSPolicy`: soyokaze.hsts.HSTSPolicy
     """
 
     def __init__(self, versions=None, limits=None, identity=None, certificate=None, key=None, tls=None, ech=None, hsts=None, reuseport=True):
@@ -117,12 +113,12 @@ class ServerConfig:
             struct.identity = self.identity.handle
 
         if self.certificate is not None:
-            certificate = ffi.slice_of(ffi.encoded(self.certificate))
+            certificate = ffi.Slice.of(ffi.Library.encoded(self.certificate))
             keepalive.append(certificate)
             struct.certificate = certificate
 
         if self.key is not None:
-            key = ffi.slice_of(ffi.encoded(self.key))
+            key = ffi.Slice.of(ffi.Library.encoded(self.key))
             keepalive.append(key)
             struct.key = key
 
@@ -135,51 +131,13 @@ class ServerConfig:
             struct.ech = self.ech.handle
 
         if self.hsts is not None:
-            hsts = ffi.HstsPolicy(self.hsts.max_age, self.hsts.include_subdomains, self.hsts.preload)
+            hsts = ffi.HSTSPolicy(self.hsts.max_age, self.hsts.include_subdomains, self.hsts.preload)
             keepalive.append(hsts)
             struct.hsts = ctypes.pointer(hsts)
 
         struct.reuseport = self.reuseport
         struct.keepalive = keepalive
         return struct
-
-def request_callback(handler):
-    """The C callback that hands each request to ``handler``.
-
-    A handler that raises answers with a bare ``500``, the way a null
-    response does, and the traceback goes to stderr rather than vanishing.
-    """
-
-    def answer(context, request):
-        try:
-            response = handler(Message(handle=request))
-            return response.take()
-        except BaseException:
-            traceback.print_exc()
-            return None
-
-    return ffi.ON_REQUEST(answer)
-
-def websocket_callback(handler):
-    """The C callback that hands each accepted WebSocket to ``handler``.
-
-    The socket is closed and freed when the handler returns without having
-    done so itself, so a handler may simply return when it is done.
-    """
-    if handler is None:
-        return ffi.ON_WEBSOCKET()
-
-    def run(context, socket):
-        connection = WebSocketConnection(socket)
-        try:
-            handler(connection)
-        except BaseException:
-            traceback.print_exc()
-        finally:
-            if connection.handle and not connection.closing():
-                connection.close()
-
-    return ffi.ON_WEBSOCKET(run)
 
 class ServerHandle:
     """A running server, as :meth:`Server.serve` returns it.
@@ -218,33 +176,6 @@ class ServerHandle:
             library.soyokaze_server_handle_close(self.runtime.handle, self.handle, -1.0 if timeout is None else timeout)
             self.handle = None
 
-class Cluster:
-    """A server running across several threads, as :meth:`Server.run` returns it."""
-
-    def __init__(self, handle, callbacks):
-        self.handle = handle
-        self.callbacks = callbacks
-
-    @property
-    def port(self):
-        """The port the first listener actually bound."""
-        return library.soyokaze_cluster_port(self.handle)
-
-    def ports(self):
-        """The port of every bound address."""
-        count = library.soyokaze_cluster_address_count(self.handle)
-        return [library.soyokaze_cluster_port_at(self.handle, index) for index in range(count)]
-
-    def workers(self):
-        """How many worker threads are running."""
-        return library.soyokaze_cluster_workers(self.handle)
-
-    def close(self, timeout=None):
-        """Stops every worker and waits for the threads to finish. This blocks."""
-        if self.handle:
-            library.soyokaze_cluster_close(self.handle, -1.0 if timeout is None else timeout)
-            self.handle = None
-
 class Server:
     """An HTTP server.
 
@@ -262,6 +193,46 @@ class Server:
             library.soyokaze_server_free(self.handle)
             self.handle = None
 
+    @classmethod
+    def request_callback(cls, handler):
+        """The C callback that hands each request to ``handler``.
+
+        A handler that raises answers with a bare ``500``, the way a null
+        response does, and the traceback goes to stderr rather than vanishing.
+        """
+
+        def answer(context, request):
+            try:
+                response = handler(Message(handle=request))
+                return response.take()
+            except BaseException:
+                traceback.print_exc()
+                return None
+
+        return ffi.ON_REQUEST(answer)
+
+    @classmethod
+    def websocket_callback(cls, handler):
+        """The C callback that hands each accepted WebSocket to ``handler``.
+
+        The socket is closed and freed when the handler returns without having
+        done so itself, so a handler may simply return when it is done.
+        """
+        if handler is None:
+            return ffi.ON_WEBSOCKET()
+
+        def run(context, socket):
+            connection = WebSocketConnection(socket)
+            try:
+                handler(connection)
+            except BaseException:
+                traceback.print_exc()
+            finally:
+                if connection.handle and not connection.closing():
+                    connection.close()
+
+        return ffi.ON_WEBSOCKET(run)
+
     def serve(self, handler, ports, on_websocket=None, runtime=None):
         """Binds every port and starts serving.
 
@@ -271,13 +242,13 @@ class Server:
         given, runs each accepted WebSocket, and upgrade requests are
         otherwise handed to ``handler`` like any other.
         """
-        runtime = runtime if runtime is not None else default_runtime()
-        callbacks = (request_callback(handler), websocket_callback(on_websocket))
-        array, structs = ports_argument(ports)
+        runtime = runtime if runtime is not None else Runtime.default()
+        callbacks = (self.request_callback(handler), self.websocket_callback(on_websocket))
+        array, structs = Port.array(ports)
 
         out = ctypes.c_void_p()
-        error = error_out()
-        raise_for(library.soyokaze_server_serve(runtime.handle, self.handle, callbacks[0], callbacks[1], None, array, len(ports), ctypes.byref(out), ctypes.byref(error)), error)
+        error = Error.out()
+        Error.raise_for(library.soyokaze_server_serve(runtime.handle, self.handle, callbacks[0], callbacks[1], None, array, len(ports), ctypes.byref(out), ctypes.byref(error)), error)
         return ServerHandle(out.value, runtime, callbacks)
 
     def run(self, handler, ports, workers=0, on_websocket=None):
@@ -287,10 +258,10 @@ class Server:
         takes one per core. Returns a :class:`Cluster` once every worker is
         ready, so a bind failure surfaces here.
         """
-        callbacks = (request_callback(handler), websocket_callback(on_websocket))
-        array, structs = ports_argument(ports)
+        callbacks = (self.request_callback(handler), self.websocket_callback(on_websocket))
+        array, structs = Port.array(ports)
 
         out = ctypes.c_void_p()
-        error = error_out()
-        raise_for(library.soyokaze_server_run(self.handle, callbacks[0], callbacks[1], None, array, len(ports), workers, ctypes.byref(out), ctypes.byref(error)), error)
+        error = Error.out()
+        Error.raise_for(library.soyokaze_server_run(self.handle, callbacks[0], callbacks[1], None, array, len(ports), workers, ctypes.byref(out), ctypes.byref(error)), error)
         return Cluster(out.value, callbacks)

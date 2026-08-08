@@ -34,7 +34,7 @@ use soyokaze::ffi::api::server::{
     soyokaze_server_serve,
 };
 use soyokaze::ffi::responses::soyokaze_response_with_body;
-use soyokaze::ffi::tls::{soyokaze_tls_config_default, TlsConfig};
+use soyokaze::ffi::tls::{soyokaze_tls_config_default, TLSConfig};
 use soyokaze::ffi::{
     soyokaze_buffer_free, soyokaze_runtime_free, soyokaze_runtime_new, soyokaze_version, Buffer, Runtime, Slice,
 };
@@ -76,9 +76,9 @@ fn every_status_carries_a_description() {
         Status::Limit,
         Status::Stream,
         Status::Timeout,
-        Status::Tls,
+        Status::TLS,
         Status::Version,
-        Status::Io,
+        Status::IO,
         Status::Invalid,
         Status::Runtime,
     ];
@@ -130,9 +130,9 @@ fn a_failure_that_names_no_stream_reads_as_absent_rather_than_zero() {
         soyokaze::Error::Protocol("bad".into()),
         soyokaze::Error::Limit("too much".into()),
         soyokaze::Error::Timeout("too slow".into()),
-        soyokaze::Error::Tls("no handshake".into()),
+        soyokaze::Error::TLS("no handshake".into()),
         soyokaze::Error::Version("no version".into()),
-        soyokaze::Error::Io(std::io::Error::other("broken")),
+        soyokaze::Error::IO(std::io::Error::other("broken")),
     ] {
         let mut error = ptr::null_mut();
         unsafe { ErrorHandle::report(&mut error, &failure) };
@@ -382,7 +382,7 @@ fn a_body_that_names_a_file_is_read_only_when_it_is_asked_for() {
 
     let mut error: *mut ErrorHandle = ptr::null_mut();
     buffer = Buffer::EMPTY;
-    assert_eq!(unsafe { soyokaze_message_body(runtime, message, &mut buffer, &mut error) }, Status::Io);
+    assert_eq!(unsafe { soyokaze_message_body(runtime, message, &mut buffer, &mut error) }, Status::IO);
     assert!(!error.is_null());
     unsafe { soyokaze_error_free(error) };
 
@@ -441,7 +441,7 @@ fn a_tls_config_defaults_to_changing_nothing() {
 #[test]
 fn a_tls_config_is_read_into_a_client_and_text_that_is_not_utf8_is_refused() {
     let (groups, groups_len) = text("X25519:P-256");
-    let tls = TlsConfig { groups: Slice { data: groups, len: groups_len }, ..soyokaze_tls_config_default() };
+    let tls = TLSConfig { groups: Slice { data: groups, len: groups_len }, ..soyokaze_tls_config_default() };
     let config = ClientConfig { tls: &tls, ..ClientConfig::DEFAULT };
 
     let client = unsafe { soyokaze_client_new(&config) };
@@ -449,7 +449,7 @@ fn a_tls_config_is_read_into_a_client_and_text_that_is_not_utf8_is_refused() {
     unsafe { soyokaze_client_free(client) };
 
     let bogus = [0xffu8, 0xfe];
-    let tls = TlsConfig { ciphers: Slice { data: bogus.as_ptr(), len: bogus.len() }, ..soyokaze_tls_config_default() };
+    let tls = TLSConfig { ciphers: Slice { data: bogus.as_ptr(), len: bogus.len() }, ..soyokaze_tls_config_default() };
     let config = ClientConfig { tls: &tls, ..ClientConfig::DEFAULT };
 
     assert!(unsafe { soyokaze_client_new(&config) }.is_null(), "a list that is not UTF-8 is refused rather than mangled");
@@ -929,11 +929,11 @@ fn a_jar_returns_matching_cookies_and_a_zero_age_deletes() {
 fn an_hsts_policy_and_store_follow_rfc_6797() {
     use soyokaze::ffi::hsts::{
         soyokaze_hsts_policy_build, soyokaze_hsts_policy_parse, soyokaze_hsts_store_free, soyokaze_hsts_store_learn,
-        soyokaze_hsts_store_new, soyokaze_hsts_store_prune, soyokaze_hsts_store_secure, HstsPolicy,
+        soyokaze_hsts_store_new, soyokaze_hsts_store_prune, soyokaze_hsts_store_secure, HSTSPolicy,
     };
 
     let (value, value_len) = text("max-age=31536000; includeSubDomains");
-    let mut policy = HstsPolicy { max_age: 0, include_subdomains: false, preload: false };
+    let mut policy = HSTSPolicy { max_age: 0, include_subdomains: false, preload: false };
     assert!(unsafe { soyokaze_hsts_policy_parse(value, value_len, &mut policy) });
     assert_eq!(policy.max_age, 31536000);
     assert!(policy.include_subdomains && !policy.preload);
@@ -1164,7 +1164,7 @@ fn an_identity_is_built_from_blobs_and_a_bad_pkcs12_is_refused() {
     let mut error: *mut ErrorHandle = ptr::null_mut();
     assert_eq!(
         unsafe { soyokaze_identity_from_pkcs12(junk, junk_len, passphrase, passphrase_len, &mut parsed, &mut error) },
-        Status::Tls,
+        Status::TLS,
     );
     unsafe { soyokaze_error_free(error) };
 }

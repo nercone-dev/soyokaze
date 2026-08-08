@@ -33,22 +33,22 @@ pub enum Error {
     /// An operation ran past its deadline.
     Timeout(String),
     /// The TLS handshake failed, or a TLS object could not be built.
-    Tls(String),
+    TLS(String),
     /// No usable HTTP version could be agreed on.
     Version(String),
     /// The transport underneath failed.
-    Io(std::io::Error),
+    IO(std::io::Error),
 }
 
 impl Error {
-    /// Wraps a BoringSSL failure as an [`Error::Tls`].
+    /// Wraps a BoringSSL failure as an [`Error::TLS`].
     pub fn tls(error: impl fmt::Display) -> Self {
-        Self::Tls(error.to_string())
+        Self::TLS(error.to_string())
     }
 
-    /// Wraps a failure from the QUIC layer as an [`Error::Io`].
+    /// Wraps a failure from the QUIC layer as an [`Error::IO`].
     pub fn quic(error: impl fmt::Display) -> Self {
-        Self::Io(std::io::Error::other(error.to_string()))
+        Self::IO(std::io::Error::other(error.to_string()))
     }
 
     /// A [`Error::Stream`] for `id`, to be reset with `code`.
@@ -77,9 +77,9 @@ impl fmt::Display for Error {
             Self::Limit(reason) => write!(f, "limit exceeded: {reason}"),
             Self::Stream { id, code, reason } => write!(f, "stream {} failed with {code:#x}: {reason}", id.0),
             Self::Timeout(reason) => write!(f, "timed out: {reason}"),
-            Self::Tls(reason) => write!(f, "tls error: {reason}"),
+            Self::TLS(reason) => write!(f, "tls error: {reason}"),
             Self::Version(reason) => write!(f, "version negotiation failed: {reason}"),
-            Self::Io(err) => write!(f, "io error: {err}"),
+            Self::IO(err) => write!(f, "io error: {err}"),
         }
     }
 }
@@ -88,7 +88,7 @@ impl std::error::Error for Error {}
 
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
-        Self::Io(err)
+        Self::IO(err)
     }
 }
 

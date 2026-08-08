@@ -9,7 +9,7 @@
 
 use soyokaze::models::{Message, Method, Port};
 use soyokaze::protocol::base::{AnyConnection, Connection};
-use soyokaze::{Client, Handler, Server, Url};
+use soyokaze::{Client, Handler, Server, URL};
 
 struct Greeter;
 
@@ -38,7 +38,7 @@ async fn main() -> Result<(), soyokaze::Error> {
     let address = handle.address().expect("the server bound no address");
 
     let client = Client::default();
-    let url = Url::parse(&format!("http://{address}/"))?;
+    let url = URL::parse(&format!("http://{address}/"))?;
     let mut connection = client.open(&url).await?;
 
     for target in ["/", "/soyokaze"] {

@@ -125,7 +125,7 @@ pub mod protocol {
 
     pub use base::{AnyConnection, Connection, Stream, Transport};
     pub use handler::{Incoming, Negotiation};
-    pub use quic::{QuicDialer, QuicListener, QuicTransport};
+    pub use quic::{QUICDialer, QUICListener, QUICTransport};
     pub use h1::{H1Connection, H1Limits};
     pub use h2::{H2Connection, H2Limits};
     pub use h3::{H3Connection, H3Limits};
@@ -151,15 +151,15 @@ pub mod helpers {
 }
 
 pub use errors::Error;
-pub use models::{Alpn, Body, ConnectionID, HeaderCase, Headers, Limits, Message, Method, Port, Role, StreamID, TransportKind, Url, Version};
+pub use models::{ALPN, Body, ConnectionID, HeaderCase, Headers, Limits, Message, Method, Port, Role, StreamID, TransportKind, URL, Version};
 pub use cookies::{Cookie, CookieJar, CookieLimits, SameSite, SetCookie};
 pub use finalizer::{DateCache, RequestFinalizer, ResponseFinalizer};
 pub use api::common::VERSIONS;
 pub use api::client::{Client, ClientConfig, ClientLimits};
 pub use api::server::{Handler, RawSocket, Server, ServerConfig, ServerLimits};
 pub use api::gate::{Gate, Permit};
-pub use api::cluster::{cores, Cluster};
-pub use tls::{EchConfig, EchConfigList, EchKeys, EchStatus, Format, Identity, Security, TLSCipher, TLSGroup, TLSVersion};
-pub use hsts::{HstsLimits, HstsPolicy, HstsStore};
+pub use api::cluster::Cluster;
+pub use tls::{ECHConfig, ECHConfigList, ECHKeys, ECHStatus, Format, Identity, Security, TLSCipher, TLSGroup, TLSVersion};
+pub use hsts::{HSTSLimits, HSTSPolicy, HSTSStore};
 pub use helpers::text::Text;
 pub use websocket::{WebSocketConnection, WebSocketLimits};

@@ -2,23 +2,23 @@
 //!
 //! Everything here builds on BoringSSL. The version of HTTP a connection ends
 //! up speaking is decided during the handshake by ALPN, so this module is
-//! where negotiation happens: [`TlsConfig::client`] and [`TlsConfig::server`]
-//! offer the versions, and [`Alpn::negotiated`] reads back what was chosen.
+//! where negotiation happens: [`TLSConfig::client`] and [`TLSConfig::server`]
+//! offer the versions, and [`ALPN::negotiated`] reads back what was chosen.
 //!
-//! What the handshake settled is read back here too: [`Alpn::negotiated`]
+//! What the handshake settled is read back here too: [`ALPN::negotiated`]
 //! gives the HTTP version, and [`Security::of`] the TLS version, group and
 //! cipher suite that every message crossing the connection is then stamped
 //! with.
 //!
-//! [`Alpn::negotiated`]: crate::models::Alpn::negotiated
+//! [`ALPN::negotiated`]: crate::models::ALPN::negotiated
 //!
 //! How a context is tuned beyond its identity and roots — cipher suites,
 //! groups, signature algorithms, session tickets, early data and certificate
-//! compression — is what [`TlsConfig`] carries, and both sides take one.
+//! compression — is what [`TLSConfig`] carries, and both sides take one.
 //!
 //! Encrypted Client Hello encrypts the server name in the handshake, so a
-//! watcher sees only the public name. [`EchKeys`] is what a server holds,
-//! [`EchConfigList`] is what a client is given, and [`EchStatus`] is how
+//! watcher sees only the public name. [`ECHKeys`] is what a server holds,
+//! [`ECHConfigList`] is what a client is given, and [`ECHStatus`] is how
 //! either finds out whether it was actually used.
 //!
 //! Certificates and keys are taken in whichever encoding they arrive in:
@@ -43,11 +43,18 @@ use boring::x509::X509;
 use foreign_types::{ForeignType, ForeignTypeRef};
 
 use crate::errors::Error;
-use crate::models::{Alpn, Message, Version};
+use crate::models::{ALPN, Message, Version};
 
 /// A TLS protocol version, as the two-octet code that appears on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TLSVersion(pub u16);
+
+impl TLSVersion {
+    /// TLS 1.3, which is the version QUIC carries.
+    ///
+    /// RFC 9001 admits nothing older underneath QUIC version 1.
+    pub const V1_3: Self = Self(0x0304);
+}
 
 /// A TLS cipher suite, as the two-octet code that appears on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,11 +63,6 @@ pub struct TLSCipher(pub u16);
 /// A TLS named group, as the two-octet code that appears on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TLSGroup(pub u16);
-
-/// The wire code for TLS 1.3, which is the version QUIC carries.
-///
-/// RFC 9001 admits nothing older underneath QUIC version 1.
-pub const TLS_1_3: u16 = 0x0304;
 
 /// What the transport underneath a connection turned out to be.
 ///
@@ -101,7 +103,7 @@ pub struct Security {
 impl Security {
     /// Reads the transport facts off a completed handshake.
     ///
-    /// The counterpart of [`Alpn::negotiated`]: that reads back which HTTP
+    /// The counterpart of [`ALPN::negotiated`]: that reads back which HTTP
     /// version was chosen, this reads back everything else the handshake
     /// settled — the TLS version, named group and cipher suite as their wire
     /// codes, and whether the peer's first flight was accepted as early data. A
@@ -134,7 +136,7 @@ impl Security {
         Self {
             secure: true,
             tls: true,
-            tls_version: Some(TLSVersion(TLS_1_3)),
+            tls_version: Some(TLSVersion::V1_3),
             quic: true,
             quic_version: version,
             ..Self::default()
@@ -162,9 +164,9 @@ impl Security {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     /// Binary DER.
-    Der,
+    DER,
     /// Base64 DER between armour lines.
-    Pem,
+    PEM,
 }
 
 impl Format {
@@ -179,8 +181,8 @@ impl Format {
     /// a human-readable description of what follows.
     pub fn of(raw: &[u8]) -> Self {
         match raw.iter().find(|byte| !byte.is_ascii_whitespace()) {
-            Some(&Self::SEQUENCE) => Self::Der,
-            _ => Self::Pem,
+            Some(&Self::SEQUENCE) => Self::DER,
+            _ => Self::PEM,
         }
     }
 
@@ -193,16 +195,16 @@ impl Format {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when the blob will not parse, or when a PEM blob
+    /// Returns [`Error::TLS`] when the blob will not parse, or when a PEM blob
     /// carries no certificate at all.
     pub fn certificates(raw: &[u8]) -> Result<Vec<X509>, Error> {
         match Self::of(raw) {
-            Self::Der => Ok(vec![X509::from_der(raw).map_err(Error::tls)?]),
-            Self::Pem => {
+            Self::DER => Ok(vec![X509::from_der(raw).map_err(Error::tls)?]),
+            Self::PEM => {
                 let parsed = X509::stack_from_pem(raw).map_err(Error::tls)?;
 
                 if parsed.is_empty() {
-                    return Err(Error::Tls("PEM data carries no certificate".into()));
+                    return Err(Error::TLS("PEM data carries no certificate".into()));
                 }
 
                 Ok(parsed)
@@ -239,18 +241,18 @@ impl Format {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when the blob will not parse as any of those.
+    /// Returns [`Error::TLS`] when the blob will not parse as any of those.
     pub fn private_key(raw: &[u8]) -> Result<PKey<Private>, Error> {
         match Self::of(raw) {
-            Self::Der => PKey::private_key_from_der(raw).map_err(Error::tls),
-            Self::Pem => PKey::private_key_from_pem(raw).map_err(Error::tls),
+            Self::DER => PKey::private_key_from_der(raw).map_err(Error::tls),
+            Self::PEM => PKey::private_key_from_pem(raw).map_err(Error::tls),
         }
     }
 }
 
 /// The TLS details a context is built with, beyond its identity and roots.
 ///
-/// Every field has a working default, so `TlsConfig::default()` changes
+/// Every field has a working default, so `TLSConfig::default()` changes
 /// nothing about how a context would otherwise behave: the profile's cipher
 /// suites, BoringSSL's groups, every signature algorithm, the client's suite
 /// order, session tickets on, early data off and certificates uncompressed.
@@ -259,7 +261,7 @@ impl Format {
 /// and most preferred first — the same strings an Nginx `ssl_ciphers`,
 /// `ssl_ecdh_curve` or `SignatureAlgorithms` directive would carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TlsConfig {
+pub struct TLSConfig {
     /// The cipher suites to allow, for TLS 1.2 and 1.3 in one list.
     ///
     /// BoringSSL keeps a built-in preference order for the TLS 1.3 suites, so
@@ -302,7 +304,7 @@ pub struct TlsConfig {
     pub certificate_compression: bool,
 }
 
-impl Default for TlsConfig {
+impl Default for TLSConfig {
     fn default() -> Self {
         Self {
             ciphers: None,
@@ -316,12 +318,12 @@ impl Default for TlsConfig {
     }
 }
 
-impl TlsConfig {
+impl TLSConfig {
     /// Applies every setting to a context.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when BoringSSL rejects a list — a name it does
+    /// Returns [`Error::TLS`] when BoringSSL rejects a list — a name it does
     /// not know, or a list that leaves nothing usable.
     pub fn install(&self, builder: &mut SslContextBuilder) -> Result<(), Error> {
         if let Some(ciphers) = &self.ciphers {
@@ -361,7 +363,7 @@ impl TlsConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when a certificate will not parse or BoringSSL
+    /// Returns [`Error::TLS`] when a certificate will not parse or BoringSSL
     /// rejects the store.
     pub fn install_roots(roots: &[Vec<u8>], builder: &mut SslContextBuilder) -> Result<(), Error> {
         if roots.is_empty() {
@@ -387,11 +389,11 @@ impl TlsConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when BoringSSL rejects the configuration or a
+    /// Returns [`Error::TLS`] when BoringSSL rejects the configuration or a
     /// certificate will not parse.
     pub fn client(&self, roots: &[Vec<u8>], versions: &[Version]) -> Result<SslConnector, Error> {
         let mut builder = SslConnector::builder(SslMethod::tls()).map_err(Error::tls)?;
-        builder.set_alpn_protos(&Alpn::wire(versions)).map_err(Error::tls)?;
+        builder.set_alpn_protos(&ALPN::wire(versions)).map_err(Error::tls)?;
         Self::install_roots(roots, &mut builder)?;
         self.install(&mut builder)?;
 
@@ -405,16 +407,16 @@ impl TlsConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when the identity carries no certificate, when a
+    /// Returns [`Error::TLS`] when the identity carries no certificate, when a
     /// certificate or key will not parse, or when BoringSSL rejects the
     /// configuration.
-    pub fn server(&self, identity: &Identity, versions: &[Version], ech: Option<&EchKeys>) -> Result<SslAcceptor, Error> {
+    pub fn server(&self, identity: &Identity, versions: &[Version], ech: Option<&ECHKeys>) -> Result<SslAcceptor, Error> {
         let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).map_err(Error::tls)?;
         identity.install(&mut builder)?;
         self.install(&mut builder)?;
 
-        let offered = Alpn::list(versions);
-        builder.set_alpn_select_callback(move |_ssl, client| Alpn::select(&offered, client).ok_or(AlpnError::NOACK));
+        let offered = ALPN::list(versions);
+        builder.set_alpn_select_callback(move |_ssl, client| ALPN::select(&offered, client).ok_or(AlpnError::NOACK));
 
         if let Some(ech) = ech {
             ech.install(&builder)?;
@@ -430,7 +432,7 @@ impl TlsConfig {
     ///
     /// # Errors
     ///
-    /// As [`TlsConfig::client`].
+    /// As [`TLSConfig::client`].
     pub fn quic_client(&self, roots: &[Vec<u8>]) -> Result<SslContextBuilder, Error> {
         let mut builder = SslContextBuilder::new(SslMethod::tls()).map_err(Error::tls)?;
         Self::install_roots(roots, &mut builder)?;
@@ -448,8 +450,8 @@ impl TlsConfig {
     ///
     /// # Errors
     ///
-    /// As [`TlsConfig::server`].
-    pub fn quic_server(&self, identity: &Identity, ech: Option<&EchKeys>) -> Result<SslContextBuilder, Error> {
+    /// As [`TLSConfig::server`].
+    pub fn quic_server(&self, identity: &Identity, ech: Option<&ECHKeys>) -> Result<SslContextBuilder, Error> {
         let mut builder = SslContextBuilder::new(SslMethod::tls()).map_err(Error::tls)?;
         identity.install(&mut builder)?;
         self.install(&mut builder)?;
@@ -466,8 +468,8 @@ impl TlsConfig {
 /// Certificate compression with zlib, as RFC 8879 assigns it.
 ///
 /// Works in both directions, so the one algorithm serves a server, which
-/// compresses, and a client, which decompresses. [`TlsConfig::install`]
-/// registers it when [`TlsConfig::certificate_compression`] asks for it.
+/// compresses, and a client, which decompresses. [`TLSConfig::install`]
+/// registers it when [`TLSConfig::certificate_compression`] asks for it.
 pub struct ZlibCertificateCompressor;
 
 impl CertificateCompressor for ZlibCertificateCompressor {
@@ -523,7 +525,7 @@ impl Identity {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when the archive will not parse, the passphrase
+    /// Returns [`Error::TLS`] when the archive will not parse, the passphrase
     /// does not open it, it carries no certificate for its key, or its
     /// contents will not re-encode.
     pub fn from_pkcs12(raw: &[u8], passphrase: &str) -> Result<Self, Error> {
@@ -545,7 +547,7 @@ impl Identity {
         }
 
         let (Some(key), Some(leaf)) = (key, leaf) else {
-            return Err(Error::Tls("the PKCS#12 archive carries no certificate for its key".into()));
+            return Err(Error::TLS("the PKCS#12 archive carries no certificate for its key".into()));
         };
 
         let mut certificates = vec![leaf.to_der().map_err(Error::tls)?];
@@ -561,7 +563,7 @@ impl Identity {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when a certificate will not parse.
+    /// Returns [`Error::TLS`] when a certificate will not parse.
     pub fn chain(&self) -> Result<Vec<X509>, Error> {
         Format::certificate_list(&self.certificates)
     }
@@ -570,7 +572,7 @@ impl Identity {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when the key will not parse.
+    /// Returns [`Error::TLS`] when the key will not parse.
     pub fn private_key(&self) -> Result<PKey<Private>, Error> {
         Format::private_key(&self.key)
     }
@@ -579,11 +581,11 @@ impl Identity {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when the identity carries no certificate, when a
+    /// Returns [`Error::TLS`] when the identity carries no certificate, when a
     /// certificate or the key will not parse, or when BoringSSL rejects them.
     pub fn install(&self, builder: &mut SslContextBuilder) -> Result<(), Error> {
         let mut chain = self.chain()?.into_iter();
-        let leaf = chain.next().ok_or_else(|| Error::Tls("identity has no certificate".into()))?;
+        let leaf = chain.next().ok_or_else(|| Error::TLS("identity has no certificate".into()))?;
         builder.set_certificate(&leaf).map_err(Error::tls)?;
 
         for extra in chain {
@@ -596,16 +598,13 @@ impl Identity {
     }
 }
 
-/// The ECHConfig version this crate understands.
-pub const ECH_VERSION: u16 = 0xfe0d;
-
 /// One ECH configuration, as far as a client needs to read it.
 ///
 /// The public key and cipher suites stay in the raw config that BoringSSL is
 /// given; only the fields a caller might want to inspect are lifted out.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EchConfig {
-    /// The config version; always [`ECH_VERSION`] here.
+pub struct ECHConfig {
+    /// The config version; always [`ECHConfig::VERSION`] here.
     pub version: u16,
     /// The name that appears in the outer, visible handshake.
     pub public_name: String,
@@ -613,14 +612,19 @@ pub struct EchConfig {
     pub maximum_name_length: u8,
 }
 
-/// A list of ECH configurations, as published for a host.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EchConfigList {
-    /// The configurations of a version this crate understands.
-    pub configs: Vec<EchConfig>,
+impl ECHConfig {
+    /// The ECHConfig version this crate understands.
+    pub const VERSION: u16 = 0xfe0d;
 }
 
-impl EchConfigList {
+/// A list of ECH configurations, as published for a host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ECHConfigList {
+    /// The configurations of a version this crate understands.
+    pub configs: Vec<ECHConfig>,
+}
+
+impl ECHConfigList {
     /// Parses a published `ECHConfigList`.
     ///
     /// Configurations of other versions are skipped rather than rejected,
@@ -628,18 +632,18 @@ impl EchConfigList {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when the list is too short, its declared length
+    /// Returns [`Error::TLS`] when the list is too short, its declared length
     /// disagrees with its contents, a config runs past the end, or nothing in
     /// it is of a supported version.
     pub fn parse(raw: &[u8]) -> Result<Self, Error> {
         if raw.len() < 2 {
-            return Err(Error::Tls("ECHConfigList is too short".into()));
+            return Err(Error::TLS("ECHConfigList is too short".into()));
         }
 
         let declared = u16::from_be_bytes([raw[0], raw[1]]) as usize;
         let body = &raw[2..];
         if declared != body.len() {
-            return Err(Error::Tls("ECHConfigList length does not match its contents".into()));
+            return Err(Error::TLS("ECHConfigList length does not match its contents".into()));
         }
 
         let mut configs = Vec::new();
@@ -652,9 +656,9 @@ impl EchConfigList {
 
             let contents = body
                 .get(offset..offset + size)
-                .ok_or_else(|| Error::Tls("an ECHConfig runs past the list".into()))?;
+                .ok_or_else(|| Error::TLS("an ECHConfig runs past the list".into()))?;
 
-            if version == ECH_VERSION {
+            if version == ECHConfig::VERSION {
                 configs.push(Self::contents(contents)?);
             }
 
@@ -662,7 +666,7 @@ impl EchConfigList {
         }
 
         if configs.is_empty() {
-            return Err(Error::Tls("ECHConfigList carries no supported ECHConfig".into()));
+            return Err(Error::TLS("ECHConfigList carries no supported ECHConfig".into()));
         }
 
         Ok(Self { configs })
@@ -672,11 +676,11 @@ impl EchConfigList {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when the config is too short or any of its
+    /// Returns [`Error::TLS`] when the config is too short or any of its
     /// length-prefixed parts runs past the end.
-    pub fn contents(raw: &[u8]) -> Result<EchConfig, Error> {
+    pub fn contents(raw: &[u8]) -> Result<ECHConfig, Error> {
         if raw.len() < 5 {
-            return Err(Error::Tls("ECHConfig is too short".into()));
+            return Err(Error::TLS("ECHConfig is too short".into()));
         }
 
         let key_length = u16::from_be_bytes([raw[3], raw[4]]) as usize;
@@ -685,21 +689,21 @@ impl EchConfigList {
         let cipher_length = raw
             .get(offset..offset + 2)
             .map(|slice| u16::from_be_bytes([slice[0], slice[1]]) as usize)
-            .ok_or_else(|| Error::Tls("ECHConfig ends inside its cipher suites".into()))?;
+            .ok_or_else(|| Error::TLS("ECHConfig ends inside its cipher suites".into()))?;
         offset += 2 + cipher_length;
 
-        let maximum_name_length = *raw.get(offset).ok_or_else(|| Error::Tls("ECHConfig has no maximum name length".into()))?;
+        let maximum_name_length = *raw.get(offset).ok_or_else(|| Error::TLS("ECHConfig has no maximum name length".into()))?;
         offset += 1;
 
-        let name_length = *raw.get(offset).ok_or_else(|| Error::Tls("ECHConfig has no public name".into()))? as usize;
+        let name_length = *raw.get(offset).ok_or_else(|| Error::TLS("ECHConfig has no public name".into()))? as usize;
         offset += 1;
 
         let name = raw
             .get(offset..offset + name_length)
-            .ok_or_else(|| Error::Tls("ECHConfig public name runs past the config".into()))?;
+            .ok_or_else(|| Error::TLS("ECHConfig public name runs past the config".into()))?;
 
-        Ok(EchConfig {
-            version: ECH_VERSION,
+        Ok(ECHConfig {
+            version: ECHConfig::VERSION,
             public_name: String::from_utf8_lossy(name).into_owned(),
             maximum_name_length,
         })
@@ -710,16 +714,16 @@ impl EchConfigList {
 ///
 /// The config is what a client needs in order to encrypt its ClientHello; the
 /// private key is what the server decrypts it with. Publish
-/// [`EchKeys::config_list`] where clients can reach it.
+/// [`ECHKeys::config_list`] where clients can reach it.
 #[derive(Debug, Clone)]
-pub struct EchKeys {
+pub struct ECHKeys {
     /// One ECHConfig: version(2) || length(2) || contents.
     pub config: Vec<u8>,
     /// The raw X25519 HPKE private key (32 bytes).
     pub private_key: Vec<u8>,
 }
 
-impl EchKeys {
+impl ECHKeys {
     /// The KEM identifier written into the config: X25519 with HKDF-SHA256.
     pub const KEM_X25519_HKDF_SHA256: u16 = 0x0020;
     /// The KDF identifier written into the config: HKDF-SHA256.
@@ -768,7 +772,7 @@ impl EchKeys {
         contents.extend_from_slice(public_name.as_bytes());
         contents.extend_from_slice(&0u16.to_be_bytes());
 
-        let mut config = ECH_VERSION.to_be_bytes().to_vec();
+        let mut config = ECHConfig::VERSION.to_be_bytes().to_vec();
         config.extend_from_slice(&(contents.len() as u16).to_be_bytes());
         config.extend_from_slice(&contents);
         config
@@ -790,7 +794,7 @@ impl EchKeys {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when BoringSSL rejects the key or the config.
+    /// Returns [`Error::TLS`] when BoringSSL rejects the key or the config.
     pub fn install(&self, builder: &SslContextBuilder) -> Result<(), Error> {
         // boring's dhkem_p256_sha256 is misnamed: it initialises the key with
         // EVP_hpke_x25519_hkdf_sha256, matching KEM_X25519_HKDF_SHA256.
@@ -808,12 +812,12 @@ impl EchKeys {
 /// name — in which case the real server name travelled in the clear. Check
 /// this where that matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EchStatus {
+pub struct ECHStatus {
     /// Whether the server accepted the encrypted ClientHello.
     pub accepted: bool,
 }
 
-impl EchStatus {
+impl ECHStatus {
     /// Reads the status off a completed handshake.
     pub fn of(ssl: &boring::ssl::SslRef) -> Self {
         Self { accepted: ssl.ech_accepted() }

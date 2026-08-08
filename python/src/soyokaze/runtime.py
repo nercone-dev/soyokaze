@@ -31,11 +31,11 @@ class Runtime:
     def __del__(self):
         self.close()
 
-shared = None
+    shared = None
 
-def default_runtime():
-    """The runtime used when a call is not handed one, built on first use."""
-    global shared
-    if shared is None:
-        shared = Runtime()
-    return shared
+    @classmethod
+    def default(cls):
+        """The runtime used when a call is not handed one, built on first use."""
+        if cls.shared is None:
+            cls.shared = cls()
+        return cls.shared

@@ -7,7 +7,7 @@
 //!
 //! # Layout
 //!
-//! The modules mirror the crate they wrap: [`models`] carries [`Url`] and
+//! The modules mirror the crate they wrap: [`models`] carries [`URL`] and
 //! [`Message`], [`errors`] carries [`Error`] across the boundary, [`cookies`]
 //! carries the cookie types, [`hsts`] the HSTS policy,
 //! [`responses`] the response constructors,
@@ -18,7 +18,7 @@
 //! the crate's async surface into blocking calls.
 //!
 //! [`Error`]: crate::errors::Error
-//! [`Url`]: crate::models::Url
+//! [`URL`]: crate::models::URL
 //! [`Message`]: crate::models::Message
 //!
 //! # Conventions

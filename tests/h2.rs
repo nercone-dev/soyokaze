@@ -3,7 +3,7 @@ use tokio::io::AsyncWriteExt;
 
 use soyokaze::helpers::fields::HeaderField;
 use soyokaze::models::Limits;
-use soyokaze::hsts::HstsPolicy;
+use soyokaze::hsts::HSTSPolicy;
 use soyokaze::models::{Body, ConnectionID, Headers, Message, Method, Port, Role, StreamID, Version};
 use soyokaze::tls::Security;
 use soyokaze::protocol::base::{AnyConnection, Connection};
@@ -381,7 +381,7 @@ async fn a_configured_hsts_policy_rides_only_on_a_secure_transport() {
 
         let mut client = H2Connection::new(client_pipe, Role::UserAgent, id(), limits());
         let mut server = H2Connection::new(server_pipe, Role::Origin, id(), limits())
-            .with_response_finalizer(soyokaze::finalizer::ResponseFinalizer::new(Some(HstsPolicy::new(600))))
+            .with_response_finalizer(soyokaze::finalizer::ResponseFinalizer::new(Some(HSTSPolicy::new(600))))
             .with_security(Security { secure, ..Security::default() });
 
         client.start().await.expect("the client preface did not send");

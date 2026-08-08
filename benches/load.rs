@@ -84,7 +84,7 @@ fn bodies() {
 fn workers() {
     let mut group = Group::new("server workers under load");
 
-    for workers in [1usize, 2, 4, soyokaze::cores()] {
+    for workers in [1usize, 2, 4, soyokaze::Cluster::cores()] {
         let name = format!("http/1.1 on {workers} worker{}", if workers == 1 { "" } else { "s" });
         group.load(Workload { workers, ..Workload::new(name, Version::V1_1) });
     }

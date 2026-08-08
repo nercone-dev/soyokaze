@@ -10,7 +10,7 @@ use crate::ffi::Slice;
 /// What a call did, as a C enum.
 ///
 /// [`Status::Ok`] is zero and every failure is non-zero, so a call may be
-/// tested with `if (soyokaze_...(...))`. The variants past [`Status::Io`] have
+/// tested with `if (soyokaze_...(...))`. The variants past [`Status::IO`] have
 /// no [`Error`] behind them: they are raised by the boundary itself, before the
 /// crate is reached.
 #[repr(C)]
@@ -31,11 +31,11 @@ pub enum Status {
     /// An operation ran past its deadline.
     Timeout = 5,
     /// The TLS handshake failed, or a TLS object could not be built.
-    Tls = 6,
+    TLS = 6,
     /// No usable HTTP version could be agreed on.
     Version = 7,
     /// The transport underneath failed.
-    Io = 8,
+    IO = 8,
     /// An argument was null where it may not be, or was not UTF-8.
     Invalid = 9,
     /// The runtime could not be built, or the call was made without one.
@@ -51,9 +51,9 @@ impl Status {
             Error::Limit(_) => Self::Limit,
             Error::Stream { .. } => Self::Stream,
             Error::Timeout(_) => Self::Timeout,
-            Error::Tls(_) => Self::Tls,
+            Error::TLS(_) => Self::TLS,
             Error::Version(_) => Self::Version,
-            Error::Io(_) => Self::Io,
+            Error::IO(_) => Self::IO,
         }
     }
 
@@ -66,9 +66,9 @@ impl Status {
             Self::Limit => "limit exceeded",
             Self::Stream => "stream failed",
             Self::Timeout => "timed out",
-            Self::Tls => "tls error",
+            Self::TLS => "tls error",
             Self::Version => "version negotiation failed",
-            Self::Io => "io error",
+            Self::IO => "io error",
             Self::Invalid => "invalid argument",
             Self::Runtime => "runtime unavailable",
         }

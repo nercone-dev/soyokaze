@@ -3,7 +3,7 @@
 import pytest
 
 import soyokaze
-from soyokaze import Cookie, CookieJar, Message, SameSite, SetCookie, Url
+from soyokaze import Cookie, CookieJar, Message, SameSite, SetCookie, URL
 
 def test_a_cookie_field_parses_into_its_pairs():
     cookie = Cookie.parse('a=1; b="quoted"; malformed; =unnamed; a=repeated')
@@ -56,22 +56,22 @@ def test_a_setcookie_value_that_could_break_out_is_refused():
 
 def test_a_jar_returns_matching_cookies_and_forgets_deleted_ones():
     jar = CookieJar()
-    url = Url("https://example.test/a/b")
+    url = URL("https://example.test/a/b")
 
     jar.learn(url, ["sid=abc; Path=/a", "other=1; Domain=elsewhere.test"])
     assert jar.cookie(url) == "sid=abc", "a cookie for another domain must not be sent"
-    assert jar.cookie(Url("https://example.test/c")) is None, "the path must match"
+    assert jar.cookie(URL("https://example.test/c")) is None, "the path must match"
 
     jar.learn(url, ["sid=abc; Path=/a; Max-Age=0"])
     assert jar.cookie(url) is None, "a Max-Age of zero deletes"
 
 def test_a_secure_cookie_stays_off_plaintext():
     jar = CookieJar()
-    secure = Url("https://example.test/")
+    secure = URL("https://example.test/")
     jar.learn(secure, ["sid=abc; Secure"])
 
     assert jar.cookie(secure) == "sid=abc"
-    assert jar.cookie(Url("http://example.test/")) is None
+    assert jar.cookie(URL("http://example.test/")) is None
 
 def test_set_cookie_goes_onto_a_response_and_delete_zeroes_it():
     response = Message.response(200)

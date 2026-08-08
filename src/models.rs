@@ -25,7 +25,7 @@ pub enum TransportKind {
     /// An ordered byte stream: TCP, or a Unix domain socket.
     Stream,
     /// QUIC, over UDP.
-    Quic,
+    QUIC,
 }
 
 /// Somewhere a server listens or a client dials.
@@ -48,7 +48,7 @@ impl Port {
     pub fn transport(&self) -> TransportKind {
         match self {
             Self::UDS(_) | Self::TCP(_) => TransportKind::Stream,
-            Self::QUIC(_) => TransportKind::Quic,
+            Self::QUIC(_) => TransportKind::QUIC,
         }
     }
 
@@ -68,7 +68,7 @@ impl Port {
     pub fn offers(&self, versions: &[Version]) -> Vec<Version> {
         let mut offered: Vec<Version> = versions.iter().copied().filter(|version| self.carries(*version)).collect();
 
-        if self.transport() == TransportKind::Quic {
+        if self.transport() == TransportKind::QUIC {
             offered.truncate(1);
         }
 
@@ -79,10 +79,10 @@ impl Port {
 /// An absolute URL, split into the parts a request needs.
 ///
 /// `target` is the request target — the path, query and fragment as one string
-/// — and is never empty; [`Url::parse`] substitutes `/` when the URL carries
+/// — and is never empty; [`URL::parse`] substitutes `/` when the URL carries
 /// no path.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Url {
+pub struct URL {
     /// The scheme, lowercased (`http`, `https`, `ws`, `wss`, ...).
     pub scheme: String,
     /// The host, without the brackets an IPv6 literal wears in a URL.
@@ -93,7 +93,7 @@ pub struct Url {
     pub target: String,
 }
 
-impl Url {
+impl URL {
     /// The port a scheme implies: 443 for `https` and `wss`, 80 otherwise.
     pub fn default_port(scheme: &str) -> u16 {
         match scheme {
@@ -115,7 +115,7 @@ impl Url {
         Self::authority_of(&self.scheme, &self.host, self.port)
     }
 
-    /// [`Url::authority`] for parts that are not held in a [`Url`].
+    /// [`URL::authority`] for parts that are not held in a [`URL`].
     ///
     /// A caller that dialled a host and a port directly, rather than parsing a
     /// URL, still owes its requests the same authority.
@@ -228,7 +228,7 @@ impl Version {
     pub fn transport(&self) -> TransportKind {
         match self {
             Self::V1_0 | Self::V1_1 | Self::V2_0 => TransportKind::Stream,
-            Self::V3_0 => TransportKind::Quic,
+            Self::V3_0 => TransportKind::QUIC,
         }
     }
 
@@ -268,15 +268,15 @@ impl FromStr for Version {
 /// The mapping between a [`Version`] and its protocol identifier lives on
 /// [`Version::alpn`] and [`Version::from_alpn`]; what is here is the list
 /// handling around it — offering several, and reading back the choice.
-pub struct Alpn;
+pub struct ALPN;
 
-impl Alpn {
+impl ALPN {
     /// The ALPN protocol identifiers for a list of versions, one per entry.
     pub fn list(versions: &[Version]) -> Vec<Vec<u8>> {
         versions.iter().map(|version| version.alpn().as_bytes().to_vec()).collect()
     }
 
-    /// [`Alpn::list`] in wire form: each length-prefixed, run together.
+    /// [`ALPN::list`] in wire form: each length-prefixed, run together.
     pub fn wire(versions: &[Version]) -> Vec<u8> {
         let mut out = Vec::new();
 
@@ -611,7 +611,6 @@ pub struct Headers {
 }
 
 impl Headers {
-
     /// `1 << index` when `matched`, and zero otherwise.
     #[inline]
     pub fn bit(matched: bool, index: u32) -> u32 {
@@ -872,7 +871,6 @@ pub struct Message {
 }
 
 impl Message {
-
     /// Whether this message leaves its stream open as a tunnel.
     ///
     /// `method` is the method of the request the stream carries. A `CONNECT`

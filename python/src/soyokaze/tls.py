@@ -1,30 +1,28 @@
 """TLS identities, context details and Encrypted Client Hello.
 
-:class:`Identity` is what a server serves, :class:`TlsConfig` is how either
-side's context is tuned, :class:`EchKeys` is what a server offers ECH with,
-and :class:`EchConfigList` is what a client reads back out of what a server
+:class:`Identity` is what a server serves, :class:`TLSConfig` is how either
+side's context is tuned, :class:`ECHKeys` is what a server offers ECH with,
+and :class:`ECHConfigList` is what a client reads back out of what a server
 published — the same parts as the crate's ``tls`` module.
 """
 
 import ctypes
 
 from . import ffi
-from .errors import InvalidError, error_out, raise_for
+from .errors import Error, InvalidError
 from .ffi import library
 
-class TlsConfig:
+class TLSConfig:
     """The TLS details a context is built with, beyond its identity and roots.
 
-    Every field has a working default, so ``TlsConfig()`` changes nothing
+    Every field has a working default, so ``TLSConfig()`` changes nothing
     about how a context would otherwise behave. Each string is an OpenSSL
     list, entries separated by ``:`` and most preferred first; ``None`` keeps
     that field's default. BoringSSL keeps its built-in order for the TLS 1.3
     suites, so ``ciphers`` restricts and orders TLS 1.2.
     """
 
-    def __init__(self, ciphers=None, groups=None, signature_algorithms=None,
-                 prefer_server_ciphers=False, session_tickets=True, early_data=False,
-                 certificate_compression=False):
+    def __init__(self, ciphers=None, groups=None, signature_algorithms=None, prefer_server_ciphers=False, session_tickets=True, early_data=False, certificate_compression=False):
         self.ciphers = ciphers
         self.groups = groups
         self.signature_algorithms = signature_algorithms
@@ -44,7 +42,7 @@ class TlsConfig:
         for name in ("ciphers", "groups", "signature_algorithms"):
             value = getattr(self, name)
             if value is not None:
-                view = ffi.slice_of(ffi.encoded(value))
+                view = ffi.Slice.of(ffi.Library.encoded(value))
                 keepalive.append(view)
                 setattr(struct, name, view)
 
@@ -67,10 +65,10 @@ class Identity:
 
     def __init__(self, certificates=None, key=None, handle=None):
         if handle is None:
-            blobs = [ffi.encoded(certificate) for certificate in certificates]
-            slices = [ffi.slice_of(blob) for blob in blobs]
+            blobs = [ffi.Library.encoded(certificate) for certificate in certificates]
+            slices = [ffi.Slice.of(blob) for blob in blobs]
             array = (ffi.Slice * len(slices))(*slices)
-            encoded = ffi.encoded(key)
+            encoded = ffi.Library.encoded(key)
             handle = library.soyokaze_identity_new(array, len(slices), encoded, len(encoded))
             if not handle:
                 raise InvalidError("the chain or key was refused")
@@ -85,19 +83,19 @@ class Identity:
     def from_pkcs12(cls, data, passphrase=""):
         """An identity from a PKCS#12 archive, as ``.p12`` and ``.pfx`` files carry."""
         handle = ctypes.c_void_p()
-        error = error_out()
-        data = ffi.encoded(data)
-        passphrase = ffi.encoded(passphrase)
-        raise_for(library.soyokaze_identity_from_pkcs12(data, len(data), passphrase, len(passphrase), ctypes.byref(handle), ctypes.byref(error)), error)
+        error = Error.out()
+        data = ffi.Library.encoded(data)
+        passphrase = ffi.Library.encoded(passphrase)
+        Error.raise_for(library.soyokaze_identity_from_pkcs12(data, len(data), passphrase, len(passphrase), ctypes.byref(handle), ctypes.byref(error)), error)
         return cls(handle=handle)
 
-class EchKeys:
+class ECHKeys:
     """A server's ECH key pair, and the config that publishes its public half."""
 
     def __init__(self, config=None, private_key=None, handle=None):
         """Keys rebuilt from a stored config and private key, or a wrapper."""
         if handle is None:
-            config, private_key = ffi.encoded(config), ffi.encoded(private_key)
+            config, private_key = ffi.Library.encoded(config), ffi.Library.encoded(private_key)
             handle = library.soyokaze_ech_keys_new(config, len(config), private_key, len(private_key))
             if not handle:
                 raise InvalidError("the config or key was refused")
@@ -116,9 +114,9 @@ class EchKeys:
         name, and must be a name the server can present a certificate for.
         """
         handle = ctypes.c_void_p()
-        error = error_out()
-        encoded = ffi.encoded(public_name)
-        raise_for(library.soyokaze_ech_keys_generate(encoded, len(encoded), config_id, ctypes.byref(handle), ctypes.byref(error)), error)
+        error = Error.out()
+        encoded = ffi.Library.encoded(public_name)
+        Error.raise_for(library.soyokaze_ech_keys_generate(encoded, len(encoded), config_id, ctypes.byref(handle), ctypes.byref(error)), error)
         return cls(handle=handle)
 
     @property
@@ -136,9 +134,9 @@ class EchKeys:
 
         This is what goes in a client configuration's ECH mapping.
         """
-        return ffi.take(library.soyokaze_ech_keys_config_list(self.handle))
+        return library.soyokaze_ech_keys_config_list(self.handle).take()
 
-class EchConfig:
+class ECHConfig:
     """One ECH configuration, as far as a client needs to read it."""
 
     def __init__(self, version, public_name, maximum_name_length):
@@ -147,13 +145,21 @@ class EchConfig:
         self.maximum_name_length = maximum_name_length
 
     def __repr__(self):
-        return f"EchConfig({self.public_name!r})"
+        return f"ECHConfig({self.public_name!r})"
 
-class EchConfigList:
+class ECHConfigList:
     """A list of ECH configurations, as published for a host."""
 
     def __init__(self, configs):
         self.configs = configs
+
+    @classmethod
+    def entry(cls, handle, index):
+        """The version, public name and padded name length of one entry."""
+        version = library.soyokaze_ech_config_version(handle, index)
+        public_name = library.soyokaze_ech_config_public_name(handle, index).text()
+        maximum_name_length = library.soyokaze_ech_config_maximum_name_length(handle, index)
+        return version, public_name, maximum_name_length
 
     @classmethod
     def parse(cls, data):
@@ -162,18 +168,12 @@ class EchConfigList:
         Configurations of other versions are skipped rather than rejected.
         """
         handle = ctypes.c_void_p()
-        error = error_out()
-        data = ffi.encoded(data)
-        raise_for(library.soyokaze_ech_config_list_parse(data, len(data), ctypes.byref(handle), ctypes.byref(error)), error)
+        error = Error.out()
+        data = ffi.Library.encoded(data)
+        Error.raise_for(library.soyokaze_ech_config_list_parse(data, len(data), ctypes.byref(handle), ctypes.byref(error)), error)
 
-        configs = [
-            EchConfig(
-                library.soyokaze_ech_config_version(handle, index),
-                library.soyokaze_ech_config_public_name(handle, index).text(),
-                library.soyokaze_ech_config_maximum_name_length(handle, index),
-            )
-            for index in range(library.soyokaze_ech_config_list_count(handle))
-        ]
+        count = library.soyokaze_ech_config_list_count(handle)
+        configs = [ECHConfig(*cls.entry(handle, index)) for index in range(count)]
 
         library.soyokaze_ech_config_list_free(handle)
         return cls(configs)
