@@ -1,94 +1,42 @@
-use std::time::{Duration, Instant};
+//! The benchmark harness.
+//!
+//! A benchmark is a [`Group`] of [`Case`]s. Each case is measured under a
+//! [`Budget`], the measurement is held as a [`Measure`], and a [`Report`]
+//! writes it out. [`Filter`] decides which of them run, [`Fixtures`] holds the
+//! messages they are measured over, and [`load`] drives a real server over a
+//! loopback port for the runs that measure a whole stack rather than a piece
+//! of one.
+//!
+//! Every part is configurable from the environment, so a run can be made quick
+//! or thorough without touching a benchmark:
+//!
+//! | Variable                  | What it sets                            |
+//! |---------------------------|-----------------------------------------|
+//! | `SOYOKAZE_BENCH_TIME`     | Seconds each case is measured for       |
+//! | `SOYOKAZE_BENCH_FORMAT`   | `table` or `json`                       |
+//! | `SOYOKAZE_BENCH_ONLY`     | Which groups and cases run              |
+//! | `SOYOKAZE_LOAD_TIME`      | Seconds each load run lasts             |
+//! | `SOYOKAZE_LOAD_SCALE`     | Multiplier on every load run's clients  |
 
-pub fn budget() -> Duration {
-    let seconds = std::env::var("SOYOKAZE_BENCH_TIME")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|seconds| *seconds > 0.0)
-        .unwrap_or(0.5);
+#![allow(dead_code, unused_imports)]
 
-    Duration::from_secs_f64(seconds)
-}
+pub mod alloc;
+pub mod budget;
+pub mod case;
+pub mod figure;
+pub mod filter;
+pub mod fixtures;
+pub mod load;
+pub mod measure;
+pub mod report;
+pub mod sample;
 
-#[inline(always)]
-pub fn opaque<T>(value: T) -> T {
-    std::hint::black_box(value)
-}
-
-pub struct Group;
-
-impl Group {
-    pub fn new(name: &str) -> Self {
-        println!("\n{name}");
-        println!("{}", "-".repeat(name.len()));
-        Self
-    }
-
-    #[allow(dead_code)]
-    pub fn bench<T>(&mut self, case: &str, mut body: impl FnMut() -> T) {
-        self.report(case, measure(&mut body), None);
-    }
-
-    pub fn throughput<T>(&mut self, case: &str, octets: usize, mut body: impl FnMut() -> T) {
-        self.report(case, measure(&mut body), Some(octets));
-    }
-
-    fn report(&self, case: &str, seconds: f64, octets: Option<usize>) {
-        let rate = match octets {
-            Some(octets) if seconds > 0.0 => {
-                format!("  {:>8.1} MiB/s", octets as f64 / seconds / (1024.0 * 1024.0))
-            }
-            _ => String::new(),
-        };
-
-        println!("  {case:<38} {:>12}{rate}", human(seconds));
-    }
-}
-
-fn human(seconds: f64) -> String {
-    let nanos = seconds * 1e9;
-
-    match nanos {
-        _ if nanos < 1_000.0 => format!("{nanos:.1} ns"),
-        _ if nanos < 1_000_000.0 => format!("{:.2} us", nanos / 1e3),
-        _ => format!("{:.2} ms", nanos / 1e6),
-    }
-}
-
-fn measure<T>(body: &mut impl FnMut() -> T) -> f64 {
-    for _ in 0..16 {
-        opaque(body());
-    }
-
-    let mut batch = 1u32;
-    while batch < 1 << 22 {
-        let started = Instant::now();
-        for _ in 0..batch {
-            opaque(body());
-        }
-
-        if started.elapsed() >= Duration::from_micros(500) {
-            break;
-        }
-
-        batch *= 4;
-    }
-
-    let budget = budget();
-    let deadline = Instant::now() + budget;
-
-    let mut best = f64::INFINITY;
-    let mut batches = 0u32;
-
-    while Instant::now() < deadline || batches == 0 {
-        let started = Instant::now();
-        for _ in 0..batch {
-            opaque(body());
-        }
-
-        best = best.min(started.elapsed().as_secs_f64() / batch as f64);
-        batches += 1;
-    }
-
-    best
-}
+pub use alloc::Counter;
+pub use budget::Budget;
+pub use case::{Case, Group};
+pub use figure::Figure;
+pub use filter::Filter;
+pub use fixtures::{Fixtures, Payload, Section, Wire};
+pub use measure::Measure;
+pub use report::Report;
+pub use sample::{Sample, Samples};

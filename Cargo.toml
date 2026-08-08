@@ -33,15 +33,11 @@ lto = true
 codegen-units = 1
 
 [[bench]]
-name = "huffman"
+name = "helpers"
 harness = false
 
 [[bench]]
-name = "hpack"
-harness = false
-
-[[bench]]
-name = "qpack"
+name = "models"
 harness = false
 
 [[bench]]
@@ -49,9 +45,13 @@ name = "protocol"
 harness = false
 
 [[bench]]
-name = "pipeline"
+name = "websocket"
 harness = false
 
 [[bench]]
-name = "h3"
+name = "allocations"
+harness = false
+
+[[bench]]
+name = "load"
 harness = false
