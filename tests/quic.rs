@@ -179,3 +179,76 @@ fn a_websocket_over_quic_survives_more_writes_than_it_can_buffer() {
     cluster.close(Some(1.0));
     assert_eq!(echoed, messages, "the tunnel stopped carrying messages part way through");
 }
+
+#[test]
+fn a_connection_is_wound_down_at_its_request_ceiling() {
+    const CEILING: u64 = 8;
+
+    let certificate = certificate();
+
+    let mut config = ServerConfig {
+        versions: vec![Version::V3_0],
+        identity: Some(Identity::new(vec![certificate.der.clone()], certificate.key)),
+        ..ServerConfig::default()
+    };
+    config.limits.message.max_requests_per_connection = CEILING;
+
+    let cluster = Server::new(config).run(Echo, &[Port::QUIC(0)], 1).expect("the QUIC port did not open");
+    let port = cluster.address().expect("the cluster has no address").port();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("no runtime");
+
+    let served = runtime.block_on(async move {
+        let client = Client::new(ClientConfig {
+            versions: vec![Version::V3_0],
+            roots: Some(vec![certificate.der]),
+            ..ClientConfig::default()
+        });
+
+        let id = ConnectionID(Bytes::from_static(b"test"));
+        let mut connection = client
+            .connect_quic("localhost", port, id.clone(), "localhost")
+            .await
+            .expect("the client could not reach the server over QUIC");
+
+        let mut served = 0u64;
+        for _ in 0..CEILING * 2 {
+            let request = Message::request(Method::GET, "/index.html", Version::V3_0);
+
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), client.request(&mut connection, request))
+                .await
+                .expect("the connection neither answered nor wound down");
+
+            match outcome {
+                Ok(response) => {
+                    assert_eq!(response.status_code, Some(200));
+                    served += 1;
+                }
+                Err(_) => break,
+            }
+        }
+
+        connection.close().await;
+
+        // Winding one connection down must not cost the peer anything but a
+        // reconnect: a fresh connection is served as the first one was.
+        let mut fresh = client
+            .connect_quic("localhost", port, id, "localhost")
+            .await
+            .expect("a fresh connection was refused after the first wound down");
+
+        let request = Message::request(Method::GET, "/index.html", Version::V3_0);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), client.request(&mut fresh, request))
+            .await
+            .expect("the fresh connection never answered")
+            .expect("the fresh connection was not served");
+
+        assert_eq!(response.status_code, Some(200));
+        fresh.close().await;
+
+        served
+    });
+
+    cluster.close(Some(1.0));
+    assert_eq!(served, CEILING, "the connection did not serve exactly its ceiling before winding down");
+}

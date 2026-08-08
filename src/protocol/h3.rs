@@ -47,6 +47,8 @@ pub struct H3Limits {
     pub max_connection_buffer_size: u64,
     /// The number of streams a peer may reset before a response was sent.
     pub max_premature_resets: u32,
+    /// The number of requests one connection may serve over its lifetime (0 serves forever).
+    pub max_requests_per_connection: u64,
     /// In bytes, the largest QPACK encoder table this end will keep.
     pub max_encoder_table_size: u64,
     /// In seconds, how long to wait for a blocking QPACK reference to resolve.
@@ -85,6 +87,7 @@ impl From<Limits> for H3Limits {
             max_concurrent_streams: limits.max_concurrent_streams,
             max_connection_buffer_size: limits.max_connection_buffer_size,
             max_premature_resets: limits.max_premature_resets,
+            max_requests_per_connection: limits.max_requests_per_connection,
             max_encoder_table_size: limits.max_encoder_table_size,
             qpack_block_timeout: limits.qpack_block_timeout,
             max_peer_uni_streams: limits.max_peer_uni_streams,
@@ -192,6 +195,23 @@ pub struct H3Session {
 
     /// The next bidirectional stream this end will open.
     pub next_stream_id: u64,
+    /// The highest request stream the peer has opened so far.
+    pub highest_peer_stream_id: u64,
+    /// How many request streams the peer has opened over the connection's
+    /// lifetime, checked against [`Limits::max_requests_per_connection`].
+    pub total_streams: u64,
+
+    /// The identifier from the GOAWAY the peer sent, once one has arrived.
+    ///
+    /// The peer will take no request above it, so once the streams drain the
+    /// connection is done; the worker closes it and the handle reports
+    /// [`Error::Closed`], exactly as HTTP/2 does when its GOAWAY drains.
+    pub goaway: Option<u64>,
+    /// The identifier from the GOAWAY this end sent, once one has.
+    ///
+    /// Requests at or above it are refused with `REQUEST_REJECTED`, which
+    /// tells the peer they were not processed and may be retried elsewhere.
+    pub goaway_sent: Option<u64>,
 
     /// What the transport underneath turned out to be, stamped on every
     /// message this session hands over.
@@ -242,6 +262,10 @@ impl H3Session {
             buffered_bound: 0,
             control_recv: BytesMut::new(),
             next_stream_id,
+            highest_peer_stream_id: 0,
+            total_streams: 0,
+            goaway: None,
+            goaway_sent: None,
             security: std::sync::Arc::new(std::sync::Mutex::new(Security::quic(None))),
         }
     }
@@ -416,8 +440,9 @@ impl H3Session {
 
     /// Takes in octets from the peer's control stream.
     ///
-    /// GOAWAY, MAX_PUSH_ID and CANCEL_PUSH are accepted and ignored, since
-    /// push is disabled and there is nothing to wind down.
+    /// GOAWAY is recorded on [`H3Session::goaway`], so the worker can close
+    /// the connection once the remaining streams drain. MAX_PUSH_ID and
+    /// CANCEL_PUSH are accepted and ignored, since push is disabled.
     ///
     /// # Errors
     ///
@@ -445,7 +470,10 @@ impl H3Session {
                     }
                     self.apply_peer_settings(settings);
                 }
-                Frame::GoAway { .. } | Frame::MaxPushID { .. } | Frame::CancelPush { .. } => {}
+                Frame::GoAway { id } => {
+                    self.goaway = Some(self.goaway.map_or(id, |earlier| earlier.min(id)));
+                }
+                Frame::MaxPushID { .. } | Frame::CancelPush { .. } => {}
                 _ => return Err(Error::Protocol("an unexpected frame arrived on the control stream".into())),
             }
         }
@@ -479,9 +507,16 @@ impl H3Session {
     /// connection as a whole goes past
     /// [`Limits::max_connection_buffer_size`].
     pub fn on_stream_bytes(&mut self, stream_id: StreamID, bytes: &[u8], fin: bool) -> Result<(), Error> {
-        if !self.streams.contains_key(&stream_id) && self.streams.len() >= self.stream_ceiling() {
+        let created = !self.streams.contains_key(&stream_id);
+
+        if created && self.streams.len() >= self.stream_ceiling() {
             let reason = format!("more than {} streams are held open at once", self.stream_ceiling());
             return Err(Error::stream(stream_id, Code::EXCESSIVE_LOAD, reason));
+        }
+
+        if created {
+            self.total_streams += 1;
+            self.highest_peer_stream_id = self.highest_peer_stream_id.max(stream_id.0);
         }
 
         let state = self.streams.entry(stream_id).or_default();
@@ -1237,6 +1272,20 @@ pub struct H3Worker {
 
     /// How many streams the peer reset before a response was sent.
     pub premature_resets: u32,
+    /// How many streams arrived at or above the GOAWAY this end sent.
+    ///
+    /// Each is refused with `REQUEST_REJECTED`; a peer that keeps opening
+    /// them regardless is cut off once a whole generation's worth has been
+    /// turned away.
+    pub rejected: u32,
+    /// The first stream a rejection has not been counted for yet.
+    ///
+    /// A refused stream can surface several reads before the peer acts on
+    /// `STOP_SENDING`, and each would otherwise count again; this keeps
+    /// [`H3Worker::rejected`] a count of streams rather than of reads.
+    pub rejected_floor: u64,
+    /// Whether the connection has been closed after its GOAWAY drained.
+    pub drained: bool,
 
     /// The buffer the QUIC driver reads datagrams into.
     pub scratch: Vec<u8>,
@@ -1277,6 +1326,9 @@ impl H3Worker {
             outbound: common::StreamMap::default(),
             outbound_bytes: 0,
             premature_resets: 0,
+            rejected: 0,
+            rejected_floor: 0,
+            drained: false,
             scratch: vec![0u8; 64 * 1024],
             read: vec![0u8; 64 * 1024],
             readable: Vec::new(),
@@ -1509,10 +1561,88 @@ impl H3Worker {
         }
 
         if StreamId::is_bidi(stream_id) {
-            return self.session.on_stream_bytes(StreamID(stream_id), data, fin);
+            if self.session.goaway_sent.is_some_and(|id| stream_id >= id) && !self.session.streams.contains_key(&StreamID(stream_id)) {
+                return self.reject(transport, stream_id);
+            }
+
+            self.session.on_stream_bytes(StreamID(stream_id), data, fin)?;
+            return self.goaway(transport);
         }
 
         self.feed_uni(transport, stream_id, data, fin)
+    }
+
+    /// Sends GOAWAY once [`Limits::max_requests_per_connection`] is reached.
+    ///
+    /// Only an origin winds a connection down this way: a client's GOAWAY
+    /// speaks of pushes, which are disabled. The identifier is the first
+    /// stream after everything accepted so far, so nothing already taken in
+    /// is abandoned, and everything after it is refused by
+    /// [`H3Worker::reject`]. The connection closes when the peer, told that
+    /// nothing more will be served, closes it or drains and goes idle.
+    ///
+    /// # Errors
+    ///
+    /// As [`H3Worker::write`].
+    pub fn goaway(&mut self, transport: &mut impl QuicTransport) -> Result<(), Error> {
+        let limit = self.session.limits.max_requests_per_connection;
+
+        if self.session.role.is_client() || self.session.goaway_sent.is_some() || limit == 0 || self.session.total_streams < limit {
+            return Ok(());
+        }
+
+        let id = self.session.highest_peer_stream_id + StreamId::STEP;
+        let mut frame = BytesMut::new();
+        Frame::GoAway { id }.encode_into(&mut frame);
+
+        self.write(transport, self.local_control, &frame, false)?;
+        self.session.goaway_sent = Some(id);
+        Ok(())
+    }
+
+    /// Refuses a stream the peer opened past the GOAWAY this end sent.
+    ///
+    /// `REQUEST_REJECTED` tells the peer the request was not processed and is
+    /// safe to retry on another connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Limit`] when the peer keeps opening streams past the
+    /// GOAWAY instead of winding down, having first closed the connection.
+    pub fn reject(&mut self, transport: &mut impl QuicTransport, stream_id: u64) -> Result<(), Error> {
+        if stream_id >= self.rejected_floor {
+            self.rejected_floor = stream_id + StreamId::STEP;
+            self.rejected = self.rejected.saturating_add(1);
+        }
+
+        if self.rejected as usize > self.session.stream_ceiling() {
+            let reason = format!("more than {} streams arrived after GOAWAY", self.session.stream_ceiling());
+            return Err(self.overloaded(transport, reason));
+        }
+
+        let _ = transport.shutdown_write(stream_id, Code::REQUEST_REJECTED);
+        let _ = transport.shutdown_read(stream_id, Code::REQUEST_REJECTED);
+        Ok(())
+    }
+
+    /// Closes the connection once the peer's GOAWAY has drained.
+    ///
+    /// The peer will take nothing more, so once every stream has finished and
+    /// everything owed has been handed to QUIC the connection is done: it is
+    /// closed cleanly and the handle is told [`Error::Closed`], exactly as an
+    /// HTTP/2 connection reports itself once its GOAWAY drains.
+    pub fn wind_down(&mut self, transport: &mut impl QuicTransport) {
+        if self.drained || self.session.goaway.is_none() {
+            return;
+        }
+
+        if !self.session.streams.is_empty() || !self.session.ready.is_empty() || !self.outbound.is_empty() || !self.tunnels.is_empty() {
+            return;
+        }
+
+        self.drained = true;
+        let _ = transport.close(Code::NO_ERROR, b"");
+        let _ = self.events.try_send(H3Event::Failed(Error::Closed));
     }
 
     /// Feeds octets to a peer's unidirectional stream, forgetting it at end of
@@ -1760,6 +1890,7 @@ impl QuicApplication for H3Worker {
         outcome?;
 
         self.deliver_ready();
+        self.wind_down(qconn);
         Ok(())
     }
 
@@ -1819,6 +1950,7 @@ impl QuicApplication for H3Worker {
         }
 
         self.deliver_ready();
+        self.wind_down(qconn);
         Ok(())
     }
 }

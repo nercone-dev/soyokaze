@@ -324,6 +324,7 @@ impl Socket {
 
             Self::TCP(listener) => {
                 let (transport, address) = listener.accept().await?;
+                let _ = transport.set_nodelay(true);
                 Ok(Incoming::Stream { transport: Box::new(transport), id: ConnectionID(Bytes::from(address.to_string())) })
             }
 

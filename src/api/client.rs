@@ -17,6 +17,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use boring::ssl::SslConnector;
 use bytes::Bytes;
 use tokio::net::{TcpStream, UnixStream};
 
@@ -126,6 +127,9 @@ pub struct Client {
     pub jar: Option<Arc<CookieJar>>,
     /// The HSTS store, unless [`ClientConfig::hsts`] turned it off.
     pub store: Option<Arc<HstsStore>>,
+    /// The TLS configuration dials go out with, built by [`Client::connector`]
+    /// on the first secure dial and reused for every one after it.
+    pub connector: std::sync::OnceLock<SslConnector>,
 }
 
 impl Default for Client {
@@ -140,7 +144,36 @@ impl Client {
         let jar = config.cookies.then(|| Arc::new(CookieJar::new().with_limits(config.limits.message)));
         let store = config.hsts.then(|| Arc::new(HstsStore::new().with_limits(config.limits.message)));
 
-        Self { config, jar, store }
+        Self { config, jar, store, connector: std::sync::OnceLock::new() }
+    }
+
+    /// The TLS configuration this client dials with.
+    ///
+    /// Built from [`ClientConfig::tls`], [`ClientConfig::roots`] and the
+    /// stream-capable [`ClientConfig::versions`] on the first call, and reused
+    /// for every dial after it — loading the trust store and building a
+    /// context are far more expensive than the per-dial handshake state, so
+    /// they are paid once per client rather than once per connection.
+    /// Changing the configuration after the first dial does not rebuild it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Version`] when no configured version runs over a
+    /// stream transport, and otherwise as [`TlsConfig::client`].
+    ///
+    /// [`TlsConfig::client`]: crate::tls::TlsConfig::client
+    pub fn connector(&self) -> Result<&SslConnector, Error> {
+        if let Some(connector) = self.connector.get() {
+            return Ok(connector);
+        }
+
+        let versions: Vec<Version> = self.config.versions.iter().copied().filter(|version| version.transport() == TransportKind::Stream).collect();
+        if versions.is_empty() {
+            return Err(Error::Version("no configured version runs over a stream transport".into()));
+        }
+
+        let connector = self.config.tls.client(self.config.roots.as_deref().unwrap_or(&[]), &versions)?;
+        Ok(self.connector.get_or_init(|| connector))
     }
 
     /// The ECH configuration list to use for a host, if one was configured.
@@ -204,6 +237,7 @@ impl Client {
 
                 Port::TCP(port) => {
                     let transport = TcpStream::connect((host, port)).await?;
+                    let _ = transport.set_nodelay(true);
                     self.connect_stream(host, Box::new(transport), id, &authority).await
                 }
 
@@ -247,7 +281,7 @@ impl Client {
             return Err(Error::Version("no configured version runs over a stream transport".into()));
         }
 
-        let connector = self.config.tls.client(self.config.roots.as_deref().unwrap_or(&[]), &versions)?;
+        let connector = self.connector()?;
         let mut config = connector.configure().map_err(|err| Error::Tls(err.to_string()))?;
 
         if let Some(list) = self.ech(host) {
@@ -417,6 +451,7 @@ impl Client {
         sync::Timeout::within(self.config.limits.connection_timeout, async move {
             if !url.secure() {
                 let transport = TcpStream::connect((url.host.as_str(), url.port)).await?;
+                let _ = transport.set_nodelay(true);
                 return self.assemble(self.prior_version()?, Box::new(transport), id, &authority).await;
             }
 
@@ -425,6 +460,7 @@ impl Client {
             }
 
             let transport = TcpStream::connect((url.host.as_str(), url.port)).await?;
+            let _ = transport.set_nodelay(true);
             self.connect_stream_tls(&url.host, Box::new(transport), id, &authority).await
         })
         .await?

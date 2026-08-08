@@ -519,6 +519,12 @@ where
     /// wait, so messages that complete meanwhile are held for the next
     /// [`H2Connection::receive_message`] rather than dropped.
     ///
+    /// The message is flushed at once unless input from the peer is still
+    /// buffered, in which case it batches with the answers that input is owed
+    /// and goes out in one write — as [`Limits::output_high_water`] is
+    /// crossed, or as the connection next waits on the transport in
+    /// [`H2Connection::read_frame`].
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Limit`] when opening a stream would go past
@@ -607,7 +613,11 @@ where
         }
 
         self.retire(stream_id);
-        self.flush_out().await?;
+
+        if self.buffer.is_empty() {
+            self.flush_out().await?;
+        }
+
         Ok(())
     }
 
@@ -699,10 +709,16 @@ where
     /// [`Frame::parse`] rather than failing the connection, so what comes back
     /// is always a frame this end understands.
     ///
+    /// Everything queued is flushed before waiting on the transport, so output
+    /// batches up while whole frames are still buffered and goes out in one
+    /// write the moment the peer's next move is what matters. This is what
+    /// keeps a multiplexed burst of responses from costing a write per frame.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Closed`] when the transport ends mid-frame, and
-    /// otherwise as [`Frame::parse`] and [`Buffer::fill`].
+    /// otherwise as [`Frame::parse`], [`Buffer::fill`] and
+    /// [`H2Connection::flush_out`].
     pub async fn read_frame(&mut self) -> Result<Frame, Error> {
         let max_frame_size = self.settings_local.max_frame_size;
 
@@ -710,6 +726,8 @@ where
             if let Some(frame) = Frame::parse(self.buffer.as_bytes_mut(), max_frame_size)? {
                 return Ok(frame);
             }
+
+            self.flush_out().await?;
 
             if !self.buffer.fill(&mut self.transport, self.limits.read_timeout).await? {
                 return Err(Error::Closed);
@@ -725,8 +743,6 @@ where
     pub async fn pump(&mut self) -> Result<Option<Message>, Error> {
         self.start().await?;
         self.flush_resets().await?;
-
-        self.flush_out().await?;
 
         let frame = self.read_frame().await?;
         let message = self.handle(frame).await?;

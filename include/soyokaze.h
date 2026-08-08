@@ -132,6 +132,7 @@ typedef struct {
     uint32_t max_idle_frames;
     uint64_t output_high_water;
 
+    uint64_t max_requests_per_connection; /* served per connection lifetime; zero serves forever */
     double qpack_block_timeout;
     uint32_t max_peer_uni_streams;
     uint32_t max_outstanding_sections;

@@ -835,6 +835,8 @@ pub struct Limits {
     /// In bytes, the buffered output size at which a body write flushes rather than growing.
     pub output_high_water: u64,
 
+    /// The number of requests one connection may serve over its lifetime. Zero serves forever.
+    pub max_requests_per_connection: u64,
     /// In seconds, how long to wait for a blocking QPACK reference.
     pub qpack_block_timeout: f64,
     /// The number of unidirectional streams a peer may open at once.
@@ -886,6 +888,7 @@ impl Limits {
             max_encoder_table_size: self.max_encoder_table_size,
             max_idle_frames: self.max_idle_frames,
             output_high_water: self.output_high_water,
+            max_requests_per_connection: self.max_requests_per_connection,
             qpack_block_timeout: self.qpack_block_timeout,
             max_peer_uni_streams: self.max_peer_uni_streams,
             max_outstanding_sections: self.max_outstanding_sections,
@@ -923,6 +926,7 @@ impl Limits {
             max_encoder_table_size: limits.max_encoder_table_size,
             max_idle_frames: limits.max_idle_frames,
             output_high_water: limits.output_high_water,
+            max_requests_per_connection: limits.max_requests_per_connection,
             qpack_block_timeout: limits.qpack_block_timeout,
             max_peer_uni_streams: limits.max_peer_uni_streams,
             max_outstanding_sections: limits.max_outstanding_sections,

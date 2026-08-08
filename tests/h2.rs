@@ -4,11 +4,12 @@ use tokio::io::AsyncWriteExt;
 use soyokaze::helpers::fields::HeaderField;
 use soyokaze::models::Limits;
 use soyokaze::hsts::HstsPolicy;
-use soyokaze::models::{Body, ConnectionID, Headers, Message, Method, Role, StreamID, Version};
+use soyokaze::models::{Body, ConnectionID, Headers, Message, Method, Port, Role, StreamID, Version};
 use soyokaze::tls::Security;
-use soyokaze::protocol::base::Connection;
+use soyokaze::protocol::base::{AnyConnection, Connection};
 use soyokaze::protocol::common;
 use soyokaze::protocol::h2::{self, Frame, FrameHeader, FrameType, H2Connection, Settings, StreamState};
+use soyokaze::{Client, ClientConfig, Handler, Server, ServerConfig};
 use soyokaze::Error;
 
 fn limits() -> Limits {
@@ -788,4 +789,69 @@ fn a_frame_larger_than_advertised_is_refused_before_it_is_read() {
     // must be caught from the header rather than after buffering the payload.
     let error = h2::Frame::parse(&mut buffer, 16_384).expect_err("an oversized frame was accepted");
     assert!(matches!(error, Error::Limit(_)), "an oversized frame must be a limit failure, not {error:?}");
+}
+
+#[derive(Clone)]
+struct Echo;
+
+impl Handler for Echo {
+    async fn on_connection(&self, connection: AnyConnection) {
+        let mut connection = connection;
+
+        while let Ok(request) = connection.receive().await {
+            let mut response = Message::response(200, connection.version());
+            response.stream_id = request.stream_id;
+            response.body = Some(Body::Data(bytes::Bytes::from_static(b"Hello, World!")));
+
+            if connection.send(response).await.is_err() {
+                break;
+            }
+        }
+
+        connection.close().await;
+    }
+}
+
+#[test]
+fn a_multiplexed_burst_is_answered_in_full() {
+    const BURST: usize = 32;
+
+    let server = Server::new(ServerConfig { versions: vec![Version::V2_0], ..ServerConfig::default() });
+    let cluster = server.run(Echo, &[Port::TCP(0)], 1).expect("the TCP port did not open");
+    let port = cluster.address().expect("the cluster has no address").port();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("no runtime");
+
+    let answered = runtime.block_on(async move {
+        let client = Client::new(ClientConfig { versions: vec![Version::V2_0], secure: false, ..ClientConfig::default() });
+
+        let mut connection = client.connect("localhost", Port::TCP(port)).await.expect("the client could not reach the server");
+
+        for index in 0..BURST {
+            let request = Message::request(Method::GET, "/index.html", Version::V2_0);
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), connection.send(request))
+                .await
+                .unwrap_or_else(|_| panic!("request {index} never left the client"))
+                .expect("the request did not send");
+        }
+
+        let mut answered = 0;
+        for index in 0..BURST {
+            let response = tokio::time::timeout(std::time::Duration::from_secs(5), connection.receive())
+                .await
+                .unwrap_or_else(|_| panic!("response {index} never arrived"))
+                .expect("the exchange failed");
+
+            assert_eq!(response.status_code, Some(200));
+            assert_eq!(response.body.as_ref().and_then(Body::inline), Some(bytes::Bytes::from_static(b"Hello, World!")));
+            answered += 1;
+        }
+
+        connection.close().await;
+        answered
+    });
+
+    cluster.close(Some(1.0));
+    assert_eq!(answered, BURST, "part of the burst was left unanswered");
 }

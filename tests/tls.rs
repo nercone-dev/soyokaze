@@ -811,3 +811,13 @@ fn a_pkcs12_identity_serves_tls() {
     assert_eq!(response.status_code, Some(200));
     assert_eq!(response.body.as_ref().and_then(Body::inline), Some(Bytes::from_static(b"Hello, World!")));
 }
+
+#[test]
+fn a_client_builds_its_tls_configuration_once() {
+    let client = Client::new(ClientConfig::default());
+
+    let first = client.connector().expect("the connector did not build") as *const _;
+    let second = client.connector().expect("the connector did not build") as *const _;
+
+    assert!(std::ptr::eq(first, second), "each dial built a fresh TLS configuration instead of reusing the client's");
+}

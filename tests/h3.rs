@@ -806,3 +806,43 @@ fn a_connection_reports_the_settings_it_advertised() {
     assert_eq!(*connection.settings_local(), advertised, "the handle must report what its session advertised");
     assert_eq!(connection.settings_local().qpack_blocked_streams, 7, "the advertised blocked-stream ceiling did not follow the limits");
 }
+
+#[test]
+fn goaway_on_the_control_stream_is_recorded_and_never_grows() {
+    let mut session = server();
+    assert_eq!(session.goaway, None, "no GOAWAY has arrived yet");
+
+    session.on_control_bytes(&Frame::GoAway { id: 64 }.encode()).expect("GOAWAY was refused");
+    assert_eq!(session.goaway, Some(64));
+
+    // RFC 9114 §5.2: an endpoint may send several GOAWAYs with shrinking
+    // identifiers, and the identifier must not grow again.
+    session.on_control_bytes(&Frame::GoAway { id: 32 }.encode()).expect("a shrinking GOAWAY was refused");
+    assert_eq!(session.goaway, Some(32));
+
+    session.on_control_bytes(&Frame::GoAway { id: 128 }.encode()).expect("a growing GOAWAY need not fail the connection");
+    assert_eq!(session.goaway, Some(32), "a growing identifier must not widen what the peer already gave up");
+}
+
+#[test]
+fn request_streams_are_counted_once_over_the_connections_lifetime() {
+    let mut session = server();
+    let mut encoder = Encoder::new();
+
+    let (block, _) = section(&mut encoder, 0, &request_fields());
+    let frame = Frame::Headers(block.into()).encode();
+
+    session.on_stream_bytes(StreamID(0), &frame[..1], false).expect("the first octet was refused");
+    session.on_stream_bytes(StreamID(0), &frame[1..], true).expect("the rest of the request was refused");
+    session.take_ready().expect("no request arrived");
+
+    assert_eq!(session.total_streams, 1, "several reads of one stream must count it once");
+    assert_eq!(session.highest_peer_stream_id, 0);
+
+    let (block, _) = section(&mut encoder, 4, &request_fields());
+    session.on_stream_bytes(StreamID(4), &Frame::Headers(block.into()).encode(), true).expect("the second request was refused");
+    session.take_ready().expect("no second request arrived");
+
+    assert_eq!(session.total_streams, 2, "the count is the connection's lifetime total");
+    assert_eq!(session.highest_peer_stream_id, 4);
+}

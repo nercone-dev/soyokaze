@@ -72,6 +72,7 @@ class Limits(Structure):
         ("max_encoder_table_size", c_uint64),
         ("max_idle_frames", c_uint32),
         ("output_high_water", c_uint64),
+        ("max_requests_per_connection", c_uint64),
         ("qpack_block_timeout", c_double),
         ("max_peer_uni_streams", c_uint32),
         ("max_outstanding_sections", c_uint32),

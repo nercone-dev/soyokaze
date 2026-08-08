@@ -999,6 +999,15 @@ pub struct Limits {
     pub output_high_water:          u64,
 
     // HTTP/3
+    /// The number of requests one connection may serve over its lifetime before it is wound down with GOAWAY (0 serves forever).
+    ///
+    /// Distinct from [`Limits::max_concurrent_streams`], which bounds how many
+    /// are open at once: this bounds the total. The QUIC stack underneath
+    /// keeps a trace of every stream a connection has ever closed, so a
+    /// connection that never ends grows without bound under continuous load;
+    /// winding it down lets a well-behaved peer reconnect and gives all of
+    /// that back.
+    pub max_requests_per_connection: u64,
     /// In seconds, how long to wait for a blocking QPACK reference to resolve before failing the connection.
     pub qpack_block_timeout:        f64,
     /// The number of unidirectional streams a peer may open at once, per connection.
@@ -1057,6 +1066,7 @@ impl Default for Limits {
             max_idle_frames: 1000,
             output_high_water: 64 * 1024,
 
+            max_requests_per_connection: 10_000,
             qpack_block_timeout: 5.0,
             max_peer_uni_streams: 32,
             max_outstanding_sections: 512,
