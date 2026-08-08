@@ -16,7 +16,7 @@ env:
 
 jobs:
   test:
-    name: Test (${{ matrix.os }}-${{ matrix.arch }})
+    name: Test (${{ matrix.arch }}-${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -85,7 +85,7 @@ jobs:
         run: cargo doc --no-deps --all-features
 
   test-ffi:
-    name: Test FFI (${{ matrix.os }}-${{ matrix.arch }})
+    name: Test FFI (${{ matrix.arch }}-${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -151,7 +151,7 @@ jobs:
           ./ffi-static
 
   test-python:
-    name: Test Python Binding (${{ matrix.os }}-${{ matrix.arch }})
+    name: Test Python Binding (${{ matrix.arch }}-${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false

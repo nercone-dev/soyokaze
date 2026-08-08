@@ -16,50 +16,9 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  update:
-    name: Update
-    runs-on: ubuntu-latest
-    if: "!github.event.release.prerelease"
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: main
-
-      - name: Update version in Cargo.toml and pyproject.toml
-        run: |
-          TAG="${{ github.event.release.tag_name }}"
-          VERSION="${TAG#v}"
-          sed -i "s/^version = .*/version = \"${VERSION}\"/" Cargo.toml
-          sed -i "s/^version = .*/version = \"${VERSION}\"/" python/pyproject.toml
-          echo "Soyokaze ${VERSION}"
-
-      - name: Commit and push version update
-        run: |
-          TAG="${{ github.event.release.tag_name }}"
-          VERSION="${TAG#v}"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git add Cargo.toml python/pyproject.toml
-
-          if git diff --cached --quiet; then
-            echo "No changes; skipping commit."
-          else
-            git commit -m "Release ${VERSION}"
-            git push origin main
-          fi
-
-          echo "Almost ready for releasing [Soyokaze ${VERSION}]. Good luck!"
-
   test:
-    name: Test (${{ matrix.os }}-${{ matrix.arch }})
-    needs: update
+    name: Test (${{ matrix.arch }}-${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
-    if: "!github.event.release.prerelease"
     strategy:
       fail-fast: false
       matrix:
@@ -109,9 +68,7 @@ jobs:
 
   test-doc:
     name: Test Documentation
-    needs: [update, test]
     runs-on: ubuntu-latest
-    if: "!github.event.release.prerelease"
 
     env:
       RUSTDOCFLAGS: -D warnings
@@ -131,9 +88,166 @@ jobs:
       - name: Build the documentation
         run: cargo doc --no-deps --all-features
 
+  test-ffi:
+    name: Test FFI (${{ matrix.arch }}-${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: linux
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos
+            arch: x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos
+            arch: aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake go
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-ffi-${{ matrix.arch }}-${{ matrix.os }}
+
+      - name: Build every library form
+        run: cargo build --lib
+
+      - name: Build and run the C test against the shared library
+        run: |
+          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c -Ltarget/debug -lsoyokaze -o ffi-shared
+          case "$RUNNER_OS" in
+            Linux) LD_LIBRARY_PATH=target/debug ./ffi-shared ;;
+            macOS) DYLD_LIBRARY_PATH=target/debug ./ffi-shared ;;
+          esac
+
+      - name: Build and run the C test against the static library
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          libs=$(cargo rustc --lib --crate-type staticlib -- --print native-static-libs 2>&1 \
+                 | sed -n 's/^note: native-static-libs: //p' | tail -n1)
+          if [ -z "$libs" ]; then
+            echo "::error::rustc reported no native static libs; the link would fail obscurely"
+            exit 1
+          fi
+          echo "native static libs: $libs"
+          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c target/debug/libsoyokaze.a $libs -o ffi-static
+          ./ffi-static
+
+  test-python:
+    name: Test Python Binding (${{ matrix.arch }}-${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: linux
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos
+            arch: x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos
+            arch: aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev golang-go perl
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake go
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-python-${{ matrix.arch }}-${{ matrix.os }}
+
+      - name: Build the shared library
+        run: cargo build --lib
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - name: Run the Python test suite
+        working-directory: python
+        run: uv run pytest
+
+  update:
+    needs: [test, test-doc, test-ffi, test-python]
+    name: Update
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Update version in Cargo.toml and pyproject.toml
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
+          sed -i "s/^version = .*/version = \"${VERSION}\"/" Cargo.toml
+          sed -i "s/^version = .*/version = \"${VERSION}\"/" python/pyproject.toml
+          echo "Soyokaze ${VERSION}"
+
+      - name: Commit and push version update
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add Cargo.toml python/pyproject.toml
+
+          if git diff --cached --quiet; then
+            echo "No changes; skipping commit."
+          else
+            git commit -m "Release ${VERSION}"
+            git push origin main
+          fi
+
+          echo "Almost ready for releasing [Soyokaze ${VERSION}]. Good luck!"
+
   build:
-    name: Build (${{ matrix.os }}-${{ matrix.arch }})
-    needs: [update, test, test-doc]
+    name: Build (${{ matrix.arch }}-${{ matrix.os }})
+    needs: update
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
@@ -241,8 +355,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
 
   build-ffi:
-    name: Build FFI (${{ matrix.os }}-${{ matrix.arch }})
-    needs: [update, test, test-doc]
+    name: Build FFI (${{ matrix.arch }}-${{ matrix.os }})
+    needs: update
     runs-on: ${{ matrix.runner }}
     if: "!github.event.release.prerelease"
     strategy:
@@ -309,8 +423,8 @@ jobs:
           ./ffi-static
 
   build-python:
-    name: Build Python Binding (${{ matrix.os }}-${{ matrix.arch }})
-    needs: [update, test, test-doc]
+    name: Build Python Binding (${{ matrix.arch }}-${{ matrix.os }})
+    needs: update
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
     permissions:
@@ -413,7 +527,7 @@ jobs:
 
   publish:
     name: Publish
-    needs: [update, test, test-doc, build, build-ffi, build-python]
+    needs: [build, build-ffi, build-python]
     runs-on: ubuntu-latest
 
     steps:
@@ -437,7 +551,7 @@ jobs:
 
   publish-python:
     name: Publish Python Binding
-    needs: [update, test, test-doc, build, build-ffi, build-python]
+    needs: [build, build-ffi, build-python]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
