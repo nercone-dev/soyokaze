@@ -7,7 +7,10 @@
  * agree — a declaration that has drifted from the Rust side shows up here and
  * nowhere else.
  *
- *   cc -I include tests/ffi.c -L target/release -lsoyokaze -o ffi-test
+ *   cc -I include tests/ffi.c -L target/debug -lsoyokaze -o ffi-test
+ *
+ * The release dylib does not work on the macOS 27 toolchain; see the soyokaze.h
+ * section of README.md for the reason and for the static library invocation.
  */
 
 #include <assert.h>
