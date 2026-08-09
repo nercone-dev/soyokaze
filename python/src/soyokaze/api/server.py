@@ -4,11 +4,21 @@
 ports and runs accept loops on a runtime, and :meth:`Server.run` runs one
 runtime per worker thread instead, mirroring the crate's ``api::server``.
 
-A handler is an ordinary callable taking a :class:`Message` request and
-returning a :class:`Message` response; a WebSocket handler takes a
-:class:`WebSocketConnection` and drives it until it is done.
+A handler takes a :class:`Message` request and returns a :class:`Message`
+response; a WebSocket handler takes a :class:`WebSocketConnection` and drives
+it until it is done. Either may be a coroutine function, and normally is: the
+library calls a handler on one of its own threads, and a coroutine is run on
+the event loop :meth:`Server.serve` was awaited from, which is where the
+connection and WebSocket calls it awaits belong. A handler that waits for
+nothing may stay an ordinary callable and is then run on the library's thread
+without the event loop hearing of it at all.
+
+Because a coroutine handler is run on the caller's loop, that loop has to
+keep running for as long as the server does — which is what awaiting
+:meth:`ServerHandle.close` at the end of the program amounts to.
 """
 
+import asyncio
 import ctypes
 import traceback
 
@@ -16,8 +26,8 @@ from .. import ffi
 from ..errors import Error, InvalidError
 from ..ffi import library
 from ..models import Limits, Message, Port, Version
-from ..runtime import Runtime
-from ..websocket import WebSocketConnection
+from ..runtime import Runtime, offload, resolved
+from ..websocket import CloseCode, WebSocketConnection
 from .cluster import Cluster
 from .gate import Gate
 
@@ -153,15 +163,26 @@ class ServerHandle:
     """A running server, as :meth:`Server.serve` returns it.
 
     Everything runs on the runtime the server was served on. Dropping this
-    leaves the server running; call :meth:`close` to wind it down. The
+    leaves the server running; await :meth:`close` to wind it down. The
     callbacks live on the handle, so it must outlive the server's use of
-    them — close it before letting it go.
+    them — close it before letting it go. Usable as an async context manager,
+    which closes it on the way out::
+
+        async with await server.serve(handler, [Port.TCP(8080)]) as handle:
+            ...
     """
 
     def __init__(self, handle, runtime, callbacks):
         self.handle = handle
         self.runtime = runtime
         self.callbacks = callbacks
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, kind, value, traceback):
+        await self.close()
+        return False
 
     @property
     def port(self):
@@ -181,15 +202,19 @@ class ServerHandle:
         count = library.soyokaze_server_handle_address_count(self.handle)
         return [library.soyokaze_server_handle_address_at(self.handle, index).take().decode() for index in range(count)]
 
-    def close(self, timeout=None):
+    async def close(self, timeout=None):
         """Stops accepting and waits for connections to finish.
 
         ``timeout`` bounds the wait in seconds; connections still running
         when it passes are aborted. ``None`` waits as long as it takes.
+
+        The event loop keeps running throughout, which is what lets a
+        coroutine handler still in flight finish rather than deadlock against
+        the close waiting for it.
         """
         if self.handle:
-            library.soyokaze_server_handle_close(self.runtime.handle, self.handle, -1.0 if timeout is None else timeout)
-            self.handle = None
+            handle, self.handle = self.handle, None
+            await offload(library.soyokaze_server_handle_close, self.runtime.handle, handle, -1.0 if timeout is None else timeout)
 
 class RawSocket:
     """A bound socket that no runtime has adopted yet.
@@ -263,8 +288,14 @@ class Server:
             self.handle = None
 
     @classmethod
-    def request_callback(cls, handler):
+    def request_callback(cls, handler, loop):
         """The C callback that hands each request to ``handler``.
+
+        The callback itself runs on one of the library's threads. A handler
+        that hands back a coroutine has it run on ``loop`` and this thread
+        waits for the response, so the handler may await the rest of the
+        bindings; one that hands back a response outright never leaves the
+        thread it was called on.
 
         A handler that raises answers with a bare ``500``, the way a null
         response does, and the traceback goes to stderr rather than vanishing.
@@ -272,7 +303,7 @@ class Server:
 
         def answer(context, request):
             try:
-                response = handler(Message(handle=request))
+                response = resolved(handler(Message(handle=request)), loop)
                 return response.take()
             except BaseException:
                 traceback.print_exc()
@@ -281,11 +312,18 @@ class Server:
         return ffi.ON_REQUEST(answer)
 
     @classmethod
-    def websocket_callback(cls, handler):
+    def websocket_callback(cls, handler, loop):
         """The C callback that hands each accepted WebSocket to ``handler``.
 
+        As :meth:`request_callback`, for a socket rather than a request: the
+        library gives the callback a thread of its own, and a coroutine
+        handler is run on ``loop`` and waited for here.
+
         The socket is closed and freed when the handler returns without having
-        done so itself, so a handler may simply return when it is done.
+        done so itself, so a handler may simply return when it is done. That
+        last close is made straight through the library rather than awaited,
+        since this thread is the library's to block and the loop may already
+        have stopped by the time a server is winding down.
         """
         if handler is None:
             return ffi.ON_WEBSOCKET()
@@ -293,12 +331,12 @@ class Server:
         def run(context, socket):
             connection = WebSocketConnection(socket)
             try:
-                handler(connection)
+                resolved(handler(connection), loop)
             except BaseException:
                 traceback.print_exc()
             finally:
                 if connection.handle and not connection.closing():
-                    connection.close()
+                    library.soyokaze_websocket_close(connection.handle, int(CloseCode.NORMAL), b"", 0)
 
         return ffi.ON_WEBSOCKET(run)
 
@@ -323,7 +361,7 @@ class Server:
         Error.raise_for(library.soyokaze_server_open(self.handle, ctypes.byref(struct), ctypes.byref(out), ctypes.byref(error)), error)
         return RawSocket(out)
 
-    def serve(self, handler, ports, on_websocket=None, runtime=None):
+    async def serve(self, handler, ports, on_websocket=None, runtime=None):
         """Binds every port and starts serving.
 
         Returns a :class:`ServerHandle` as soon as the ports are bound; the
@@ -331,27 +369,36 @@ class Server:
         handle. ``handler`` answers each request; ``on_websocket``, when
         given, runs each accepted WebSocket, and upgrade requests are
         otherwise handed to ``handler`` like any other.
+
+        The event loop this is awaited from is the one a coroutine handler is
+        run on for as long as the server lives, so serve from the loop the
+        program is going to keep running.
         """
         runtime = runtime if runtime is not None else Runtime.default()
-        callbacks = (self.request_callback(handler), self.websocket_callback(on_websocket))
+        loop = asyncio.get_running_loop()
+        callbacks = (self.request_callback(handler, loop), self.websocket_callback(on_websocket, loop))
         array, structs = Port.array(ports)
 
         out = ctypes.c_void_p()
         error = Error.out()
-        Error.raise_for(library.soyokaze_server_serve(runtime.handle, self.handle, callbacks[0], callbacks[1], None, array, len(ports), ctypes.byref(out), ctypes.byref(error)), error)
+        status = await offload(library.soyokaze_server_serve, runtime.handle, self.handle, callbacks[0], callbacks[1], None, array, len(ports), ctypes.byref(out), ctypes.byref(error))
+        Error.raise_for(status, error)
         return ServerHandle(out.value, runtime, callbacks)
 
-    def run(self, handler, ports, workers=0, on_websocket=None):
+    async def run(self, handler, ports, workers=0, on_websocket=None):
         """Runs the server across several threads, each with its own runtime.
 
         The multi-worker counterpart of :meth:`serve`; a ``workers`` of zero
         takes one per core. Returns a :class:`Cluster` once every worker is
-        ready, so a bind failure surfaces here.
+        ready, so a bind failure surfaces here. Every worker's callbacks reach
+        the one event loop this was awaited from, as in :meth:`serve`.
         """
-        callbacks = (self.request_callback(handler), self.websocket_callback(on_websocket))
+        loop = asyncio.get_running_loop()
+        callbacks = (self.request_callback(handler, loop), self.websocket_callback(on_websocket, loop))
         array, structs = Port.array(ports)
 
         out = ctypes.c_void_p()
         error = Error.out()
-        Error.raise_for(library.soyokaze_server_run(self.handle, callbacks[0], callbacks[1], None, array, len(ports), workers, ctypes.byref(out), ctypes.byref(error)), error)
+        status = await offload(library.soyokaze_server_run, self.handle, callbacks[0], callbacks[1], None, array, len(ports), workers, ctypes.byref(out), ctypes.byref(error))
+        Error.raise_for(status, error)
         return Cluster(out.value, callbacks)

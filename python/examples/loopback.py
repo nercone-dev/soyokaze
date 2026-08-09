@@ -7,32 +7,35 @@ whole stack:
     uv run examples/loopback.py
 """
 
+import asyncio
+
 from soyokaze import Client, Message, Method, Port, Server, URL
 
-def greet(request):
+async def greet(request):
     """Answers every request with a greeting taken from its target.
 
-    A handler is an ordinary callable: it takes the request and returns the
-    response, and the bindings frame it in whichever version the connection
-    negotiated.
+    A handler is an ordinary coroutine function: it takes the request and
+    returns the response, and the bindings frame it in whichever version the
+    connection negotiated. It runs on this program's event loop, so it may
+    await anything the loop can — the rest of these bindings included.
     """
     name = (request.target or "/").lstrip("/") or "World"
     return Message.text(f"Hello, {name}!", request.version)
 
-def main():
+async def main():
     # A port of zero lets the kernel choose one, so the example names none.
     server = Server()
-    handle = server.serve(greet, [Port.TCP(0)])
+    handle = await server.serve(greet, [Port.TCP(0)])
 
     client = Client()
-    connection = client.open(URL(f"http://127.0.0.1:{handle.port}/"))
+    connection = await client.open(URL(f"http://127.0.0.1:{handle.port}/"))
 
     for target in ["/", "/soyokaze"]:
-        response = client.request(connection, Message.request(Method.GET, target, connection.version))
-        print(f"{target} -> {response.status_code} {response.body().decode()}")
+        response = await client.request(connection, Message.request(Method.GET, target, connection.version))
+        print(f"{target} -> {response.status_code} {(await response.body()).decode()}")
 
-    connection.close()
-    handle.close(5)
+    await connection.close()
+    await handle.close(5)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

@@ -7,9 +7,12 @@ better number.
 """
 
 from ..ffi import library
+from ..runtime import offload
 
 class Cluster:
     """A server running across several threads, as :meth:`Server.run` returns it.
+
+    Usable as an async context manager, which closes it on the way out.
 
     :meth:`Server.run`: soyokaze.api.server.Server.run
     """
@@ -17,6 +20,13 @@ class Cluster:
     def __init__(self, handle, callbacks):
         self.handle = handle
         self.callbacks = callbacks
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, kind, value, traceback):
+        await self.close()
+        return False
 
     @classmethod
     def cores(cls):
@@ -47,8 +57,12 @@ class Cluster:
         """How many worker threads are running."""
         return library.soyokaze_cluster_workers(self.handle)
 
-    def close(self, timeout=None):
-        """Stops every worker and waits for the threads to finish. This blocks."""
+    async def close(self, timeout=None):
+        """Stops every worker and waits for the threads to finish.
+
+        The wait is made on a worker thread, so the event loop keeps running
+        and a coroutine handler still in flight can finish.
+        """
         if self.handle:
-            library.soyokaze_cluster_close(self.handle, -1.0 if timeout is None else timeout)
-            self.handle = None
+            handle, self.handle = self.handle, None
+            await offload(library.soyokaze_cluster_close, handle, -1.0 if timeout is None else timeout)

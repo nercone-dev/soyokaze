@@ -1,9 +1,16 @@
 """Dialling an origin and issuing requests.
 
 :class:`Client` is the entry point. Build one from a :class:`ClientConfig` —
-or with no arguments to take every default — then use :meth:`Client.get` and
-friends for one-off requests, or :meth:`Client.connect` when the connection
-itself is wanted, mirroring the crate's ``api::client`` module.
+or with no arguments to take every default — then await :meth:`Client.get`
+and friends for one-off requests, or :meth:`Client.connect` when the
+connection itself is wanted, mirroring the crate's ``api::client`` module.
+
+Every call that waits is a coroutine: the exchange runs on a worker thread
+and the event loop is handed back until it finishes, so requests may be
+awaited alongside each other with :func:`asyncio.gather` and anything else
+the loop is running keeps running. What only reads what the client already
+knows — :meth:`Client.authority`, :meth:`Client.versions` — waits for
+nothing and stays an ordinary call.
 """
 
 import ctypes
@@ -15,7 +22,7 @@ from ..cookies import CookieJar
 from ..finalizer import RequestFinalizer
 from ..hsts import HSTSStore
 from ..models import Limits, Message, Method, Role, Version
-from ..runtime import Runtime
+from ..runtime import Runtime, offload
 from ..websocket import WebSocketConnection
 
 class ClientLimits:
@@ -99,7 +106,11 @@ class Connection:
     """A connection of whichever version was negotiated.
 
     What :meth:`Client.open` and :meth:`Client.connect` hand back; several
-    messages may go over one.
+    messages may go over one. Usable as an async context manager, which
+    closes it on the way out::
+
+        async with await client.open(url) as connection:
+            ...
     """
 
     def __init__(self, handle, runtime):
@@ -110,6 +121,13 @@ class Connection:
         if getattr(self, "handle", None):
             library.soyokaze_connection_free(self.handle)
             self.handle = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, kind, value, traceback):
+        await self.close()
+        return False
 
     @property
     def version(self):
@@ -129,16 +147,19 @@ class Connection:
         """Whether another message may go over the connection."""
         return library.soyokaze_connection_reusable(self.handle)
 
-    def send(self, message):
+    async def send(self, message):
         """Sends one message, without waiting for anything back.
 
         The raw half of :meth:`Client.request`, for pipelining requests or
-        streaming responses by hand. ``message`` is consumed.
+        streaming responses by hand. ``message`` is consumed. Waiting for
+        nothing back is not the same as not waiting: the octets still have to
+        reach the peer, so this is awaited like anything else.
         """
         error = Error.out()
-        Error.raise_for(library.soyokaze_connection_send(self.runtime.handle, self.handle, message.take(), ctypes.byref(error)), error)
+        status = await offload(library.soyokaze_connection_send, self.runtime.handle, self.handle, message.take(), ctypes.byref(error))
+        Error.raise_for(status, error)
 
-    def receive(self):
+    async def receive(self):
         """Receives the next message.
 
         Unlike :meth:`Client.request`, informational (1xx) responses are
@@ -146,10 +167,11 @@ class Connection:
         """
         out = ctypes.c_void_p()
         error = Error.out()
-        Error.raise_for(library.soyokaze_connection_receive(self.runtime.handle, self.handle, ctypes.byref(out), ctypes.byref(error)), error)
+        status = await offload(library.soyokaze_connection_receive, self.runtime.handle, self.handle, ctypes.byref(out), ctypes.byref(error))
+        Error.raise_for(status, error)
         return Message(handle=out)
 
-    def open_websocket(self, authority, target, limits=None):
+    async def open_websocket(self, authority, target, limits=None):
         """Opens a WebSocket and takes the connection over.
 
         The connection is consumed whether the handshake succeeds or not.
@@ -162,13 +184,14 @@ class Connection:
         out = ctypes.c_void_p()
         error = Error.out()
         authority, target = ffi.Library.encoded(authority), ffi.Library.encoded(target)
-        Error.raise_for(library.soyokaze_connection_open_websocket(self.runtime.handle, handle, authority, len(authority), target, len(target), ctypes.byref(limits) if limits is not None else None, ctypes.byref(out), ctypes.byref(error)), error)
+        status = await offload(library.soyokaze_connection_open_websocket, self.runtime.handle, handle, authority, len(authority), target, len(target), ctypes.byref(limits) if limits is not None else None, ctypes.byref(out), ctypes.byref(error))
+        Error.raise_for(status, error)
         return WebSocketConnection(out)
 
-    def close(self):
+    async def close(self):
         """Closes the connection, leaving the object to be dropped."""
         if self.handle:
-            library.soyokaze_connection_close(self.runtime.handle, self.handle)
+            await offload(library.soyokaze_connection_close, self.runtime.handle, self.handle)
 
 class Client:
     """An HTTP client.
@@ -191,7 +214,7 @@ class Client:
             library.soyokaze_client_free(self.handle)
             self.handle = None
 
-    def fetch(self, method, url, headers=None, body=None):
+    async def fetch(self, method, url, headers=None, body=None):
         """Makes one request and returns the response.
 
         Dials, exchanges, and closes the connection. ``Host`` and ``Cookie``
@@ -206,37 +229,39 @@ class Client:
         out = ctypes.c_void_p()
         error = Error.out()
         encoded = ffi.Library.encoded(url)
-        Error.raise_for(library.soyokaze_client_fetch(self.runtime.handle, self.handle, int(Method(method)), encoded, len(encoded), request, ctypes.byref(out), ctypes.byref(error)), error)
+        status = await offload(library.soyokaze_client_fetch, self.runtime.handle, self.handle, int(Method(method)), encoded, len(encoded), request, ctypes.byref(out), ctypes.byref(error))
+        Error.raise_for(status, error)
         return Message(handle=out)
 
-    def get(self, url):
+    async def get(self, url):
         """A ``GET``; see :meth:`fetch`."""
-        return self.fetch(Method.GET, url)
+        return await self.fetch(Method.GET, url)
 
-    def head(self, url):
+    async def head(self, url):
         """A ``HEAD``; see :meth:`fetch`."""
-        return self.fetch(Method.HEAD, url)
+        return await self.fetch(Method.HEAD, url)
 
-    def post(self, url, body):
+    async def post(self, url, body):
         """A ``POST``; see :meth:`fetch`."""
-        return self.fetch(Method.POST, url, body=body)
+        return await self.fetch(Method.POST, url, body=body)
 
-    def put(self, url, body):
+    async def put(self, url, body):
         """A ``PUT``; see :meth:`fetch`."""
-        return self.fetch(Method.PUT, url, body=body)
+        return await self.fetch(Method.PUT, url, body=body)
 
-    def delete(self, url):
+    async def delete(self, url):
         """A ``DELETE``; see :meth:`fetch`."""
-        return self.fetch(Method.DELETE, url)
+        return await self.fetch(Method.DELETE, url)
 
-    def open(self, url):
+    async def open(self, url):
         """Opens a connection for a :class:`URL`, taking the transport from its scheme."""
         out = ctypes.c_void_p()
         error = Error.out()
-        Error.raise_for(library.soyokaze_client_open(self.runtime.handle, self.handle, url.handle, ctypes.byref(out), ctypes.byref(error)), error)
+        status = await offload(library.soyokaze_client_open, self.runtime.handle, self.handle, url.handle, ctypes.byref(out), ctypes.byref(error))
+        Error.raise_for(status, error)
         return Connection(out, self.runtime)
 
-    def connect(self, host, port):
+    async def connect(self, host, port):
         """Opens a connection to a host on a given :class:`Port`.
 
         The port decides the transport, and so which versions are available.
@@ -245,20 +270,22 @@ class Client:
         error = Error.out()
         encoded = ffi.Library.encoded(host)
         struct = port.build()
-        Error.raise_for(library.soyokaze_client_connect(self.runtime.handle, self.handle, encoded, len(encoded), ctypes.byref(struct), ctypes.byref(out), ctypes.byref(error)), error)
+        status = await offload(library.soyokaze_client_connect, self.runtime.handle, self.handle, encoded, len(encoded), ctypes.byref(struct), ctypes.byref(out), ctypes.byref(error))
+        Error.raise_for(status, error)
         return Connection(out, self.runtime)
 
-    def request(self, connection, request):
+    async def request(self, connection, request):
         """Sends a request over an open connection and waits for the response.
 
         Informational (1xx) responses are read past. ``request`` is consumed.
         """
         out = ctypes.c_void_p()
         error = Error.out()
-        Error.raise_for(library.soyokaze_client_request(self.runtime.handle, self.handle, connection.handle, request.take(), ctypes.byref(out), ctypes.byref(error)), error)
+        status = await offload(library.soyokaze_client_request, self.runtime.handle, self.handle, connection.handle, request.take(), ctypes.byref(out), ctypes.byref(error))
+        Error.raise_for(status, error)
         return Message(handle=out)
 
-    def websocket(self, url):
+    async def websocket(self, url):
         """Opens a WebSocket connection.
 
         The handshake follows whichever version is negotiated: an HTTP/1.1
@@ -267,7 +294,8 @@ class Client:
         out = ctypes.c_void_p()
         error = Error.out()
         encoded = ffi.Library.encoded(url)
-        Error.raise_for(library.soyokaze_client_websocket(self.runtime.handle, self.handle, encoded, len(encoded), ctypes.byref(out), ctypes.byref(error)), error)
+        status = await offload(library.soyokaze_client_websocket, self.runtime.handle, self.handle, encoded, len(encoded), ctypes.byref(out), ctypes.byref(error))
+        Error.raise_for(status, error)
         return WebSocketConnection(out)
 
     def id(self, host, target):
