@@ -1,19 +1,30 @@
-# soyokaze.rs
+# soyokaze
 HTTP/1/2/3 Library Crate
 
 ## Overview
 
 An HTTP/1/2/3 implementation written in Rust.
 
-It uses BoringSSL for TLS handling, and the BoringSSL-based Quiche for QUIC handling.
-
-C FFI and Python bindings are also available.
+It uses [`boring`](https://github.com/cloudflare/boring/) for TLS processing and [`quiche`](https://github.com/cloudflare/quiche/) for QUIC processing.
 
 ## Requirements
+
+### soyokaze.rs
 
 - Linux / macOS (x86_64, AArch64)
 - Rust 1.88+ (including dependencies, The crate itself is 1.85+)
 - CMake and C/C++ Toolchain (for building BoringSSL)
+
+### soyokaze.h (libsoyokaze)
+
+- Linux / macOS (x86_64, AArch64)
+- Rust 1.88+ (including dependencies, The crate itself is 1.85+)
+- CMake and C/C++ Toolchain
+
+### soyokaze.py
+
+- Linux / macOS (x86_64, AArch64)
+- Python 3.9+
 
 ## Installation
 
@@ -21,37 +32,13 @@ C FFI and Python bindings are also available.
 cargo add soyokaze
 ```
 
-The C ABI ships as part of the same crate. Prebuilt shared and static libraries, plus the matching [`include/soyokaze.h`](include/soyokaze.h), are attached to each [release](https://github.com/nercone-dev/soyokaze/releases) for Linux and macOS on x86_64 and aarch64 — or build them yourself with `cargo build --release --lib`.
-
-The Python bindings in [`python/`](python/) wrap that same shared library through `ctypes` and are published on PyPI with the library bundled into the wheel:
-
 ```bash
-uv pip install soyokaze
+uv add soyokaze
 ```
-
-They locate the shared library through, in order: the `SOYOKAZE_LIBRARY` environment variable, the copy bundled with the package, the crate's own `target/{release,debug}` directory when run from within the repository, and the system loader.
-
-## Examples
-
-[`examples/`](examples/) holds the same program in each language: a server and a client in one process over loopback TCP, which needs no network access and no certificate.
-
-```bash
-cargo run --example loopback
-```
-
-```bash
-cargo build --lib
-cc -std=c11 -Iinclude examples/loopback.c -Ltarget/debug -lsoyokaze -o loopback
-LD_LIBRARY_PATH=target/debug ./loopback  # DYLD_LIBRARY_PATH=target/debug on macOS
-```
-
-```bash
-cd python && uv run examples/loopback.py
-```
-
-[`websocket_loopback.rs`](examples/websocket_loopback.rs), [`websocket_loopback.c`](examples/websocket_loopback.c) and [`python/examples/websocket_loopback.py`](python/examples/websocket_loopback.py) do the same for a WebSocket echo server.
 
 ## Development
+
+### soyokaze.rs
 
 ```bash
 cargo test
@@ -65,13 +52,15 @@ cargo bench
 cargo +nightly fuzz run everything
 ```
 
-The C ABI and Python bindings each have their own test suite. [`tests/ffi.c`](tests/ffi.c) links against the shared library through the header the way an external C caller would, checked alongside [`tests/ffi.rs`](tests/ffi.rs), which drives the same surface from Rust:
+### soyokaze.h
 
 ```bash
 cargo build --lib
 cc -std=c11 -Iinclude tests/ffi.c -Ltarget/debug -lsoyokaze -o ffi-test
 LD_LIBRARY_PATH=target/debug ./ffi-test  # DYLD_LIBRARY_PATH=target/debug on macOS
 ```
+
+### soyokaze.py
 
 ```bash
 cd python

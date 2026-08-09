@@ -33,6 +33,16 @@ class Cluster:
         count = library.soyokaze_cluster_address_count(self.handle)
         return [library.soyokaze_cluster_port_at(self.handle, index) for index in range(count)]
 
+    def address(self):
+        """The address the first listener bound, or ``None``."""
+        addresses = self.addresses()
+        return addresses[0] if addresses else None
+
+    def addresses(self):
+        """Every address the cluster bound, as text."""
+        count = library.soyokaze_cluster_address_count(self.handle)
+        return [library.soyokaze_cluster_address_at(self.handle, index).take().decode() for index in range(count)]
+
     def workers(self):
         """How many worker threads are running."""
         return library.soyokaze_cluster_workers(self.handle)

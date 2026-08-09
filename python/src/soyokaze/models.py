@@ -25,12 +25,38 @@ class Version(enum.IntEnum):
     V2_0 = 2
     V3_0 = 3
 
+    def alpn(self):
+        """The ALPN identifier this version is negotiated under."""
+        return library.soyokaze_version_alpn(int(self)).text()
+
+    @classmethod
+    def from_alpn(cls, alpn):
+        """The version an ALPN identifier names, or ``None``."""
+        alpn = ffi.Library.encoded(alpn)
+        version = library.soyokaze_version_from_alpn(alpn, len(alpn))
+        return None if version < 0 else cls(version)
+
     def major(self):
         """The major version number."""
-        return {Version.V1_0: 1, Version.V1_1: 1, Version.V2_0: 2, Version.V3_0: 3}[self]
+        return library.soyokaze_version_major(int(self))
+
+    def transport(self):
+        """What this version runs over."""
+        return TransportKind(library.soyokaze_version_transport(int(self)))
+
+    def as_str(self):
+        """How the version is written out."""
+        return library.soyokaze_version_name(int(self)).text()
+
+    @classmethod
+    def parse(cls, name):
+        """The version a name spells out, or ``None``."""
+        name = ffi.Library.encoded(name)
+        version = library.soyokaze_version_parse(name, len(name))
+        return None if version < 0 else cls(version)
 
     def __str__(self):
-        return {Version.V1_0: "HTTP/1.0", Version.V1_1: "HTTP/1.1", Version.V2_0: "HTTP/2", Version.V3_0: "HTTP/3"}[self]
+        return self.as_str()
 
 class Method(enum.IntEnum):
     """A request method."""
@@ -45,13 +71,27 @@ class Method(enum.IntEnum):
     TRACE = 7
     PATCH = 8
 
+    def as_str(self):
+        """The method as it is written on the wire."""
+        return library.soyokaze_method_name(int(self)).text()
+
+    @classmethod
+    def parse(cls, name):
+        """The method a name spells out, or ``None``."""
+        name = ffi.Library.encoded(name)
+        method = library.soyokaze_method_parse(name, len(name))
+        return None if method < 0 else cls(method)
+
     def safe(self):
         """Whether the method is read-only, so that issuing it changes nothing."""
-        return self in (Method.GET, Method.HEAD, Method.OPTIONS, Method.TRACE)
+        return library.soyokaze_method_safe(int(self))
 
     def idempotent(self):
         """Whether repeating the method has the same effect as issuing it once."""
-        return self.safe() or self in (Method.PUT, Method.DELETE)
+        return library.soyokaze_method_idempotent(int(self))
+
+    def __str__(self):
+        return self.as_str()
 
 class Role(enum.IntEnum):
     """What one end of a connection is doing on it."""
@@ -64,11 +104,92 @@ class Role(enum.IntEnum):
 
     def is_client(self):
         """Whether this role sends requests and reads responses."""
-        return self in (Role.USER_AGENT, Role.PROXY)
+        return library.soyokaze_role_is_client(int(self))
 
     def is_server(self):
         """Whether this role reads requests and sends responses."""
-        return self in (Role.ORIGIN, Role.GATEWAY)
+        return library.soyokaze_role_is_server(int(self))
+
+class TransportKind(enum.IntEnum):
+    """What a port or a version runs over.
+
+    Nothing keys on a particular version number: a port carries exactly the
+    versions whose transport matches its own, so a future version is routed by
+    what it runs over rather than by name.
+    """
+
+    STREAM = 0
+    QUIC = 1
+
+class HeaderCase(enum.IntEnum):
+    """How field names are cased on the way out.
+
+    Names are always stored lowercase and re-cased as they are written.
+    """
+
+    TITLE = 0
+    LOWER = 1
+
+    @classmethod
+    def from_version(cls, version):
+        """The casing a version expects: title case for HTTP/1.x, lowercase above."""
+        return cls(library.soyokaze_header_case_from_version(int(version)))
+
+    def apply(self, name):
+        """The field name in this casing."""
+        name = ffi.Library.encoded(name)
+        return library.soyokaze_header_case_apply(int(self), name, len(name)).take().decode()
+
+    def apply_in_place(self, name):
+        """Re-cases a field name already written into a mutable buffer."""
+        buffer = (ctypes.c_uint8 * len(name)).from_buffer_copy(ffi.Library.encoded(name))
+        library.soyokaze_header_case_apply_in_place(int(self), buffer, len(buffer))
+        return bytes(buffer)
+
+class BodyKind(enum.IntEnum):
+    """Which kind of body a message carries."""
+
+    NONE = 0
+    DATA = 1
+    TEXT = 2
+    FILE = 3
+
+class ALPN:
+    """The protocol identifiers a TLS or QUIC handshake agrees a version on."""
+
+    @classmethod
+    def list(cls, versions):
+        """The ALPN identifier for each version, in order."""
+        return [Version(version).alpn() for version in versions]
+
+    @classmethod
+    def wire(cls, versions):
+        """The protocol list, each identifier preceded by its length."""
+        array = (ctypes.c_int32 * len(versions))(*[int(version) for version in versions])
+        return library.soyokaze_alpn_wire(array, len(versions)).take()
+
+    @classmethod
+    def select(cls, versions, client):
+        """The first identifier a client offered that these versions also offer."""
+        array = (ctypes.c_int32 * len(versions))(*[int(version) for version in versions])
+        client = ffi.Library.encoded(client)
+        return library.soyokaze_alpn_select(array, len(versions), client, len(client)).bytes()
+
+    @classmethod
+    def negotiated(cls, alpn, versions):
+        """The version an agreed identifier settles on.
+
+        A ``None`` ``alpn`` stands for a handshake that agreed on nothing,
+        which settles on HTTP/1.1 when it is offered and fails otherwise.
+        """
+        array = (ctypes.c_int32 * len(versions))(*[int(version) for version in versions])
+        alpn = None if alpn is None else ffi.Library.encoded(alpn)
+        out, error = ctypes.c_int32(), Error.out()
+        Error.raise_for(
+            library.soyokaze_alpn_negotiated(alpn, 0 if alpn is None else len(alpn), array, len(versions), ctypes.byref(out), ctypes.byref(error)),
+            error,
+        )
+        return Version(out.value)
 
 class PortKind(enum.IntEnum):
     """Which transport a port names."""
@@ -125,6 +246,24 @@ class Port:
 
         return struct
 
+    def transport(self):
+        """The transport family this port carries."""
+        struct = self.build()
+        return TransportKind(library.soyokaze_port_transport(ctypes.byref(struct)))
+
+    def carries(self, version):
+        """Whether this port can carry a version at all."""
+        struct = self.build()
+        return library.soyokaze_port_carries(ctypes.byref(struct), int(version))
+
+    def offers(self, versions):
+        """Which of ``versions`` this port can carry, in the order given."""
+        struct = self.build()
+        array = (ctypes.c_int32 * len(versions))(*[int(version) for version in versions])
+        out = (ctypes.c_int32 * len(versions))()
+        count = library.soyokaze_port_offers(ctypes.byref(struct), array, len(versions), out)
+        return [Version(out[index]) for index in range(min(count, len(versions)))]
+
     @classmethod
     def array(cls, ports):
         """A C array of ``soyokaze_port_t`` and the structs keeping it alive."""
@@ -139,6 +278,22 @@ class Port:
 
 class URL:
     """An absolute URL, split into the parts a request needs."""
+
+    @classmethod
+    def default_port(cls, scheme):
+        """The port a scheme is reached on when the URL does not say."""
+        scheme = ffi.Library.encoded(scheme)
+        return library.soyokaze_url_default_port(scheme, len(scheme))
+
+    @classmethod
+    def authority_of(cls, scheme, host, port):
+        """The authority a scheme, host and port spell out.
+
+        The port is left off when it is the scheme's default, which is what an
+        origin expects to see in ``Host`` or ``:authority``.
+        """
+        scheme, host = ffi.Library.encoded(scheme), ffi.Library.encoded(host)
+        return library.soyokaze_url_authority_of(scheme, len(scheme), host, len(host), port).take().decode()
 
     def __init__(self, url):
         """Parses an absolute URL, raising :class:`ProtocolError` when it will not."""
@@ -183,6 +338,142 @@ class URL:
 
     def __repr__(self):
         return f"URL({self.scheme}://{self.authority()}{self.target})"
+
+class Headers:
+    """A field section: an ordered list of name and value pairs.
+
+    Order is preserved, and a name may repeat — HTTP allows several fields with
+    the same name, and ``set-cookie`` in particular must never be folded
+    together. Names are stored lowercase and compared case-insensitively.
+
+    One borrowed from a :class:`Message` belongs to that message and is valid
+    only for as long as it is; one built here owns itself.
+    """
+
+    @classmethod
+    def bit(cls, matched, index):
+        """``1 << index`` when ``matched``, and zero otherwise."""
+        return library.soyokaze_headers_bit(matched, index)
+
+    @classmethod
+    def well_known(cls, name):
+        """The presence bit that stands for a well-known field name, or zero.
+
+        A section keeps the bitwise or of these over every field it holds,
+        which lets a lookup for one of these names rule itself out without
+        walking the list. The name must already be lowercase.
+        """
+        name = ffi.Library.encoded(name)
+        return library.soyokaze_headers_well_known(name, len(name))
+
+    @classmethod
+    def named(cls, stored, name):
+        """Whether a stored lowercase name is the field ``name`` asks for."""
+        stored, name = ffi.Library.encoded(stored), ffi.Library.encoded(name)
+        return library.soyokaze_headers_named(stored, len(stored), name, len(name))
+
+    @classmethod
+    def with_capacity(cls, fields):
+        """An empty section with room for ``fields`` entries."""
+        return cls(handle=library.soyokaze_headers_with_capacity(fields), owned=True)
+
+    def __init__(self, handle=None, owned=None):
+        """An empty section, or a view of one the library handed back."""
+        self.owned = owned if owned is not None else handle is None
+        self.handle = handle if handle is not None else library.soyokaze_headers_new()
+
+    def __del__(self):
+        if getattr(self, "owned", False) and getattr(self, "handle", None):
+            library.soyokaze_headers_free(self.handle)
+            self.handle = None
+
+    def len(self):
+        """How many fields the section holds."""
+        return library.soyokaze_headers_len(self.handle)
+
+    def is_empty(self):
+        """Whether the section holds nothing."""
+        return library.soyokaze_headers_is_empty(self.handle)
+
+    def contains(self, name):
+        """Whether the section carries ``name`` at all."""
+        name = ffi.Library.encoded(name)
+        return library.soyokaze_headers_contains(self.handle, name, len(name))
+
+    def absent(self, name):
+        """Whether the section carries no field named ``name``."""
+        name = ffi.Library.encoded(name)
+        return library.soyokaze_headers_absent(self.handle, name, len(name))
+
+    def get(self, name):
+        """The first value stored under ``name``, or ``None``."""
+        name = ffi.Library.encoded(name)
+        return library.soyokaze_headers_get(self.handle, name, len(name)).text()
+
+    def get_all(self, name):
+        """Every value stored under ``name``, in order."""
+        encoded = ffi.Library.encoded(name)
+        count = library.soyokaze_headers_get_all_count(self.handle, encoded, len(encoded))
+        return [library.soyokaze_headers_get_all(self.handle, encoded, len(encoded), index).text() for index in range(count)]
+
+    def append(self, name, value):
+        """Adds a field, keeping any already stored under the same name."""
+        name, value = ffi.Library.encoded(name), ffi.Library.encoded(value)
+        if not library.soyokaze_headers_append(self.handle, name, len(name), value, len(value)):
+            raise InvalidError("the field was refused")
+
+    def append_lowercase(self, name, value):
+        """Adds a field whose name is already lowercase, skipping the lowercasing.
+
+        A name that is not already lowercase will never be found by a lookup.
+        """
+        name, value = ffi.Library.encoded(name), ffi.Library.encoded(value)
+        if not library.soyokaze_headers_append_lowercase(self.handle, name, len(name), value, len(value)):
+            raise InvalidError("the field was refused")
+
+    def insert(self, name, value):
+        """Adds a field, dropping any already stored under the same name."""
+        name, value = ffi.Library.encoded(name), ffi.Library.encoded(value)
+        if not library.soyokaze_headers_insert(self.handle, name, len(name), value, len(value)):
+            raise InvalidError("the field was refused")
+
+    def remove(self, name):
+        """Drops every field stored under ``name``, reporting whether any were there."""
+        name = ffi.Library.encoded(name)
+        return library.soyokaze_headers_remove(self.handle, name, len(name))
+
+    def fields(self):
+        """Every field in order, as name and value pairs."""
+        return [
+            (library.soyokaze_headers_name(self.handle, index).text(), library.soyokaze_headers_value(self.handle, index).text())
+            for index in range(self.len())
+        ]
+
+    def iter(self):
+        """Every field in order, as name and value pairs."""
+        return iter(self.fields())
+
+    def __iter__(self):
+        return self.iter()
+
+    def __len__(self):
+        return self.len()
+
+    def __contains__(self, name):
+        return self.contains(name)
+
+    def __getitem__(self, name):
+        return self.get(name)
+
+    def __eq__(self, other):
+        if isinstance(other, Headers):
+            return self.fields() == other.fields()
+        if isinstance(other, list):
+            return self.fields() == other
+        return NotImplemented
+
+    def __repr__(self):
+        return f"Headers({self.fields()!r})"
 
 class Message(ResponseMixin):
     """One HTTP request or response, whichever version framed it.
@@ -248,11 +539,19 @@ class Message(ResponseMixin):
         """The version that framed this message, or is about to."""
         return Version(library.soyokaze_message_version(self.handle))
 
+    @version.setter
+    def version(self, version):
+        library.soyokaze_message_set_version(self.handle, int(Version(version)))
+
     @property
     def method(self):
         """The request method, or ``None`` on a response."""
         method = library.soyokaze_message_method(self.handle)
         return None if method < 0 else Method(method)
+
+    @method.setter
+    def method(self, method):
+        library.soyokaze_message_set_method(self.handle, -1 if method is None else int(Method(method)))
 
     @property
     def status_code(self):
@@ -260,10 +559,27 @@ class Message(ResponseMixin):
         status_code = library.soyokaze_message_status_code(self.handle)
         return None if status_code < 0 else status_code
 
+    @status_code.setter
+    def status_code(self, status_code):
+        library.soyokaze_message_set_status_code(self.handle, -1 if status_code is None else status_code)
+
     @property
     def target(self):
         """The request target, or ``None`` on a response."""
         return library.soyokaze_message_target(self.handle).text()
+
+    @target.setter
+    def target(self, target):
+        encoded = None if target is None else ffi.Library.encoded(target)
+        library.soyokaze_message_set_target(self.handle, encoded, 0 if encoded is None else len(encoded))
+
+    def tunneling(self, method=None):
+        """Whether the message opens a tunnel rather than carrying a body.
+
+        ``method`` is the request method a response is being read against, and
+        is ignored on a request.
+        """
+        return library.soyokaze_message_tunneling(self.handle, -1 if method is None else int(Method(method)))
 
     def is_request(self):
         """Whether this message is a request."""
@@ -300,6 +616,11 @@ class Message(ResponseMixin):
     def connection_id(self):
         """The identifier of the connection the message arrived on, if any."""
         return library.soyokaze_message_connection_id(self.handle).bytes()
+
+    @connection_id.setter
+    def connection_id(self, connection_id):
+        encoded = None if connection_id is None else ffi.Library.encoded(connection_id)
+        library.soyokaze_message_set_connection_id(self.handle, encoded, 0 if encoded is None else len(encoded))
 
     @property
     def early_data(self):
@@ -340,13 +661,14 @@ class Message(ResponseMixin):
         version = library.soyokaze_message_quic_version(self.handle)
         return None if version < 0 else version
 
+    @property
     def headers(self):
-        """Every header field in order, as name and value pairs."""
-        count = library.soyokaze_message_header_count(self.handle)
-        return [
-            (library.soyokaze_message_header_name(self.handle, index).text(), library.soyokaze_message_header_value(self.handle, index).text())
-            for index in range(count)
-        ]
+        """The message's field section, borrowed from it.
+
+        Built empty when the message has none yet, and valid only for as long
+        as the message is.
+        """
+        return Headers(handle=library.soyokaze_message_headers(self.handle), owned=False)
 
     def header(self, name):
         """The first header value stored under ``name``, or ``None``.
@@ -374,13 +696,13 @@ class Message(ResponseMixin):
         encoded = ffi.Library.encoded(name)
         return library.soyokaze_message_remove_header(self.handle, encoded, len(encoded))
 
+    @property
     def trailers(self):
-        """Every trailer field in order, as name and value pairs."""
-        count = library.soyokaze_message_trailer_count(self.handle)
-        return [
-            (library.soyokaze_message_trailer_name(self.handle, index).text(), library.soyokaze_message_trailer_value(self.handle, index).text())
-            for index in range(count)
-        ]
+        """The message's trailer section, borrowed from it.
+
+        As :attr:`headers`, for the fields that follow the body.
+        """
+        return Headers(handle=library.soyokaze_message_trailers(self.handle), owned=False)
 
     def trailer(self, name):
         """The first trailer value stored under ``name``, or ``None``."""
@@ -423,6 +745,30 @@ class Message(ResponseMixin):
 
         if not accepted:
             raise InvalidError("the body was refused")
+
+    def clear_body(self):
+        """Drops the payload."""
+        library.soyokaze_message_clear_body(self.handle)
+
+    def body_kind(self):
+        """Which kind of body the message carries."""
+        return BodyKind(library.soyokaze_message_body_kind(self.handle))
+
+    def body_is_empty(self):
+        """Whether the body is known to be empty.
+
+        A file that has not been read counts as non-empty, since its length is
+        not known until it is.
+        """
+        return library.soyokaze_message_body_is_empty(self.handle)
+
+    def body_inline(self):
+        """The body's octets when they are already in memory, or ``None``."""
+        return library.soyokaze_message_body_inline(self.handle).bytes()
+
+    def body_path(self):
+        """The path a file body names, or ``None``."""
+        return library.soyokaze_message_body_path(self.handle).text()
 
     def body_len(self):
         """How long the body is, or ``None`` when there is none or it is an unread file."""

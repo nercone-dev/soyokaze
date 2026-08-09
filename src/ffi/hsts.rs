@@ -165,3 +165,55 @@ pub unsafe extern "C" fn soyokaze_hsts_store_prune(store: *const HSTSStore) {
         store.prune(Instant::now());
     }
 }
+
+/// How many hosts one [`HSTSStore`] may remember unless told otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_hsts_default_max_entries() -> u32 {
+    crate::hsts::HSTSLimits::default().max_hsts_entries
+}
+
+/// A policy lasting `max_age` seconds, covering this host alone.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_hsts_policy_new(max_age: i64) -> HSTSPolicy {
+    HSTSPolicy::build(&crate::hsts::HSTSPolicy::new(max_age))
+}
+
+/// The form of a host name the store keys on, owned by the caller.
+///
+/// Strips surrounding brackets and any trailing root dot, and lowercases the
+/// rest. Comes back empty with a null pointer for an empty name and for an IP
+/// address, since HSTS applies to host names only.
+///
+/// # Safety
+///
+/// `host` must either be null or point to `host_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_hsts_normalize(host: *const u8, host_len: usize) -> Buffer {
+    match unsafe { Slice::borrow_text(host, host_len) }.and_then(HSTSStore::normalize) {
+        Some(host) => Buffer::new(host.into_bytes()),
+        None => Buffer::EMPTY,
+    }
+}
+
+/// How many hosts the store is remembering.
+///
+/// # Safety
+///
+/// `store` must either be null or be a handle that has not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_hsts_store_len(store: *const HSTSStore) -> usize {
+    match unsafe { store.as_ref() } {
+        Some(store) => crate::helpers::sync::Lock::on(&store.entries).len(),
+        None => 0,
+    }
+}
+
+/// How many hosts the store may remember.
+///
+/// # Safety
+///
+/// As [`soyokaze_hsts_store_len`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_hsts_store_max_entries(store: *const HSTSStore) -> u32 {
+    unsafe { store.as_ref() }.map_or(0, |store| store.limits.max_hsts_entries)
+}

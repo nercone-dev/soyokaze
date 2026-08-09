@@ -89,6 +89,11 @@ pub struct ErrorHandle {
     pub status: Status,
     /// What went wrong, as [`Error`] renders it.
     pub message: String,
+    /// What went wrong, without the prefix the rendering adds.
+    ///
+    /// This is the payload the [`Error`] variant carries, which is what a
+    /// caller narrowing a failure to one stream has to keep.
+    pub reason: String,
     /// The stream that failed, on an [`Error::Stream`].
     pub stream_id: Option<crate::models::StreamID>,
     /// The protocol error code to reset that stream with.
@@ -103,7 +108,36 @@ impl ErrorHandle {
             _ => (None, None),
         };
 
-        Self { status: Status::of(error), message: error.to_string(), stream_id, code }
+        Self { status: Status::of(error), message: error.to_string(), reason: Self::reason(error), stream_id, code }
+    }
+
+    /// The payload `error` carries, without the prefix its rendering adds.
+    pub fn reason(error: &Error) -> String {
+        match error {
+            Error::Closed => String::new(),
+            Error::Protocol(reason) | Error::Limit(reason) | Error::Timeout(reason) | Error::TLS(reason) | Error::Version(reason) => reason.clone(),
+            Error::Stream { reason, .. } => reason.clone(),
+            Error::IO(failure) => failure.to_string(),
+        }
+    }
+
+    /// The [`Error`] a status and a reason stand for.
+    ///
+    /// The statuses raised by the boundary itself — [`Status::Invalid`] and
+    /// [`Status::Runtime`] — have no [`Error`] behind them and read as
+    /// [`Error::Protocol`], since a caller that builds one is describing a
+    /// failure the crate would have called a protocol violation.
+    pub fn build(status: Status, reason: String) -> Error {
+        match status {
+            Status::Ok | Status::Closed => Error::Closed,
+            Status::Protocol | Status::Invalid | Status::Runtime => Error::Protocol(reason),
+            Status::Limit => Error::Limit(reason),
+            Status::Stream => Error::stream(crate::models::StreamID(0), 0, reason),
+            Status::Timeout => Error::Timeout(reason),
+            Status::TLS => Error::TLS(reason),
+            Status::Version => Error::Version(reason),
+            Status::IO => Error::IO(std::io::Error::other(reason)),
+        }
     }
 
     /// Writes `error` through an out parameter, and returns its status.
@@ -134,7 +168,7 @@ impl ErrorHandle {
     /// As [`ErrorHandle::report`].
     pub unsafe fn raise(out: *mut *mut ErrorHandle, status: Status) -> Status {
         if !out.is_null() {
-            let handle = Self { status, message: status.message().to_owned(), stream_id: None, code: None };
+            let handle = Self { status, message: status.message().to_owned(), reason: status.message().to_owned(), stream_id: None, code: None };
             unsafe { *out = Box::into_raw(Box::new(handle)) };
         }
 
@@ -221,4 +255,96 @@ pub unsafe extern "C" fn soyokaze_error_code(error: *const ErrorHandle) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn soyokaze_status_message(status: Status) -> Slice {
     Slice::text(status.message())
+}
+
+/// Builds an [`ErrorHandle`] for a status and the reason that goes with it.
+///
+/// For a caller that raises a failure of its own — a request handler refusing
+/// a message, most of all — and wants it to read exactly like one the crate
+/// raised. A [`Status::Stream`] built this way names stream zero and code
+/// zero; [`soyokaze_error_stream`] names them properly.
+///
+/// # Safety
+///
+/// `reason` must either be null or point to `reason_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_error_new(status: Status, reason: *const u8, reason_len: usize) -> *mut ErrorHandle {
+    let reason = unsafe { Slice::borrow_text(reason, reason_len) }.unwrap_or_default().to_owned();
+    Box::into_raw(Box::new(ErrorHandle::new(&ErrorHandle::build(status, reason))))
+}
+
+/// Builds an [`ErrorHandle`] for one stream that failed.
+///
+/// The connection itself stays usable; `code` is the HTTP/2 or HTTP/3 error
+/// code the stream is reset with.
+///
+/// # Safety
+///
+/// As [`soyokaze_error_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_error_stream(stream_id: u64, code: u64, reason: *const u8, reason_len: usize) -> *mut ErrorHandle {
+    let reason = unsafe { Slice::borrow_text(reason, reason_len) }.unwrap_or_default();
+    Box::into_raw(Box::new(ErrorHandle::new(&Error::stream(crate::models::StreamID(stream_id), code, reason))))
+}
+
+/// Narrows a connection-wide failure to one stream, consuming `error`.
+///
+/// A [`Status::Protocol`] or [`Status::Limit`] failure becomes a
+/// [`Status::Stream`] one, so the stream is reset instead of the connection;
+/// everything else comes back unchanged, because it is not something one
+/// stream can absorb. `error` must not be freed afterwards.
+///
+/// # Safety
+///
+/// `error` must come from an `error` out parameter or one of the constructors
+/// here, and not have been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_error_on_stream(error: *mut ErrorHandle, stream_id: u64, code: u64) -> *mut ErrorHandle {
+    if error.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let handle = *unsafe { Box::from_raw(error) };
+    let narrowed = ErrorHandle::build(handle.status, handle.reason).on_stream(crate::models::StreamID(stream_id), code);
+
+    Box::into_raw(Box::new(ErrorHandle::new(&narrowed)))
+}
+
+/// What went wrong without the prefix the message carries, borrowed from
+/// `error`.
+///
+/// # Safety
+///
+/// As [`soyokaze_error_status`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_error_reason(error: *const ErrorHandle) -> Slice {
+    match unsafe { error.as_ref() } {
+        Some(error) => Slice::text(&error.reason),
+        None => Slice::ABSENT,
+    }
+}
+
+/// Builds an [`ErrorHandle`] for a TLS failure.
+///
+/// # Safety
+///
+/// As [`soyokaze_error_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_error_tls(reason: *const u8, reason_len: usize) -> *mut ErrorHandle {
+    let reason = unsafe { Slice::borrow_text(reason, reason_len) }.unwrap_or_default();
+    Box::into_raw(Box::new(ErrorHandle::new(&Error::tls(reason))))
+}
+
+/// Builds an [`ErrorHandle`] for a failure from the QUIC layer.
+///
+/// QUIC failures read as [`Status::IO`], since what they mean to a caller is
+/// that the transport underneath gave way.
+///
+/// # Safety
+///
+/// As [`soyokaze_error_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_error_quic(reason: *const u8, reason_len: usize) -> *mut ErrorHandle {
+    let reason = unsafe { Slice::borrow_text(reason, reason_len) }.unwrap_or_default();
+    Box::into_raw(Box::new(ErrorHandle::new(&Error::quic(reason))))
 }

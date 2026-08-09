@@ -12,6 +12,18 @@ from . import ffi
 from .errors import Error, InvalidError
 from .ffi import library
 
+class Status:
+    """The reason phrases a status code is conventionally sent with."""
+
+    @classmethod
+    def reason(cls, status_code):
+        """The reason phrase for a status code.
+
+        A code outside the ranges the library knows reads as the phrase for the
+        class it falls in.
+        """
+        return library.soyokaze_status_reason(status_code).text()
+
 class ResponseMixin:
     """The response constructors and cookie methods that extend :class:`Message <models.Message>`.
 
@@ -19,6 +31,50 @@ class ResponseMixin:
     :meth:`Message.version_code <models.Message.version_code>`, so this module
     stands alone rather than reaching back into :mod:`models`.
     """
+
+    @classmethod
+    def content_type(cls, path):
+        """The media type a path's extension names.
+
+        An extension the library does not know reads as
+        ``application/octet-stream``.
+        """
+        path = ffi.Library.encoded(path)
+        return library.soyokaze_content_type(path, len(path)).text()
+
+    @classmethod
+    def upgrade_required(cls, request, version=None, protocol="HTTP/2.0"):
+        """The ``426 Upgrade Required`` for a request in a version this end will not speak.
+
+        ``request`` is read, not consumed.
+        """
+        encoded = ffi.Library.encoded(protocol)
+        handle = library.soyokaze_response_upgrade_required(request.handle, cls.version_code(version), encoded, len(encoded))
+        if not handle:
+            raise InvalidError("the protocol was refused")
+        return cls(handle=handle)
+
+    def finalize_response(self, date=None, hsts=None):
+        """Stamps the fields a response is expected to carry onto this message.
+
+        The ``Date`` field comes from ``date``, or from the shared cache when
+        none is given; ``hsts`` stamps a ``Strict-Transport-Security``.
+        """
+        policy = None if hsts is None else ffi.HSTSPolicy(hsts.max_age, hsts.include_subdomains, hsts.preload)
+        library.soyokaze_message_finalize_response(
+            self.handle,
+            None if date is None else date.handle,
+            None if policy is None else ctypes.byref(policy),
+        )
+
+    def finalize_request(self, authority):
+        """Fills in the authority a request is expected to carry.
+
+        Writes ``Host`` for HTTP/1.x and ``:authority`` above it, and leaves
+        whichever is already there alone.
+        """
+        encoded = ffi.Library.encoded(authority)
+        library.soyokaze_message_finalize_request(self.handle, encoded, len(encoded))
 
     @classmethod
     def content(cls, content_type, body, version=None):

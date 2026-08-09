@@ -39,12 +39,39 @@ class Error(Exception):
 
     status = Status.INVALID
 
-    def __init__(self, message=None, status=None, stream_id=None, code=None):
+    def __init__(self, message=None, status=None, stream_id=None, code=None, reason=None):
         if status is not None:
             self.status = Status(status)
         self.stream_id = stream_id
         self.code = code
+        self.reason = reason if reason is not None else message
         super().__init__(message if message is not None else self.status.message())
+
+    @classmethod
+    def tls(cls, reason):
+        """A TLS failure, as the crate raises one."""
+        return TLSError(reason)
+
+    @classmethod
+    def quic(cls, reason):
+        """A failure from the QUIC layer, which reads as an I/O failure."""
+        return IOError(reason)
+
+    @classmethod
+    def stream(cls, stream_id, code, reason):
+        """A failure that takes one stream down and leaves the connection running."""
+        return StreamError(reason, stream_id=stream_id, code=code)
+
+    def on_stream(self, stream_id, code):
+        """Narrows a connection-wide failure to one stream.
+
+        A protocol or limit failure becomes a :class:`StreamError`, so the
+        stream is reset instead of the connection; everything else comes back
+        unchanged, because it is not something one stream can absorb.
+        """
+        if self.status not in (Status.PROTOCOL, Status.LIMIT):
+            return self
+        return StreamError(str(self), stream_id=stream_id, code=code)
 
     @classmethod
     def of(cls, status):
@@ -75,14 +102,21 @@ class Error(Exception):
         if status == Status.OK:
             return
 
-        message, stream_id, code = None, None, None
+        message, reason, stream_id, code = None, None, None, None
         if error and error.value:
             message = library.soyokaze_error_message(error).text()
+            reason = library.soyokaze_error_reason(error).text()
             stream_id = library.soyokaze_error_stream_id(error)
             code = library.soyokaze_error_code(error)
             library.soyokaze_error_free(error)
 
-        raise cls.of(status)(message, status, None if stream_id is None or stream_id < 0 else stream_id, None if code is None or code < 0 else code)
+        raise cls.of(status)(
+            message,
+            status,
+            None if stream_id is None or stream_id < 0 else stream_id,
+            None if code is None or code < 0 else code,
+            reason,
+        )
 
 class ClosedError(Error):
     """The peer closed the connection, or it was closed under us."""

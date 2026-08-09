@@ -367,3 +367,331 @@ pub struct ECHEntry {
     /// The `ECHConfigList`, as `soyokaze_ech_keys_config_list` produces it.
     pub config_list: Slice,
 }
+
+/// The one TLS version this library speaks, as its wire code.
+///
+/// Nothing below TLS 1.3 is offered or accepted.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_tls_version_1_3() -> u16 {
+    crate::tls::TLSVersion::V1_3.0
+}
+
+/// Which encoding a certificate or key blob is in.
+///
+/// The C half of [`Format`]. One DER blob holds exactly one object, while one
+/// PEM blob holds as many as were concatenated into it — which is how a chain,
+/// or a chain and its key, is usually shipped in a single file.
+///
+/// [`Format`]: crate::tls::Format
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Format {
+    /// Binary DER.
+    DER = 0,
+    /// Base64 DER between armour lines.
+    PEM = 1,
+}
+
+impl Format {
+    /// The C half of `format`.
+    pub fn build(format: crate::tls::Format) -> Self {
+        match format {
+            crate::tls::Format::DER => Self::DER,
+            crate::tls::Format::PEM => Self::PEM,
+        }
+    }
+}
+
+/// The ASN.1 tag every DER object read here opens with: a SEQUENCE.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_format_sequence() -> u8 {
+    crate::tls::Format::SEQUENCE
+}
+
+/// The format a blob is in, recognised from its contents.
+///
+/// The first octet that is not whitespace decides it: DER starts with
+/// [`soyokaze_format_sequence`], and anything else is read as PEM.
+///
+/// # Safety
+///
+/// `raw` must either be null or point to `raw_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_format_of(raw: *const u8, raw_len: usize) -> Format {
+    Format::build(crate::tls::Format::of(unsafe { Slice::borrow(raw, raw_len) }.unwrap_or_default()))
+}
+
+/// How many certificates a blob holds, or `-1` when it will not parse.
+///
+/// A DER blob carries exactly one; a PEM blob carries as many as it holds.
+/// Sections that are not certificates are skipped, so a file holding a chain
+/// and its key counts the chain alone.
+///
+/// # Safety
+///
+/// As [`soyokaze_format_of`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_format_certificate_count(raw: *const u8, raw_len: usize) -> isize {
+    let raw = unsafe { Slice::borrow(raw, raw_len) }.unwrap_or_default();
+
+    match crate::tls::Format::certificates(raw) {
+        Ok(certificates) => certificates.len() as isize,
+        Err(_) => -1,
+    }
+}
+
+/// The certificate at `index` within a blob, as DER, owned by the caller.
+///
+/// An empty buffer with a null pointer means the blob will not parse or holds
+/// no certificate there.
+///
+/// # Safety
+///
+/// As [`soyokaze_format_of`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_format_certificate(raw: *const u8, raw_len: usize, index: usize) -> Buffer {
+    let raw = unsafe { Slice::borrow(raw, raw_len) }.unwrap_or_default();
+
+    let Ok(certificates) = crate::tls::Format::certificates(raw) else {
+        return Buffer::EMPTY;
+    };
+
+    match certificates.get(index).and_then(|certificate| certificate.to_der().ok()) {
+        Some(der) => Buffer::new(der),
+        None => Buffer::EMPTY,
+    }
+}
+
+/// The private key in a blob, as DER, owned by the caller.
+///
+/// An empty buffer with a null pointer means the blob carries no key that will
+/// parse.
+///
+/// # Safety
+///
+/// As [`soyokaze_format_of`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_format_private_key(raw: *const u8, raw_len: usize) -> Buffer {
+    let raw = unsafe { Slice::borrow(raw, raw_len) }.unwrap_or_default();
+
+    match crate::tls::Format::private_key(raw).and_then(|key| key.private_key_to_der().map_err(crate::errors::Error::tls)) {
+        Ok(der) => Buffer::new(der),
+        Err(_) => Buffer::EMPTY,
+    }
+}
+
+/// What a connection turned out to be underneath.
+///
+/// The C half of [`Security`], with the codes it carries flattened: a `-1`
+/// stands for a value the handshake did not settle. Stamped on every message a
+/// connection receives, which is what `soyokaze_message_tls` and its
+/// neighbours read out.
+///
+/// [`Security`]: crate::tls::Security
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Security {
+    /// Whether the transport underneath authenticated the peer.
+    pub secure: bool,
+    /// Whether the message arrived in early data, and so may be a replay.
+    pub early_data: bool,
+    /// Whether the transport underneath was TLS.
+    pub tls: bool,
+    /// The negotiated TLS version's wire code, or `-1`.
+    pub tls_version: i32,
+    /// The negotiated named group's wire code, or `-1`.
+    pub tls_group: i32,
+    /// The negotiated cipher suite's wire code, or `-1`.
+    pub tls_cipher: i32,
+    /// Whether the transport underneath was QUIC.
+    pub quic: bool,
+    /// The negotiated QUIC version, or `-1`.
+    pub quic_version: i64,
+}
+
+impl Security {
+    /// The C half of `security`.
+    pub fn build(security: &crate::tls::Security) -> Self {
+        Self {
+            secure: security.secure,
+            early_data: security.early_data,
+            tls: security.tls,
+            tls_version: security.tls_version.map_or(-1, |version| version.0 as i32),
+            tls_group: security.tls_group.map_or(-1, |group| group.0 as i32),
+            tls_cipher: security.tls_cipher.map_or(-1, |cipher| cipher.0 as i32),
+            quic: security.quic,
+            quic_version: security.quic_version.map_or(-1, |version| version as i64),
+        }
+    }
+
+    /// The [`Security`] this stands for.
+    ///
+    /// [`Security`]: crate::tls::Security
+    pub fn parse(&self) -> crate::tls::Security {
+        crate::tls::Security {
+            secure: self.secure,
+            early_data: self.early_data,
+            tls: self.tls,
+            tls_version: u16::try_from(self.tls_version).ok().map(crate::tls::TLSVersion),
+            tls_group: u16::try_from(self.tls_group).ok().map(crate::tls::TLSGroup),
+            tls_cipher: u16::try_from(self.tls_cipher).ok().map(crate::tls::TLSCipher),
+            quic: self.quic,
+            quic_version: u32::try_from(self.quic_version).ok(),
+        }
+    }
+}
+
+/// What a plain connection reports: nothing negotiated at all.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_security_default() -> Security {
+    Security::build(&crate::tls::Security::default())
+}
+
+/// What a QUIC connection reports.
+///
+/// QUIC always carries TLS 1.3, but the QUIC stack does not hand its session
+/// out, so the cipher suite and group are left unsettled. A negative
+/// `quic_version` stands for a handshake that has not settled one yet.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_security_quic(quic_version: i64) -> Security {
+    Security::build(&crate::tls::Security::quic(u32::try_from(quic_version).ok()))
+}
+
+/// Stamps what the transport turned out to be onto a message.
+///
+/// # Safety
+///
+/// `security` must either be null or point to a readable [`Security`], and
+/// `message` must either be null or be a handle that has not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_security_apply(security: *const Security, message: *mut crate::models::Message) -> bool {
+    let (Some(security), Some(message)) = (unsafe { security.as_ref() }, unsafe { message.as_mut() }) else {
+        return false;
+    };
+
+    security.parse().apply(message);
+    true
+}
+
+/// What a message's connection turned out to be underneath.
+///
+/// The same values `soyokaze_message_tls` and its neighbours read out, in one
+/// call.
+///
+/// # Safety
+///
+/// `message` must either be null or be a handle that has not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_security(message: *const crate::models::Message) -> Security {
+    match unsafe { message.as_ref() } {
+        Some(message) => Security::build(&message.security),
+        None => Security::build(&crate::tls::Security::default()),
+    }
+}
+
+/// The version an ECH configuration must carry to be understood.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_ech_config_supported_version() -> u16 {
+    crate::tls::ECHConfig::VERSION
+}
+
+/// The one key encapsulation mechanism this library generates keys for.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_ech_kem_x25519_hkdf_sha256() -> u16 {
+    ECHKeys::KEM_X25519_HKDF_SHA256
+}
+
+/// The one key derivation function this library offers.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_ech_kdf_hkdf_sha256() -> u16 {
+    ECHKeys::KDF_HKDF_SHA256
+}
+
+/// The one AEAD this library offers.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_ech_aead_aes_128_gcm() -> u16 {
+    ECHKeys::AEAD_AES_128_GCM
+}
+
+/// How long a name a generated configuration says it can cover.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_ech_maximum_name_length() -> u8 {
+    ECHKeys::MAXIMUM_NAME_LENGTH
+}
+
+/// The configuration list an ECH key pair advertises, encoded, owned by the
+/// caller.
+///
+/// A server publishes this in DNS; a client hands it back through
+/// `soyokaze_client_config_t`.
+///
+/// # Safety
+///
+/// `public_key` must either be null or point to `public_key_len` readable
+/// octets, and `public_name` to `public_name_len` of them.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_ech_keys_encode(public_name: *const u8, public_name_len: usize, config_id: u8, public_key: *const u8, public_key_len: usize) -> Buffer {
+    let Some(public_name) = (unsafe { Slice::borrow_text(public_name, public_name_len) }) else {
+        return Buffer::EMPTY;
+    };
+
+    let public_key = unsafe { Slice::borrow(public_key, public_key_len) }.unwrap_or_default();
+    Buffer::new(ECHKeys::encode(public_name, config_id, public_key))
+}
+
+/// How many certificates the identity's chain holds, or `-1` when it will not
+/// parse.
+///
+/// # Safety
+///
+/// `identity` must either be null or be a handle that has not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_identity_certificate_count(identity: *const Identity) -> isize {
+    let Some(identity) = (unsafe { identity.as_ref() }) else {
+        return -1;
+    };
+
+    match identity.chain() {
+        Ok(chain) => chain.len() as isize,
+        Err(_) => -1,
+    }
+}
+
+/// The certificate at `index` in the identity's chain, as DER, owned by the
+/// caller.
+///
+/// # Safety
+///
+/// As [`soyokaze_identity_certificate_count`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_identity_certificate(identity: *const Identity, index: usize) -> Buffer {
+    let Some(identity) = (unsafe { identity.as_ref() }) else {
+        return Buffer::EMPTY;
+    };
+
+    let Ok(chain) = identity.chain() else {
+        return Buffer::EMPTY;
+    };
+
+    match chain.get(index).and_then(|certificate| certificate.to_der().ok()) {
+        Some(der) => Buffer::new(der),
+        None => Buffer::EMPTY,
+    }
+}
+
+/// The identity's private key, as DER, owned by the caller.
+///
+/// # Safety
+///
+/// As [`soyokaze_identity_certificate_count`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_identity_private_key(identity: *const Identity) -> Buffer {
+    let Some(identity) = (unsafe { identity.as_ref() }) else {
+        return Buffer::EMPTY;
+    };
+
+    match identity.private_key().and_then(|key| key.private_key_to_der().map_err(crate::errors::Error::tls)) {
+        Ok(der) => Buffer::new(der),
+        Err(_) => Buffer::EMPTY,
+    }
+}

@@ -173,3 +173,47 @@ pub unsafe extern "C" fn soyokaze_message_delete_cookie(message: *mut Message, c
         Err(failure) => unsafe { ErrorHandle::report(error, &failure) },
     }
 }
+
+/// The reason phrase a status code is conventionally sent with, borrowed from
+/// the library.
+///
+/// A code outside the ranges the library knows reads as the phrase for the
+/// class it falls in.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_status_reason(status_code: u16) -> Slice {
+    Slice::text(crate::responses::Status::reason(status_code))
+}
+
+/// The media type a path's extension names, borrowed from the library.
+///
+/// An extension the library does not know reads as
+/// `application/octet-stream`.
+///
+/// # Safety
+///
+/// `path` must either be null or point to `path_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_content_type(path: *const u8, path_len: usize) -> Slice {
+    match unsafe { Slice::borrow_text(path, path_len) } {
+        Some(path) => Slice::text(crate::models::Message::content_type(path)),
+        None => Slice::ABSENT,
+    }
+}
+
+/// The `426 Upgrade Required` a server answers with when it will not speak the
+/// version a request came in on.
+///
+/// `request` is read, not consumed.
+///
+/// # Safety
+///
+/// `request` must either be null or be a handle that has not been freed, and
+/// `protocol` must point to `protocol_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_response_upgrade_required(request: *const Message, version: Version, protocol: *const u8, protocol_len: usize) -> *mut Message {
+    let (Some(request), Some(protocol)) = (unsafe { request.as_ref() }, unsafe { Slice::borrow_text(protocol, protocol_len) }) else {
+        return std::ptr::null_mut();
+    };
+
+    Box::into_raw(Box::new(Message::upgrade_required(request, version, protocol)))
+}

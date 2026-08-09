@@ -561,3 +561,230 @@ pub unsafe extern "C" fn soyokaze_cookiejar_prune(jar: *const CookieJar) {
         jar.prune(Instant::now());
     }
 }
+
+/// How many cookies one jar may hold unless told otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_cookie_default_max_cookies() -> u32 {
+    crate::cookies::CookieLimits::default().max_cookies
+}
+
+/// How many cookies one jar may hold per domain unless told otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_cookie_default_max_cookies_per_domain() -> u16 {
+    crate::cookies::CookieLimits::default().max_cookies_per_domain
+}
+
+/// Whether an octet separates cookie pairs rather than belonging to one.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_cookie_is_separator(octet: u8) -> bool {
+    Cookie::is_separator(octet)
+}
+
+/// How a `SameSite` attribute is written out, borrowed from the library.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_samesite_name(samesite: i32) -> Slice {
+    match SameSite::from_code(samesite) {
+        Some(samesite) => Slice::text(samesite.as_str()),
+        None => Slice::ABSENT,
+    }
+}
+
+/// The `SameSite` attribute a name spells out, or `-1` when it spells none.
+///
+/// The name is matched case-insensitively, as the attribute is written.
+///
+/// # Safety
+///
+/// `name` must either be null or point to `name_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_samesite_parse(name: *const u8, name_len: usize) -> i32 {
+    match unsafe { Slice::borrow_text(name, name_len) }.and_then(SameSite::parse) {
+        Some(samesite) => samesite as i32,
+        None => -1,
+    }
+}
+
+impl SameSite {
+    /// The attribute a wire code names, or `None` when it names none.
+    ///
+    /// A negative code stands for an absent attribute, which is how a caller
+    /// says the cookie carries none.
+    pub fn from_code(code: i32) -> Option<Self> {
+        Some(match code {
+            0 => Self::Strict,
+            1 => Self::Lax,
+            2 => Self::None,
+            _ => return None,
+        })
+    }
+}
+
+/// Reads a `Max-Age` attribute, writing the seconds through `out`.
+///
+/// Returns whether it parsed. A value that is not a run of digits, optionally
+/// signed, is refused; one too large to hold saturates rather than wrapping.
+///
+/// # Safety
+///
+/// `text` must either be null or point to `text_len` readable octets, and
+/// `out` must either be null or be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_setcookie_age(text: *const u8, text_len: usize, out: *mut i64) -> bool {
+    let Some(age) = unsafe { Slice::borrow_text(text, text_len) }.and_then(SetCookie::age) else {
+        return false;
+    };
+
+    if !out.is_null() {
+        unsafe { *out = age };
+    }
+
+    true
+}
+
+/// Whether a cookie's `Path` covers a request target.
+///
+/// # Safety
+///
+/// `target` and `path` must either be null or point to their stated number of
+/// readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_cookie_path_matches(target: *const u8, target_len: usize, path: *const u8, path_len: usize) -> bool {
+    let (Some(target), Some(path)) = (unsafe { Slice::borrow_text(target, target_len) }, unsafe { Slice::borrow_text(path, path_len) }) else {
+        return false;
+    };
+
+    crate::cookies::StoredCookie::path_matches(target, path)
+}
+
+/// The `Path` a cookie takes when the attribute is absent, owned by the
+/// caller.
+///
+/// # Safety
+///
+/// `target` must either be null or point to `target_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_cookie_default_path(target: *const u8, target_len: usize) -> Buffer {
+    match unsafe { Slice::borrow_text(target, target_len) } {
+        Some(target) => Buffer::new(crate::cookies::StoredCookie::default_path(target).into_bytes()),
+        None => Buffer::EMPTY,
+    }
+}
+
+/// How many cookies the jar is holding.
+///
+/// # Safety
+///
+/// `jar` must either be null or be a handle that has not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_cookiejar_count(jar: *const CookieJar) -> usize {
+    match unsafe { jar.as_ref() } {
+        Some(jar) => crate::helpers::sync::Lock::on(&jar.entries).len(),
+        None => 0,
+    }
+}
+
+/// How many cookies the jar may hold.
+///
+/// # Safety
+///
+/// As [`soyokaze_cookiejar_count`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_cookiejar_max_cookies(jar: *const CookieJar) -> u32 {
+    unsafe { jar.as_ref() }.map_or(0, |jar| jar.limits.max_cookies)
+}
+
+/// How many cookies the jar may hold for one domain.
+///
+/// # Safety
+///
+/// As [`soyokaze_cookiejar_count`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_cookiejar_max_cookies_per_domain(jar: *const CookieJar) -> u16 {
+    unsafe { jar.as_ref() }.map_or(0, |jar| jar.limits.max_cookies_per_domain)
+}
+
+/// A stored cookie, as the jar holds it.
+///
+/// The C half of [`StoredCookie`]. The text points into a buffer the caller
+/// owns, filled by [`soyokaze_cookiejar_entry`] and freed with
+/// `soyokaze_buffer_free`.
+///
+/// [`StoredCookie`]: crate::cookies::StoredCookie
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct StoredCookie {
+    /// The cookie name.
+    pub name: Slice,
+    /// The cookie value.
+    pub value: Slice,
+    /// The domain the cookie is sent to.
+    pub domain: Slice,
+    /// Whether it is sent to that host alone rather than its subdomains too.
+    pub host_only: bool,
+    /// The path prefix the cookie is sent under.
+    pub path: Slice,
+    /// Whether it is sent over secure transports only.
+    pub secure: bool,
+    /// How many seconds until it expires, or `-1` when it lasts the session.
+    pub expires_in: f64,
+}
+
+/// Reads the cookie at `index` out of the jar.
+///
+/// The four pieces of text are written into one buffer, handed back through
+/// `storage`, which the caller frees with `soyokaze_buffer_free` once it is
+/// done with the entry. Returns whether there was a cookie at `index`.
+///
+/// # Safety
+///
+/// As [`soyokaze_cookiejar_count`], and `out` and `storage` must either be
+/// null or be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_cookiejar_entry(jar: *const CookieJar, index: usize, out: *mut StoredCookie, storage: *mut Buffer) -> bool {
+    let Some(jar) = (unsafe { jar.as_ref() }) else {
+        return false;
+    };
+
+    let entries = crate::helpers::sync::Lock::on(&jar.entries);
+
+    let Some(entry) = entries.get(index) else {
+        return false;
+    };
+
+    let mut octets = Vec::with_capacity(entry.name.len() + entry.value.len() + entry.domain.len() + entry.path.len());
+    let mut spans = Vec::with_capacity(4);
+
+    for part in [&entry.name, &entry.value, &entry.domain, &entry.path] {
+        spans.push((octets.len(), part.len()));
+        octets.extend_from_slice(part.as_bytes());
+    }
+
+    let expires_in = match entry.expires {
+        Some(expires) => expires.saturating_duration_since(Instant::now()).as_secs_f64(),
+        None => -1.0,
+    };
+
+    let buffer = Buffer::new(octets);
+    let view = |(at, len): (usize, usize)| Slice { data: unsafe { buffer.data.add(at) }, len };
+
+    if !out.is_null() {
+        unsafe {
+            *out = StoredCookie {
+                name: view(spans[0]),
+                value: view(spans[1]),
+                domain: view(spans[2]),
+                host_only: entry.host_only,
+                path: view(spans[3]),
+                secure: entry.secure,
+                expires_in,
+            }
+        };
+    }
+
+    match storage.is_null() {
+        true => unsafe { crate::ffi::soyokaze_buffer_free(buffer) },
+        false => unsafe { *storage = buffer },
+    }
+
+    true
+}

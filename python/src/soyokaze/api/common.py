@@ -1,10 +1,14 @@
-"""What the client and the server configure in common.
+"""What the two entry points configure in common.
 
-:data:`VERSIONS` is the version list both configurations offer by default.
-:class:`Limits` lives with the rest of the shared vocabulary in
-:mod:`soyokaze.models`, mirroring the crate.
+The one thing the crate's ``api::common`` holds: the versions a client offers
+and a server accepts when nothing narrows them, newest first.
 """
 
+from ..ffi import library
 from ..models import Version
 
-VERSIONS = [Version.V3_0, Version.V2_0, Version.V1_1]
+VERSIONS = tuple(
+    Version(library.soyokaze_versions_at(index))
+    for index in range(library.soyokaze_versions_count())
+)
+"""The versions offered when nothing narrows them, newest first."""

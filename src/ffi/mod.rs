@@ -50,13 +50,34 @@ pub mod tls;
 pub mod api {
     //! The two entry points a caller of the library reaches for first, from C.
     //!
-    //! [`client`] dials an origin, and [`server`] binds ports and accepts
-    //! connections.
+    //! [`client`] dials an origin, [`server`] binds ports and accepts
+    //! connections, and [`common`] holds what the two configure in common.
+    //! [`gate`] is the server's admission control, and [`cluster`] runs it
+    //! across worker threads.
     //!
     //! Each module wraps its namesake in [`crate::api`].
 
+    pub mod common;
     pub mod client;
     pub mod server;
+    pub mod gate;
+    pub mod cluster;
+}
+
+pub mod protocol {
+    //! One connection type per HTTP version, over a shared vocabulary, from C.
+    //!
+    //! Each module wraps its namesake in [`crate::protocol`]. What crosses is
+    //! the wire format each version is written in — frames, field sections,
+    //! start lines, chunks — rather than the connections themselves, which are
+    //! reached through [`crate::ffi::api`] as one kind of handle whichever
+    //! version framed them.
+
+    pub mod common;
+    pub mod quic;
+    pub mod h1;
+    pub mod h2;
+    pub mod h3;
 }
 
 pub mod helpers {
@@ -65,7 +86,10 @@ pub mod helpers {
     //! Each module wraps its namesake in [`crate::helpers`].
 
     pub mod base64;
+    pub mod scan;
+    pub mod text;
     pub mod sha1;
+    pub mod sync;
     pub mod huffman;
     pub mod fields;
     pub mod hpack;

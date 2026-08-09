@@ -595,3 +595,197 @@ pub unsafe extern "C" fn soyokaze_connection_free(connection: *mut AnyConnection
         drop(unsafe { Box::from_raw(connection) });
     }
 }
+
+/// The connection identifier a client would give a connection to `host` on
+/// `target`, owned by the caller.
+///
+/// The same identifier every message on that connection carries, so a caller
+/// can key its own bookkeeping on what the library will use.
+///
+/// # Safety
+///
+/// `client` must either be null or be a handle that has not been freed, `host`
+/// must point to `host_len` readable octets, and `target` must point to a
+/// readable [`Port`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_client_id(client: *const Client, host: *const u8, host_len: usize, target: *const Port) -> Buffer {
+    let (Some(client), Some(host), Some(target)) = (unsafe { client.as_ref() }, unsafe { Slice::borrow_text(host, host_len) }, unsafe { target.as_ref() }.and_then(|target| unsafe { target.parse() })) else {
+        return Buffer::EMPTY;
+    };
+
+    Buffer::new(client.id(host, &target).0.to_vec())
+}
+
+/// The authority a client would send for `host` on `target`, owned by the
+/// caller.
+///
+/// The port is left off when it is the scheme's default, which is what an
+/// origin expects to see in `Host` or `:authority`.
+///
+/// # Safety
+///
+/// As [`soyokaze_client_id`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_client_authority(client: *const Client, host: *const u8, host_len: usize, target: *const Port) -> Buffer {
+    let (Some(client), Some(host), Some(target)) = (unsafe { client.as_ref() }, unsafe { Slice::borrow_text(host, host_len) }, unsafe { target.as_ref() }.and_then(|target| unsafe { target.parse() })) else {
+        return Buffer::EMPTY;
+    };
+
+    Buffer::new(client.authority(host, &target).into_bytes())
+}
+
+/// The ECH configuration list a client would use for `host`, borrowed from the
+/// client.
+///
+/// Absent when the client has none for that host, either exactly or through
+/// the `*` fallback.
+///
+/// # Safety
+///
+/// `client` must either be null or be a handle that has not been freed, and
+/// `host` must point to `host_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_client_ech(client: *const Client, host: *const u8, host_len: usize) -> Slice {
+    let (Some(client), Some(host)) = (unsafe { client.as_ref() }, unsafe { Slice::borrow_text(host, host_len) }) else {
+        return Slice::ABSENT;
+    };
+
+    match client.ech(host) {
+        Some(config) => Slice::new(config),
+        None => Slice::ABSENT,
+    }
+}
+
+/// The version a client would use without negotiating one.
+///
+/// A plain connection has no ALPN to settle a version with, so the client must
+/// have been given exactly one version to offer. Fails when it was given
+/// several, since nothing could then choose between them.
+///
+/// # Safety
+///
+/// `client` must either be null or be a handle that has not been freed, and
+/// `out` must either be null or be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_client_prior_version(client: *const Client, out: *mut Version, error: *mut *mut ErrorHandle) -> Status {
+    let Some(client) = (unsafe { client.as_ref() }) else {
+        return unsafe { ErrorHandle::raise(error, Status::Invalid) };
+    };
+
+    match client.prior_version() {
+        Ok(version) => {
+            if !out.is_null() {
+                unsafe { *out = version };
+            }
+
+            Status::Ok
+        }
+        Err(failure) => unsafe { ErrorHandle::report(error, &failure) },
+    }
+}
+
+/// Whether every version the client offers runs over QUIC.
+///
+/// A client like that dials UDP and nothing else, which is what decides how a
+/// URL with no port is reached.
+///
+/// # Safety
+///
+/// `client` must either be null or be a handle that has not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_client_only_quic(client: *const Client) -> bool {
+    unsafe { client.as_ref() }.is_some_and(|client| client.only_quic())
+}
+
+/// How many versions the client offers.
+///
+/// # Safety
+///
+/// As [`soyokaze_client_only_quic`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_client_version_count(client: *const Client) -> usize {
+    unsafe { client.as_ref() }.map_or(0, |client| client.config.versions.len())
+}
+
+/// The version at `index` among those the client offers, or `-1` past the end.
+///
+/// # Safety
+///
+/// As [`soyokaze_client_only_quic`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_client_version_at(client: *const Client, index: usize) -> i32 {
+    match unsafe { client.as_ref() }.and_then(|client| client.config.versions.get(index)) {
+        Some(&version) => version as i32,
+        None => -1,
+    }
+}
+
+/// The client's cookie jar, as a handle of its own, or null when it keeps
+/// none.
+///
+/// Borrowed from the client and valid until it is freed; it must not be freed
+/// with `soyokaze_cookiejar_free`, which would take the client's jar with it.
+///
+/// # Safety
+///
+/// As [`soyokaze_client_only_quic`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_client_jar(client: *const Client) -> *const crate::cookies::CookieJar {
+    match unsafe { client.as_ref() }.and_then(|client| client.jar.as_ref()) {
+        Some(jar) => std::sync::Arc::as_ptr(jar),
+        None => std::ptr::null(),
+    }
+}
+
+/// The client's HSTS store, as a handle of its own, or null when it keeps
+/// none.
+///
+/// As [`soyokaze_client_jar`], for the store.
+///
+/// # Safety
+///
+/// As [`soyokaze_client_only_quic`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_client_store(client: *const Client) -> *const crate::hsts::HSTSStore {
+    match unsafe { client.as_ref() }.and_then(|client| client.store.as_ref()) {
+        Some(store) => std::sync::Arc::as_ptr(store),
+        None => std::ptr::null(),
+    }
+}
+
+/// Rewrites a URL to `https` when the client's HSTS store insists on it.
+///
+/// Does nothing when the client keeps no store, or when the host has no policy
+/// on file. Returns whether the URL was rewritten.
+///
+/// # Safety
+///
+/// `client` must either be null or be a handle that has not been freed, and
+/// `url` must be a handle that has not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_client_apply_hsts(client: *const Client, url: *mut URL) -> bool {
+    let (Some(client), Some(url)) = (unsafe { client.as_ref() }, unsafe { url.as_mut() }) else {
+        return false;
+    };
+
+    let before = url.scheme.clone();
+    client.apply_hsts(url, std::time::Instant::now());
+    before != url.scheme
+}
+
+/// Builds the request finalizer a client would use for `authority`.
+///
+/// Freed with `soyokaze_request_finalizer_free`.
+///
+/// # Safety
+///
+/// `client` must either be null or be a handle that has not been freed, and
+/// `authority` must point to `authority_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_client_request_finalizer(client: *const Client, authority: *const u8, authority_len: usize) -> *mut crate::finalizer::RequestFinalizer {
+    let (Some(client), Some(authority)) = (unsafe { client.as_ref() }, unsafe { Slice::borrow_text(authority, authority_len) }) else {
+        return std::ptr::null_mut();
+    };
+
+    Box::into_raw(Box::new(client.request_finalizer(authority)))
+}

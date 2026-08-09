@@ -21,8 +21,79 @@ class SameSite(enum.IntEnum):
     LAX = 1
     NONE = 2
 
+    def as_str(self):
+        """How the attribute is written out."""
+        return library.soyokaze_samesite_name(int(self)).text()
+
+    @classmethod
+    def parse(cls, name):
+        """The attribute a name spells out, or ``None``.
+
+        The name is matched case-insensitively, as the attribute is written.
+        """
+        name = ffi.Library.encoded(name)
+        samesite = library.soyokaze_samesite_parse(name, len(name))
+        return None if samesite < 0 else cls(samesite)
+
+    def __str__(self):
+        return self.as_str()
+
+class CookieLimits:
+    """What one :class:`CookieJar` may hold."""
+
+    max_cookies = library.soyokaze_cookie_default_max_cookies()
+    """How many cookies a jar may hold unless told otherwise."""
+
+    max_cookies_per_domain = library.soyokaze_cookie_default_max_cookies_per_domain()
+    """How many cookies a jar may hold per domain unless told otherwise."""
+
+    def __init__(self, max_cookies=None, max_cookies_per_domain=None):
+        if max_cookies is not None:
+            self.max_cookies = max_cookies
+        if max_cookies_per_domain is not None:
+            self.max_cookies_per_domain = max_cookies_per_domain
+
+    def __repr__(self):
+        return f"CookieLimits({self.max_cookies}, {self.max_cookies_per_domain})"
+
+class StoredCookie:
+    """A cookie as a :class:`CookieJar` holds it.
+
+    ``expires_in`` is how many seconds are left before it expires, or ``None``
+    when it lasts the session.
+    """
+
+    @classmethod
+    def path_matches(cls, target, cookie_path):
+        """Whether a cookie's ``Path`` covers a request target."""
+        target, cookie_path = ffi.Library.encoded(target), ffi.Library.encoded(cookie_path)
+        return library.soyokaze_cookie_path_matches(target, len(target), cookie_path, len(cookie_path))
+
+    @classmethod
+    def default_path(cls, target):
+        """The ``Path`` a cookie takes when the attribute is absent."""
+        target = ffi.Library.encoded(target)
+        return library.soyokaze_cookie_default_path(target, len(target)).take().decode()
+
+    def __init__(self, name, value, domain, host_only, path, secure, expires_in):
+        self.name = name
+        self.value = value
+        self.domain = domain
+        self.host_only = host_only
+        self.path = path
+        self.secure = secure
+        self.expires_in = expires_in
+
+    def __repr__(self):
+        return f"StoredCookie({self.name!r}, {self.value!r}, domain={self.domain!r}, path={self.path!r})"
+
 class Cookie:
     """The contents of a ``Cookie`` field: the pairs a client sends back."""
+
+    @classmethod
+    def is_separator(cls, octet):
+        """Whether an octet separates pairs rather than belonging to one."""
+        return library.soyokaze_cookie_is_separator(octet)
 
     def __init__(self, handle=None):
         """An empty set of pairs, or a wrapper around an existing handle."""
@@ -203,15 +274,53 @@ class CookieJar:
     :class:`Client`: soyokaze.client.Client
     """
 
-    def __init__(self, limits=None):
-        """An empty jar, bounded by ``limits`` or the defaults."""
-        struct = Limits.argument(limits)
-        self.handle = library.soyokaze_cookiejar_new(Limits.pointer(struct))
+    def __init__(self, limits=None, handle=None):
+        """An empty jar bounded by ``limits``, or a view of one already built.
+
+        A jar reached through :attr:`Client.jar <soyokaze.api.client.Client.jar>`
+        belongs to that client: it is borrowed rather than owned, and is valid
+        only for as long as the client is.
+        """
+        self.owned = handle is None
+        self.handle = handle if handle is not None else library.soyokaze_cookiejar_new(Limits.pointer(Limits.argument(limits)))
 
     def __del__(self):
-        if getattr(self, "handle", None):
+        if getattr(self, "owned", False) and getattr(self, "handle", None):
             library.soyokaze_cookiejar_free(self.handle)
             self.handle = None
+
+    @property
+    def limits(self):
+        """What this jar may hold."""
+        return CookieLimits(
+            library.soyokaze_cookiejar_max_cookies(self.handle),
+            library.soyokaze_cookiejar_max_cookies_per_domain(self.handle),
+        )
+
+    def entries(self):
+        """Every cookie the jar is holding, as :class:`StoredCookie` values."""
+        stored = []
+
+        for index in range(library.soyokaze_cookiejar_count(self.handle)):
+            entry, storage = ffi.StoredCookie(), ffi.Buffer()
+            if not library.soyokaze_cookiejar_entry(self.handle, index, ctypes.byref(entry), ctypes.byref(storage)):
+                break
+
+            stored.append(StoredCookie(
+                entry.name.text(),
+                entry.value.text(),
+                entry.domain.text(),
+                entry.host_only,
+                entry.path.text(),
+                entry.secure,
+                None if entry.expires_in < 0 else entry.expires_in,
+            ))
+            storage.take()
+
+        return stored
+
+    def __len__(self):
+        return library.soyokaze_cookiejar_count(self.handle)
 
     def learn(self, url, values):
         """Takes in the ``Set-Cookie`` values a response for ``url`` carried.

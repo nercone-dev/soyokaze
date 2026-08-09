@@ -79,5 +79,5 @@ def test_set_cookie_goes_onto_a_response_and_delete_zeroes_it():
     assert response.header("set-cookie") == "sid=abc"
 
     response.delete_cookie(SetCookie("sid", "abc"))
-    values = [value for name, value in response.headers() if name == "set-cookie"]
+    values = [value for name, value in response.headers if name == "set-cookie"]
     assert values == ["sid=abc", "sid=; Max-Age=0"]

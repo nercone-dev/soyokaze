@@ -19,6 +19,7 @@ from ..models import Limits, Message, Port, Version
 from ..runtime import Runtime
 from ..websocket import WebSocketConnection
 from .cluster import Cluster
+from .gate import Gate
 
 class ServerLimits:
     """The limits a server applies on top of the per-message :class:`Limits`.
@@ -37,6 +38,15 @@ class ServerLimits:
         self.max_connection_rate = max_connection_rate if max_connection_rate is not None else []
         self.max_connection_history = max_connection_history if max_connection_history is not None else defaults.max_connection_history
         self.worker_stack_size = worker_stack_size if worker_stack_size is not None else defaults.worker_stack_size
+
+    def gate(self):
+        """The admission gate these limits describe.
+
+        The same gate a server built from these limits would admit connections
+        through.
+        """
+        struct = self.build()
+        return Gate(handle=library.soyokaze_server_limits_gate(ctypes.byref(struct)))
 
     def build(self):
         """The ``soyokaze_server_limits_t`` this stands for.
@@ -166,6 +176,11 @@ class ServerHandle:
         count = library.soyokaze_server_handle_address_count(self.handle)
         return [library.soyokaze_server_handle_port_at(self.handle, index) for index in range(count)]
 
+    def addresses(self):
+        """Every address the server bound, as text."""
+        count = library.soyokaze_server_handle_address_count(self.handle)
+        return [library.soyokaze_server_handle_address_at(self.handle, index).take().decode() for index in range(count)]
+
     def close(self, timeout=None):
         """Stops accepting and waits for connections to finish.
 
@@ -175,6 +190,60 @@ class ServerHandle:
         if self.handle:
             library.soyokaze_server_handle_close(self.runtime.handle, self.handle, -1.0 if timeout is None else timeout)
             self.handle = None
+
+class RawSocket:
+    """A bound socket that no runtime has adopted yet.
+
+    Sockets are opened before worker threads start, so this is deliberately
+    runtime-free. A caller that wants to bind its ports itself — to drop
+    privileges after binding, or to hand a socket to another process — opens
+    one with :meth:`Server.open` and reads the descriptor off it.
+
+    The handle owns the descriptor: dropping it closes the socket.
+    """
+
+    def __init__(self, handle):
+        self.handle = handle
+
+    def __del__(self):
+        if getattr(self, "handle", None):
+            library.soyokaze_raw_socket_free(self.handle)
+            self.handle = None
+
+    def address(self):
+        """The address the socket is bound to, or ``None``.
+
+        A Unix socket has none, so it always reads as ``None``.
+        """
+        address = library.soyokaze_raw_socket_address(self.handle).taken()
+        return None if address is None else address.decode()
+
+    @property
+    def port(self):
+        """The port the socket is bound to, or zero when it has none."""
+        return library.soyokaze_raw_socket_port(self.handle)
+
+    @property
+    def descriptor(self):
+        """The descriptor underneath, for a caller handing the socket elsewhere.
+
+        The socket still owns it: dropping this object closes the descriptor,
+        so a caller that passes it on must keep the object alive.
+        """
+        return library.soyokaze_raw_socket_descriptor(self.handle)
+
+    def share(self):
+        """Duplicates the descriptor, so several workers may accept from one socket.
+
+        This is the fallback when ``SO_REUSEPORT`` is off, and the only way for
+        a Unix socket, which cannot be bound twice.
+        """
+        out, error = ctypes.c_void_p(), Error.out()
+        Error.raise_for(library.soyokaze_raw_socket_share(self.handle, ctypes.byref(out), ctypes.byref(error)), error)
+        return RawSocket(out)
+
+    def __repr__(self):
+        return f"RawSocket({self.address()!r})"
 
 class Server:
     """An HTTP server.
@@ -232,6 +301,27 @@ class Server:
                     connection.close()
 
         return ffi.ON_WEBSOCKET(run)
+
+    def versions(self):
+        """The versions this server accepts, in the order it accepts them."""
+        count = library.soyokaze_server_version_count(self.handle)
+        return [Version(library.soyokaze_server_version_at(self.handle, index)) for index in range(count)]
+
+    @property
+    def reuseport(self):
+        """Whether each worker's socket is bound with ``SO_REUSEPORT``."""
+        return library.soyokaze_server_reuseport(self.handle)
+
+    def open(self, target):
+        """Binds one port without starting anything on it.
+
+        The socket is bound and, for a stream port, listening, but nothing
+        accepts from it until a server adopts it.
+        """
+        struct = target.build()
+        out, error = ctypes.c_void_p(), Error.out()
+        Error.raise_for(library.soyokaze_server_open(self.handle, ctypes.byref(struct), ctypes.byref(out), ctypes.byref(error)), error)
+        return RawSocket(out)
 
     def serve(self, handler, ports, on_websocket=None, runtime=None):
         """Binds every port and starts serving.

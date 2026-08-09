@@ -424,6 +424,7 @@ impl FromStr for Method {
 ///
 /// The role decides which side sends requests, which stream identifiers may be
 /// opened, and whether the crate fills in server-side fields such as `Date`.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     /// Originates requests on its own behalf.

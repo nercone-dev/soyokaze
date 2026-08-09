@@ -11,6 +11,9 @@ import ctypes
 from .. import ffi
 from ..errors import Error, InvalidError
 from ..ffi import library
+from ..cookies import CookieJar
+from ..finalizer import RequestFinalizer
+from ..hsts import HSTSStore
 from ..models import Limits, Message, Method, Role, Version
 from ..runtime import Runtime
 from ..websocket import WebSocketConnection
@@ -266,3 +269,75 @@ class Client:
         encoded = ffi.Library.encoded(url)
         Error.raise_for(library.soyokaze_client_websocket(self.runtime.handle, self.handle, encoded, len(encoded), ctypes.byref(out), ctypes.byref(error)), error)
         return WebSocketConnection(out)
+
+    def id(self, host, target):
+        """The connection identifier this client would give a connection.
+
+        The same identifier every message on that connection carries, so a
+        caller can key its own bookkeeping on what the library will use.
+        """
+        encoded, struct = ffi.Library.encoded(host), target.build()
+        return library.soyokaze_client_id(self.handle, encoded, len(encoded), ctypes.byref(struct)).take()
+
+    def authority(self, host, target):
+        """The authority this client would send for a host and port.
+
+        The port is left off when it is the scheme's default, which is what an
+        origin expects to see in ``Host`` or ``:authority``.
+        """
+        encoded, struct = ffi.Library.encoded(host), target.build()
+        return library.soyokaze_client_authority(self.handle, encoded, len(encoded), ctypes.byref(struct)).take().decode()
+
+    def ech(self, host):
+        """The ECH configuration list this client would use for a host, or ``None``."""
+        encoded = ffi.Library.encoded(host)
+        return library.soyokaze_client_ech(self.handle, encoded, len(encoded)).bytes()
+
+    def prior_version(self):
+        """The version this client would use without negotiating one.
+
+        A plain connection has no ALPN to settle a version with, so the client
+        must have been given exactly one version to offer.
+        """
+        out, error = ctypes.c_int32(), Error.out()
+        Error.raise_for(library.soyokaze_client_prior_version(self.handle, ctypes.byref(out), ctypes.byref(error)), error)
+        return Version(out.value)
+
+    def only_quic(self):
+        """Whether every version this client offers runs over QUIC."""
+        return library.soyokaze_client_only_quic(self.handle)
+
+    def versions(self):
+        """The versions this client offers, in the order it offers them."""
+        count = library.soyokaze_client_version_count(self.handle)
+        return [Version(library.soyokaze_client_version_at(self.handle, index)) for index in range(count)]
+
+    @property
+    def jar(self):
+        """This client's cookie jar, or ``None`` when it keeps none.
+
+        Borrowed from the client and valid only for as long as it is.
+        """
+        handle = library.soyokaze_client_jar(self.handle)
+        return None if not handle else CookieJar(handle=handle)
+
+    @property
+    def store(self):
+        """This client's HSTS store, or ``None`` when it keeps none.
+
+        As :attr:`jar`, for the store.
+        """
+        handle = library.soyokaze_client_store(self.handle)
+        return None if not handle else HSTSStore(handle=handle)
+
+    def apply_hsts(self, url):
+        """Rewrites a URL to ``https`` when this client's store insists on it.
+
+        Returns whether the URL was rewritten.
+        """
+        return library.soyokaze_client_apply_hsts(self.handle, url.handle)
+
+    def request_finalizer(self, authority):
+        """The request finalizer this client would use for an authority."""
+        encoded = ffi.Library.encoded(authority)
+        return RequestFinalizer(handle=library.soyokaze_client_request_finalizer(self.handle, encoded, len(encoded)))

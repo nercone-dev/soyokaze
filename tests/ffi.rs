@@ -976,12 +976,12 @@ fn base64_sha1_and_huffman_match_their_rfcs() {
 
     let (encoded, encoded_len) = text("Zm9vYmFy");
     let mut decoded = Buffer::EMPTY;
-    assert!(unsafe { soyokaze_base64_decode(encoded, encoded_len, &mut decoded) });
+    assert!(unsafe { soyokaze_base64_decode(encoded, encoded_len, &mut decoded, std::ptr::null_mut(), std::ptr::null_mut()) });
     assert_eq!(take(decoded), b"foobar");
 
     let (bad, bad_len) = text("not base64!");
     let mut refused = Buffer::EMPTY;
-    assert!(!unsafe { soyokaze_base64_decode(bad, bad_len, &mut refused) });
+    assert!(!unsafe { soyokaze_base64_decode(bad, bad_len, &mut refused, std::ptr::null_mut(), std::ptr::null_mut()) });
 
     let (abc, abc_len) = text("abc");
     let digest = take(unsafe { soyokaze_sha1(abc, abc_len) });
@@ -993,12 +993,12 @@ fn base64_sha1_and_huffman_match_their_rfcs() {
     assert_eq!(huffman, [0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff], "RFC 7541 appendix C");
 
     let mut back = Buffer::EMPTY;
-    assert!(unsafe { soyokaze_huffman_decode(huffman.as_ptr(), huffman.len(), &mut back) });
+    assert!(unsafe { soyokaze_huffman_decode(huffman.as_ptr(), huffman.len(), &mut back, std::ptr::null_mut()) });
     assert_eq!(take(back), b"www.example.com");
 
     let junk = [0xffu8; 5];
     let mut garbled = Buffer::EMPTY;
-    assert!(!unsafe { soyokaze_huffman_decode(junk.as_ptr(), junk.len(), &mut garbled) });
+    assert!(!unsafe { soyokaze_huffman_decode(junk.as_ptr(), junk.len(), &mut garbled, std::ptr::null_mut()) });
 }
 
 #[test]
@@ -1179,7 +1179,8 @@ fn the_http_date_renders_the_imf_fixdate() {
 
 #[test]
 fn a_cluster_answers_and_reports_its_workers() {
-    use soyokaze::ffi::api::server::{soyokaze_cluster_close, soyokaze_cluster_port, soyokaze_cluster_workers, soyokaze_server_run};
+    use soyokaze::ffi::api::cluster::{soyokaze_cluster_close, soyokaze_cluster_port, soyokaze_cluster_workers};
+    use soyokaze::ffi::api::server::soyokaze_server_run;
 
     let seen = std::sync::atomic::AtomicUsize::new(0);
     let server = unsafe { soyokaze_server_new(ptr::null()) };

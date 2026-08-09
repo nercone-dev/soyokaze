@@ -1020,3 +1020,853 @@ impl Role {
         }
     }
 }
+
+/// What a port or a version runs over.
+///
+/// The C half of [`TransportKind`]. Nothing keys on a particular version
+/// number: a port carries exactly the versions whose transport matches its
+/// own, so a future version is routed by what it runs over rather than by
+/// name.
+///
+/// [`TransportKind`]: crate::models::TransportKind
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransportKind {
+    /// An ordered byte stream: TCP, or a Unix domain socket.
+    Stream = 0,
+    /// QUIC, over UDP.
+    QUIC = 1,
+}
+
+impl TransportKind {
+    /// The C half of `transport`.
+    pub fn build(transport: crate::models::TransportKind) -> Self {
+        match transport {
+            crate::models::TransportKind::Stream => Self::Stream,
+            crate::models::TransportKind::QUIC => Self::QUIC,
+        }
+    }
+}
+
+/// The transport family a port carries.
+///
+/// A null `port`, or one whose socket path will not read, reads as
+/// [`TransportKind::Stream`].
+///
+/// # Safety
+///
+/// `port` must either be null or point to a readable [`Port`] whose own
+/// pointers are valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_port_transport(port: *const Port) -> TransportKind {
+    match unsafe { port.as_ref() }.and_then(|port| unsafe { port.parse() }) {
+        Some(port) => TransportKind::build(port.transport()),
+        None => TransportKind::Stream,
+    }
+}
+
+/// Whether a port can carry a version at all.
+///
+/// # Safety
+///
+/// As [`soyokaze_port_transport`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_port_carries(port: *const Port, version: Version) -> bool {
+    unsafe { port.as_ref() }.and_then(|port| unsafe { port.parse() }).is_some_and(|port| port.carries(version))
+}
+
+/// Which of `versions` a port can carry, in the order they were given.
+///
+/// Writes at most `count` versions through `out` and returns how many there
+/// were. A null `out` counts without writing.
+///
+/// # Safety
+///
+/// As [`soyokaze_port_transport`], `versions` must point to `count` readable
+/// versions, and `out` must either be null or be writable for `count` of them.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_port_offers(port: *const Port, versions: *const Version, count: usize, out: *mut Version) -> usize {
+    let (Some(port), Some(versions)) = (unsafe { port.as_ref() }.and_then(|port| unsafe { port.parse() }), unsafe { Version::borrow_all(versions, count) }) else {
+        return 0;
+    };
+
+    let offered = port.offers(&versions);
+
+    if !out.is_null() {
+        for (index, version) in offered.iter().take(count).enumerate() {
+            unsafe { *out.add(index) = *version };
+        }
+    }
+
+    offered.len()
+}
+
+impl Version {
+    /// Borrows `count` versions from a C array.
+    ///
+    /// A null array borrows nothing, which is how an absent argument is
+    /// passed.
+    ///
+    /// # Safety
+    ///
+    /// `versions` must either be null or point to `count` readable versions.
+    pub unsafe fn borrow_all<'a>(versions: *const Version, count: usize) -> Option<&'a [Version]> {
+        if versions.is_null() {
+            return (count == 0).then_some(&[][..]);
+        }
+
+        Some(unsafe { std::slice::from_raw_parts(versions, count) })
+    }
+}
+
+/// The port a scheme is reached on when the URL does not say.
+///
+/// Zero for a scheme with no default.
+///
+/// # Safety
+///
+/// `scheme` must either be null or point to `scheme_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_url_default_port(scheme: *const u8, scheme_len: usize) -> u16 {
+    match unsafe { Slice::borrow_text(scheme, scheme_len) } {
+        Some(scheme) => URL::default_port(scheme),
+        None => 0,
+    }
+}
+
+/// The authority a scheme, host and port spell out, owned by the caller.
+///
+/// The port is left off when it is the scheme's default, which is what an
+/// origin expects to see in `Host` or `:authority`.
+///
+/// # Safety
+///
+/// `scheme` and `host` must either be null or point to their stated number of
+/// readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_url_authority_of(scheme: *const u8, scheme_len: usize, host: *const u8, host_len: usize, port: u16) -> Buffer {
+    let (Some(scheme), Some(host)) = (unsafe { Slice::borrow_text(scheme, scheme_len) }, unsafe { Slice::borrow_text(host, host_len) }) else {
+        return Buffer::EMPTY;
+    };
+
+    Buffer::new(URL::authority_of(scheme, host, port).into_bytes())
+}
+
+/// The ALPN identifier a version is negotiated under, borrowed from the
+/// library.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_version_alpn(version: Version) -> Slice {
+    Slice::text(version.alpn())
+}
+
+/// The version an ALPN identifier names, or `-1` when it names none.
+///
+/// # Safety
+///
+/// `alpn` must either be null or point to `alpn_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_version_from_alpn(alpn: *const u8, alpn_len: usize) -> i32 {
+    match unsafe { Slice::borrow(alpn, alpn_len) }.and_then(Version::from_alpn) {
+        Some(version) => version as i32,
+        None => -1,
+    }
+}
+
+/// The major version number.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_version_major(version: Version) -> u8 {
+    version.major()
+}
+
+/// What the version runs over.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_version_transport(version: Version) -> TransportKind {
+    TransportKind::build(version.transport())
+}
+
+/// How the version is written out, borrowed from the library.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_version_name(version: Version) -> Slice {
+    Slice::text(version.as_str())
+}
+
+/// The version a name spells out, or `-1` when it spells none.
+///
+/// Accepts what [`soyokaze_version_name`] produces, and the bare `1.0`, `1.1`,
+/// `2` and `3` forms alongside them.
+///
+/// # Safety
+///
+/// `name` must either be null or point to `name_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_version_parse(name: *const u8, name_len: usize) -> i32 {
+    match unsafe { Slice::borrow_text(name, name_len) }.and_then(|name| name.parse::<Version>().ok()) {
+        Some(version) => version as i32,
+        None => -1,
+    }
+}
+
+/// The ALPN protocol list for `versions`, in the wire format a handshake
+/// carries: each identifier preceded by its length.
+///
+/// # Safety
+///
+/// `versions` must either be null or point to `count` readable versions.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_alpn_wire(versions: *const Version, count: usize) -> Buffer {
+    match unsafe { Version::borrow_all(versions, count) } {
+        Some(versions) => Buffer::new(crate::models::ALPN::wire(versions)),
+        None => Buffer::EMPTY,
+    }
+}
+
+/// Picks the first identifier a client offered that this end also offers.
+///
+/// Both lists are in the wire format [`soyokaze_alpn_wire`] produces. The
+/// answer is borrowed from `client`, and is absent when nothing matched.
+///
+/// # Safety
+///
+/// `versions` must either be null or point to `count` readable versions, and
+/// `client` must either be null or point to `client_len` readable octets that
+/// outlive the returned slice.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_alpn_select(versions: *const Version, count: usize, client: *const u8, client_len: usize) -> Slice {
+    let (Some(versions), Some(client)) = (unsafe { Version::borrow_all(versions, count) }, unsafe { Slice::borrow(client, client_len) }) else {
+        return Slice::ABSENT;
+    };
+
+    match crate::models::ALPN::select(&crate::models::ALPN::list(versions), client) {
+        Some(chosen) => Slice::new(chosen),
+        None => Slice::ABSENT,
+    }
+}
+
+/// The version an agreed ALPN identifier settles on.
+///
+/// A null `alpn` stands for a handshake that agreed on nothing, which settles
+/// on HTTP/1.1 when it is offered and fails otherwise.
+///
+/// # Safety
+///
+/// As [`soyokaze_alpn_select`], and `out` must either be null or be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_alpn_negotiated(alpn: *const u8, alpn_len: usize, versions: *const Version, count: usize, out: *mut Version, error: *mut *mut ErrorHandle) -> Status {
+    let Some(versions) = (unsafe { Version::borrow_all(versions, count) }) else {
+        return unsafe { ErrorHandle::raise(error, Status::Invalid) };
+    };
+
+    match crate::models::ALPN::negotiated(unsafe { Slice::borrow(alpn, alpn_len) }, versions) {
+        Ok(version) => {
+            if !out.is_null() {
+                unsafe { *out = version };
+            }
+
+            Status::Ok
+        }
+        Err(failure) => unsafe { ErrorHandle::report(error, &failure) },
+    }
+}
+
+/// The method as it is written on the wire, borrowed from the library.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_method_name(method: Method) -> Slice {
+    Slice::text(method.as_str())
+}
+
+/// The method a name spells out, or `-1` when it spells none.
+///
+/// # Safety
+///
+/// `name` must either be null or point to `name_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_method_parse(name: *const u8, name_len: usize) -> i32 {
+    match unsafe { Slice::borrow_text(name, name_len) }.and_then(|name| name.parse::<Method>().ok()) {
+        Some(method) => method as i32,
+        None => -1,
+    }
+}
+
+/// Whether the method is read-only, so that issuing it changes nothing.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_method_safe(method: Method) -> bool {
+    method.safe()
+}
+
+/// Whether repeating the method has the same effect as issuing it once.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_method_idempotent(method: Method) -> bool {
+    method.idempotent()
+}
+
+/// Whether this role sends requests and reads responses.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_role_is_client(role: Role) -> bool {
+    role.is_client()
+}
+
+/// Whether this role reads requests and sends responses.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_role_is_server(role: Role) -> bool {
+    role.is_server()
+}
+
+/// How field names are cased on the way out.
+///
+/// The C half of [`HeaderCase`]. Names are always stored lowercase and
+/// re-cased as they are written.
+///
+/// [`HeaderCase`]: crate::models::HeaderCase
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HeaderCase {
+    /// `Content-Length`: each dash-separated word capitalised.
+    Title = 0,
+    /// `content-length`: entirely lowercase.
+    Lower = 1,
+}
+
+impl HeaderCase {
+    /// The [`HeaderCase`] this stands for.
+    ///
+    /// [`HeaderCase`]: crate::models::HeaderCase
+    pub fn parse(self) -> crate::models::HeaderCase {
+        match self {
+            Self::Title => crate::models::HeaderCase::Title,
+            Self::Lower => crate::models::HeaderCase::Lower,
+        }
+    }
+
+    /// The C half of `case`.
+    pub fn build(case: crate::models::HeaderCase) -> Self {
+        match case {
+            crate::models::HeaderCase::Title => Self::Title,
+            crate::models::HeaderCase::Lower => Self::Lower,
+        }
+    }
+}
+
+/// The casing a version expects: title case for HTTP/1.x, lowercase above.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_header_case_from_version(version: Version) -> HeaderCase {
+    HeaderCase::build(crate::models::HeaderCase::from_version(version))
+}
+
+/// A field name in this casing, owned by the caller.
+///
+/// # Safety
+///
+/// `name` must either be null or point to `name_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_header_case_apply(case: HeaderCase, name: *const u8, name_len: usize) -> Buffer {
+    match unsafe { Slice::borrow_text(name, name_len) } {
+        Some(name) => Buffer::new(case.parse().apply(name).into_bytes()),
+        None => Buffer::EMPTY,
+    }
+}
+
+/// Re-cases a field name already written into `name`, in place.
+///
+/// # Safety
+///
+/// `name` must either be null or point to `name_len` writable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_header_case_apply_in_place(case: HeaderCase, name: *mut u8, name_len: usize) -> bool {
+    if name.is_null() {
+        return false;
+    }
+
+    case.parse().apply_in_place(unsafe { std::slice::from_raw_parts_mut(name, name_len) });
+    true
+}
+
+pub use crate::models::Headers;
+
+/// The presence bit that stands for a well-known field name, or zero.
+///
+/// A [`Headers`] keeps the bitwise or of these over every field it holds,
+/// which lets a lookup for one of these names rule itself out without walking
+/// the list. The name must already be lowercase.
+///
+/// # Safety
+///
+/// `name` must either be null or point to `name_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_headers_well_known(name: *const u8, name_len: usize) -> u32 {
+    match unsafe { Slice::borrow_text(name, name_len) } {
+        Some(name) => Headers::well_known(name),
+        None => 0,
+    }
+}
+
+/// `1 << index` when `matched`, and zero otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_headers_bit(matched: bool, index: u32) -> u32 {
+    Headers::bit(matched, index)
+}
+
+/// Whether a stored lowercase name is the field `name` asks for.
+///
+/// # Safety
+///
+/// `stored` and `name` must either be null or point to their stated number of
+/// readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_headers_named(stored: *const u8, stored_len: usize, name: *const u8, name_len: usize) -> bool {
+    let (Some(stored), Some(name)) = (unsafe { Slice::borrow_text(stored, stored_len) }, unsafe { Slice::borrow_text(name, name_len) }) else {
+        return false;
+    };
+
+    Headers::named(stored, name)
+}
+
+/// Builds an empty field section.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_headers_new() -> *mut Headers {
+    Box::into_raw(Box::new(Headers::new()))
+}
+
+/// Builds an empty field section with room for `fields` entries.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_headers_with_capacity(fields: usize) -> *mut Headers {
+    Box::into_raw(Box::new(Headers::with_capacity(fields)))
+}
+
+/// Releases a [`Headers`].
+///
+/// Only one built by [`soyokaze_headers_new`] or
+/// [`soyokaze_headers_with_capacity`] is freed this way; one borrowed from a
+/// message belongs to that message.
+///
+/// # Safety
+///
+/// `headers` must come from one of those two calls and not have been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_headers_free(headers: *mut Headers) {
+    if !headers.is_null() {
+        drop(unsafe { Box::from_raw(headers) });
+    }
+}
+
+/// How many fields the section holds.
+///
+/// # Safety
+///
+/// `headers` must either be null or be a section that has not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_headers_len(headers: *const Headers) -> usize {
+    unsafe { headers.as_ref() }.map_or(0, |headers| headers.len())
+}
+
+/// Whether the section holds nothing.
+///
+/// # Safety
+///
+/// As [`soyokaze_headers_len`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_headers_is_empty(headers: *const Headers) -> bool {
+    unsafe { headers.as_ref() }.is_none_or(|headers| headers.is_empty())
+}
+
+/// The name of the field at `index`, borrowed from the section.
+///
+/// # Safety
+///
+/// As [`soyokaze_headers_len`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_headers_name(headers: *const Headers, index: usize) -> Slice {
+    Slice::maybe(unsafe { headers.as_ref() }.and_then(|headers| headers.fields().get(index)).map(|(name, _)| name.as_str()))
+}
+
+/// The value of the field at `index`, borrowed from the section.
+///
+/// # Safety
+///
+/// As [`soyokaze_headers_len`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_headers_value(headers: *const Headers, index: usize) -> Slice {
+    Slice::maybe(unsafe { headers.as_ref() }.and_then(|headers| headers.fields().get(index)).map(|(_, value)| value.as_str()))
+}
+
+/// Whether the section carries `name` at all.
+///
+/// # Safety
+///
+/// As [`soyokaze_headers_len`], and `name` must either be null or point to
+/// `name_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_headers_contains(headers: *const Headers, name: *const u8, name_len: usize) -> bool {
+    let (Some(headers), Some(name)) = (unsafe { headers.as_ref() }, unsafe { Slice::borrow_text(name, name_len) }) else {
+        return false;
+    };
+
+    headers.contains(name)
+}
+
+/// Whether the section carries no field named `name`.
+///
+/// # Safety
+///
+/// As [`soyokaze_headers_contains`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_headers_absent(headers: *const Headers, name: *const u8, name_len: usize) -> bool {
+    let (Some(headers), Some(name)) = (unsafe { headers.as_ref() }, unsafe { Slice::borrow_text(name, name_len) }) else {
+        return true;
+    };
+
+    headers.absent(name)
+}
+
+/// The first value stored under `name`, borrowed from the section.
+///
+/// # Safety
+///
+/// As [`soyokaze_headers_contains`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_headers_get(headers: *const Headers, name: *const u8, name_len: usize) -> Slice {
+    let (Some(headers), Some(name)) = (unsafe { headers.as_ref() }, unsafe { Slice::borrow_text(name, name_len) }) else {
+        return Slice::ABSENT;
+    };
+
+    Slice::maybe(headers.get(name))
+}
+
+/// How many values are stored under `name`.
+///
+/// # Safety
+///
+/// As [`soyokaze_headers_contains`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_headers_get_all_count(headers: *const Headers, name: *const u8, name_len: usize) -> usize {
+    let (Some(headers), Some(name)) = (unsafe { headers.as_ref() }, unsafe { Slice::borrow_text(name, name_len) }) else {
+        return 0;
+    };
+
+    headers.get_all(name).count()
+}
+
+/// The `index`th value stored under `name`, borrowed from the section.
+///
+/// # Safety
+///
+/// As [`soyokaze_headers_contains`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_headers_get_all(headers: *const Headers, name: *const u8, name_len: usize, index: usize) -> Slice {
+    let (Some(headers), Some(name)) = (unsafe { headers.as_ref() }, unsafe { Slice::borrow_text(name, name_len) }) else {
+        return Slice::ABSENT;
+    };
+
+    Slice::maybe(headers.get_all(name).nth(index))
+}
+
+/// Appends a field, keeping whatever is already stored under the name.
+///
+/// # Safety
+///
+/// As [`soyokaze_headers_contains`], and `value` must either be null or point
+/// to `value_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_headers_append(headers: *mut Headers, name: *const u8, name_len: usize, value: *const u8, value_len: usize) -> bool {
+    let (Some(headers), Some(name), Some(value)) = (unsafe { headers.as_mut() }, unsafe { Slice::borrow_text(name, name_len) }, unsafe { Slice::borrow_text(value, value_len) }) else {
+        return false;
+    };
+
+    headers.append(name, value);
+    true
+}
+
+/// Appends a field whose name is already lowercase.
+///
+/// Skips the lowercasing [`soyokaze_headers_append`] does. A name that is not
+/// already lowercase will never be found by a lookup.
+///
+/// # Safety
+///
+/// As [`soyokaze_headers_append`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_headers_append_lowercase(headers: *mut Headers, name: *const u8, name_len: usize, value: *const u8, value_len: usize) -> bool {
+    let (Some(headers), Some(name), Some(value)) = (unsafe { headers.as_mut() }, unsafe { Slice::borrow_text(name, name_len) }, unsafe { Slice::borrow_text(value, value_len) }) else {
+        return false;
+    };
+
+    headers.append_lowercase(name, value);
+    true
+}
+
+/// Stores a field, dropping whatever was already under the name.
+///
+/// # Safety
+///
+/// As [`soyokaze_headers_append`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_headers_insert(headers: *mut Headers, name: *const u8, name_len: usize, value: *const u8, value_len: usize) -> bool {
+    let (Some(headers), Some(name), Some(value)) = (unsafe { headers.as_mut() }, unsafe { Slice::borrow_text(name, name_len) }, unsafe { Slice::borrow_text(value, value_len) }) else {
+        return false;
+    };
+
+    headers.insert(name, value);
+    true
+}
+
+/// Drops every field stored under `name`, returning whether any was there.
+///
+/// # Safety
+///
+/// As [`soyokaze_headers_contains`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_headers_remove(headers: *mut Headers, name: *const u8, name_len: usize) -> bool {
+    let (Some(headers), Some(name)) = (unsafe { headers.as_mut() }, unsafe { Slice::borrow_text(name, name_len) }) else {
+        return false;
+    };
+
+    headers.remove(name)
+}
+
+/// The message's field section, borrowed from it.
+///
+/// Built empty when the message has none yet, so the pointer is null only when
+/// `message` is. It belongs to the message and must not be freed; it stays
+/// valid until the message is freed or its section is replaced.
+///
+/// # Safety
+///
+/// `message` must either be null or be a handle that has not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_headers(message: *mut Message) -> *mut Headers {
+    match unsafe { message.as_mut() } {
+        Some(message) => message.headers.get_or_insert_with(Headers::new),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// The message's trailer section, borrowed from it.
+///
+/// As [`soyokaze_message_headers`], for the fields that follow the body.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_headers`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_trailers(message: *mut Message) -> *mut Headers {
+    match unsafe { message.as_mut() } {
+        Some(message) => message.trailers.get_or_insert_with(Headers::new),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Whether the message opens a tunnel rather than carrying a body.
+///
+/// `method` is the request method a response is being read against, and is
+/// ignored on a request; pass `-1` when there is none.
+///
+/// # Safety
+///
+/// `message` must either be null or be a handle that has not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_tunneling(message: *const Message, method: i32) -> bool {
+    let Some(message) = (unsafe { message.as_ref() }) else {
+        return false;
+    };
+
+    message.tunneling(Method::from_code(method))
+}
+
+impl Method {
+    /// The method a wire code names, or `None` when it names none.
+    ///
+    /// A negative code stands for an absent method, which is how a caller says
+    /// it does not know which request a response answers.
+    pub fn from_code(code: i32) -> Option<Self> {
+        Some(match code {
+            0 => Self::GET,
+            1 => Self::HEAD,
+            2 => Self::POST,
+            3 => Self::PUT,
+            4 => Self::DELETE,
+            5 => Self::CONNECT,
+            6 => Self::OPTIONS,
+            7 => Self::TRACE,
+            8 => Self::PATCH,
+            _ => return None,
+        })
+    }
+}
+
+/// Sets which version framed the message.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_tunneling`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_set_version(message: *mut Message, version: Version) -> bool {
+    let Some(message) = (unsafe { message.as_mut() }) else {
+        return false;
+    };
+
+    message.version = version;
+    true
+}
+
+/// Sets the request method, or clears it with a negative `method`.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_tunneling`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_set_method(message: *mut Message, method: i32) -> bool {
+    let Some(message) = (unsafe { message.as_mut() }) else {
+        return false;
+    };
+
+    message.method = Method::from_code(method);
+    true
+}
+
+/// Sets the request target, or clears it with a null `target`.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_tunneling`], and `target` must either be null or point
+/// to `target_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_set_target(message: *mut Message, target: *const u8, target_len: usize) -> bool {
+    let Some(message) = (unsafe { message.as_mut() }) else {
+        return false;
+    };
+
+    if target.is_null() {
+        message.target = None;
+        return true;
+    }
+
+    let Some(target) = (unsafe { Slice::borrow_text(target, target_len) }) else {
+        return false;
+    };
+
+    message.target = Some(target.to_owned());
+    true
+}
+
+/// Sets the response status code, or clears it with a negative `status_code`.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_tunneling`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_set_status_code(message: *mut Message, status_code: i32) -> bool {
+    let Some(message) = (unsafe { message.as_mut() }) else {
+        return false;
+    };
+
+    message.status_code = u16::try_from(status_code).ok();
+    true
+}
+
+/// Sets the connection the message belongs to, or clears it with a null `id`.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_tunneling`], and `id` must either be null or point to
+/// `id_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_set_connection_id(message: *mut Message, id: *const u8, id_len: usize) -> bool {
+    let Some(message) = (unsafe { message.as_mut() }) else {
+        return false;
+    };
+
+    message.connection_id = unsafe { Slice::borrow(id, id_len) }.map(|id| crate::models::ConnectionID(Bytes::copy_from_slice(id)));
+    true
+}
+
+/// Which kind of body a message carries.
+///
+/// The C half of [`Body`], with [`BodyKind::None`] added for the message that
+/// carries none.
+///
+/// [`Body`]: crate::models::Body
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BodyKind {
+    /// No body at all.
+    None = 0,
+    /// Octets held in memory.
+    Data = 1,
+    /// A UTF-8 string held in memory.
+    Text = 2,
+    /// A filesystem path, read when the body is needed.
+    File = 3,
+}
+
+/// Which kind of body the message carries.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_tunneling`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_body_kind(message: *const Message) -> BodyKind {
+    match unsafe { message.as_ref() }.and_then(|message| message.body.as_ref()) {
+        Some(Body::Data(_)) => BodyKind::Data,
+        Some(Body::Text(_)) => BodyKind::Text,
+        Some(Body::File(_)) => BodyKind::File,
+        None => BodyKind::None,
+    }
+}
+
+/// Whether the body is known to be empty.
+///
+/// A file that has not been read counts as non-empty, since its length is not
+/// known until it is.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_tunneling`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_body_is_empty(message: *const Message) -> bool {
+    unsafe { message.as_ref() }.and_then(|message| message.body.as_ref()).is_none_or(|body| body.is_empty())
+}
+
+/// The body's octets when they are already in memory, borrowed from the
+/// message.
+///
+/// Absent for a file that has not been read, which
+/// `soyokaze_message_body` reads instead.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_tunneling`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_body_inline(message: *const Message) -> Slice {
+    match unsafe { message.as_ref() }.and_then(|message| message.body.as_ref()) {
+        Some(Body::Data(data)) => Slice::new(data),
+        Some(Body::Text(text)) => Slice::text(text),
+        _ => Slice::ABSENT,
+    }
+}
+
+/// The path a file body names, borrowed from the message.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_tunneling`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_body_path(message: *const Message) -> Slice {
+    match unsafe { message.as_ref() }.and_then(|message| message.body.as_ref()) {
+        Some(Body::File(path)) => Slice::text(path),
+        _ => Slice::ABSENT,
+    }
+}
+
+/// Clears the body, returning whether there was a message.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_tunneling`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_clear_body(message: *mut Message) -> bool {
+    let Some(message) = (unsafe { message.as_mut() }) else {
+        return false;
+    };
+
+    message.body = None;
+    true
+}

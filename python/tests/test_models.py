@@ -45,11 +45,11 @@ def test_appending_keeps_every_field_and_inserting_keeps_one():
     response = Message.response(200)
     response.append_header("Set-Cookie", "a=1")
     response.append_header("set-cookie", "b=2")
-    assert len(response.headers()) == 2, "appending must never fold fields together"
+    assert len(response.headers) == 2, "appending must never fold fields together"
     assert response.header("SET-COOKIE") == "a=1", "names are matched without regard to case"
 
     response.insert_header("set-cookie", "c=3")
-    assert response.headers() == [("set-cookie", "c=3")], "inserting must drop what was there"
+    assert response.headers == [("set-cookie", "c=3")], "inserting must drop what was there"
 
     assert response.remove_header("set-cookie")
     assert not response.remove_header("set-cookie"), "removing twice finds nothing"
@@ -65,13 +65,13 @@ def test_trailers_mirror_headers():
     message = Message.response(200)
     message.append_trailer("checksum", "abc")
     message.append_trailer("checksum", "def")
-    assert message.trailers() == [("checksum", "abc"), ("checksum", "def")]
+    assert message.trailers == [("checksum", "abc"), ("checksum", "def")]
     assert message.trailer("Checksum") == "abc"
 
     message.insert_trailer("checksum", "ghi")
-    assert message.trailers() == [("checksum", "ghi")]
+    assert message.trailers == [("checksum", "ghi")]
     assert message.remove_trailer("checksum")
-    assert message.trailers() == []
+    assert message.trailers == []
 
 def test_a_body_reads_back_whichever_way_it_was_set(tmp_path):
     message = Message.response(200)

@@ -237,15 +237,6 @@ pub extern "C" fn soyokaze_server_limits_default() -> ServerLimits {
     ServerLimits::build(&crate::api::server::ServerLimits::default())
 }
 
-/// How many threads the machine can run at once, or 1 if that cannot be
-/// found.
-///
-/// Useful as the worker count for [`soyokaze_server_run`].
-#[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_cores() -> u32 {
-    Cluster::cores() as u32
-}
-
 /// How a [`Server`] is configured.
 ///
 /// Passing null wherever one of these is asked for takes every default: every
@@ -531,65 +522,191 @@ pub unsafe extern "C" fn soyokaze_server_run(server: *const Server, on_request: 
     }
 }
 
-/// The port the cluster's first listener actually bound.
+/// A bound socket that no runtime has adopted yet.
 ///
-/// As [`soyokaze_server_handle_port`], for a cluster.
-///
-/// # Safety
-///
-/// `cluster` must either be null or be a handle that has not been freed.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_cluster_port(cluster: *const Cluster) -> u16 {
-    unsafe { cluster.as_ref() }.and_then(|cluster| cluster.address()).map_or(0, |address| address.port())
-}
+/// Sockets are opened before worker threads start, so this is deliberately
+/// runtime-free. A caller that wants to bind its ports itself — to drop
+/// privileges after binding, or to hand a socket to another process — opens
+/// one with [`soyokaze_server_open`] and reads the descriptor off it.
+pub use crate::api::server::RawSocket;
 
-/// How many addresses the cluster bound.
+/// Binds one port without starting anything on it.
+///
+/// The socket is bound and, for a stream port, listening, but nothing accepts
+/// from it until a server adopts it. Freed with
+/// [`soyokaze_raw_socket_free`].
 ///
 /// # Safety
 ///
-/// As [`soyokaze_cluster_port`].
+/// `server` must either be null or be a handle that has not been freed, and
+/// `target` must point to a readable [`Port`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_cluster_address_count(cluster: *const Cluster) -> usize {
-    unsafe { cluster.as_ref() }.map_or(0, |cluster| cluster.addresses().len())
-}
+pub unsafe extern "C" fn soyokaze_server_open(server: *const Server, target: *const Port, out: *mut *mut RawSocket, error: *mut *mut ErrorHandle) -> Status {
+    let (Some(server), Some(target)) = (unsafe { server.as_ref() }, unsafe { target.as_ref() }.and_then(|target| unsafe { target.parse() })) else {
+        return unsafe { ErrorHandle::raise(error, Status::Invalid) };
+    };
 
-/// The port of the address at `index`, or zero when there is no such address.
-///
-/// # Safety
-///
-/// As [`soyokaze_cluster_port`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_cluster_port_at(cluster: *const Cluster, index: usize) -> u16 {
-    unsafe { cluster.as_ref() }
-        .and_then(|cluster| cluster.addresses().get(index))
-        .map_or(0, |address| address.port())
-}
+    match server.open(&target) {
+        Ok(socket) => {
+            if !out.is_null() {
+                unsafe { *out = Box::into_raw(Box::new(socket)) };
+            }
 
-/// How many worker threads are running.
-///
-/// # Safety
-///
-/// As [`soyokaze_cluster_port`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_cluster_workers(cluster: *const Cluster) -> u32 {
-    unsafe { cluster.as_ref() }.map_or(0, |cluster| cluster.workers() as u32)
-}
-
-/// Stops every worker and waits for the threads to finish.
-///
-/// `timeout` bounds how long each worker waits for its connections; a
-/// negative `timeout` waits as long as it takes. This blocks the calling
-/// thread. The handle is consumed either way — the caller must not free it.
-///
-/// # Safety
-///
-/// `cluster` must be a handle the caller owns and has not freed.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_cluster_close(cluster: *mut Cluster, timeout: f64) {
-    if cluster.is_null() {
-        return;
+            Status::Ok
+        }
+        Err(failure) => unsafe { ErrorHandle::report(error, &failure) },
     }
+}
 
-    let cluster = *unsafe { Box::from_raw(cluster) };
-    cluster.close((timeout >= 0.0).then_some(timeout));
+/// Releases a [`RawSocket`], closing it.
+///
+/// # Safety
+///
+/// `socket` must come from [`soyokaze_server_open`] or
+/// [`soyokaze_raw_socket_share`], and not have been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_raw_socket_free(socket: *mut RawSocket) {
+    if !socket.is_null() {
+        drop(unsafe { Box::from_raw(socket) });
+    }
+}
+
+/// The address the socket is bound to, as text, owned by the caller.
+///
+/// An empty buffer with a null pointer means the address cannot be read, which
+/// is what a Unix socket always reports.
+///
+/// # Safety
+///
+/// `socket` must either be null or be a handle that has not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_raw_socket_address(socket: *const RawSocket) -> crate::ffi::Buffer {
+    match unsafe { socket.as_ref() }.and_then(|socket| socket.address().ok()) {
+        Some(address) => crate::ffi::Buffer::new(address.to_string().into_bytes()),
+        None => crate::ffi::Buffer::EMPTY,
+    }
+}
+
+/// The port the socket is bound to, or zero when it has none.
+///
+/// # Safety
+///
+/// As [`soyokaze_raw_socket_address`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_raw_socket_port(socket: *const RawSocket) -> u16 {
+    unsafe { socket.as_ref() }.and_then(|socket| socket.address().ok()).map_or(0, |address| address.port())
+}
+
+/// Duplicates the descriptor, so several workers may accept from one socket.
+///
+/// This is the fallback when `SO_REUSEPORT` is off, and the only way for a
+/// Unix socket, which cannot be bound twice.
+///
+/// # Safety
+///
+/// As [`soyokaze_raw_socket_address`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_raw_socket_share(socket: *const RawSocket, out: *mut *mut RawSocket, error: *mut *mut ErrorHandle) -> Status {
+    let Some(socket) = (unsafe { socket.as_ref() }) else {
+        return unsafe { ErrorHandle::raise(error, Status::Invalid) };
+    };
+
+    match socket.share() {
+        Ok(shared) => {
+            if !out.is_null() {
+                unsafe { *out = Box::into_raw(Box::new(shared)) };
+            }
+
+            Status::Ok
+        }
+        Err(failure) => unsafe { ErrorHandle::report(error, &failure) },
+    }
+}
+
+/// The descriptor underneath, for a caller handing the socket elsewhere.
+///
+/// The socket still owns the descriptor: freeing the handle closes it, so a
+/// caller that passes this on must keep the handle alive for as long as the
+/// descriptor is in use.
+///
+/// # Safety
+///
+/// As [`soyokaze_raw_socket_address`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_raw_socket_descriptor(socket: *const RawSocket) -> i32 {
+    use std::os::fd::AsRawFd;
+
+    match unsafe { socket.as_ref() } {
+        Some(RawSocket::UDS(listener)) => listener.as_raw_fd(),
+        Some(RawSocket::TCP(listener)) => listener.as_raw_fd(),
+        Some(RawSocket::QUIC(socket)) => socket.as_raw_fd(),
+        None => -1,
+    }
+}
+
+/// How many versions the server accepts.
+///
+/// # Safety
+///
+/// `server` must either be null or be a handle that has not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_server_version_count(server: *const Server) -> usize {
+    unsafe { server.as_ref() }.map_or(0, |server| server.config.versions.len())
+}
+
+/// The version at `index` among those the server accepts, or `-1` past the
+/// end.
+///
+/// # Safety
+///
+/// As [`soyokaze_server_version_count`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_server_version_at(server: *const Server, index: usize) -> i32 {
+    match unsafe { server.as_ref() }.and_then(|server| server.config.versions.get(index)) {
+        Some(&version) => version as i32,
+        None => -1,
+    }
+}
+
+/// Whether the server binds each worker's socket with `SO_REUSEPORT`.
+///
+/// # Safety
+///
+/// As [`soyokaze_server_version_count`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_server_reuseport(server: *const Server) -> bool {
+    unsafe { server.as_ref() }.is_some_and(|server| server.config.reuseport)
+}
+
+/// Builds the admission gate a [`ServerLimits`] describes.
+///
+/// The same gate a server built from those limits would admit connections
+/// through. Freed with `soyokaze_gate_free`.
+///
+/// # Safety
+///
+/// `limits` must either be null or point to a readable [`ServerLimits`] whose
+/// own pointers are valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_server_limits_gate(limits: *const ServerLimits) -> *mut crate::ffi::api::gate::GateHandle {
+    let limits = match unsafe { limits.as_ref() } {
+        Some(limits) => unsafe { limits.parse() },
+        None => crate::api::server::ServerLimits::default(),
+    };
+
+    Box::into_raw(Box::new(crate::ffi::api::gate::GateHandle(limits.gate())))
+}
+
+/// The address at `index` a running server bound, as text, owned by the
+/// caller.
+///
+/// # Safety
+///
+/// `handle` must either be null or be a handle that has not been closed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_server_handle_address_at(handle: *const ServerHandle, index: usize) -> crate::ffi::Buffer {
+    match unsafe { handle.as_ref() }.and_then(|handle| handle.addresses().get(index)) {
+        Some(address) => crate::ffi::Buffer::new(address.to_string().into_bytes()),
+        None => crate::ffi::Buffer::EMPTY,
+    }
 }
