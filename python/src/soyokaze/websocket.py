@@ -4,6 +4,10 @@ A :class:`WebSocketConnection` comes out of ``Client.websocket``,
 ``Connection.open_websocket``, or a server's ``on_websocket`` callback, and
 is driven the same way whichever side produced it — the same symmetry the
 crate's ``websocket`` module keeps.
+
+Everything that goes to or comes from the peer is awaited; the framing and
+the handshake below it — :class:`Frame`, :class:`Upgrade`, :class:`Connect`
+— only ever look at octets already in hand, so they stay ordinary calls.
 """
 
 import ctypes
@@ -13,6 +17,7 @@ from . import ffi
 from .errors import Error, InvalidError, Status, TLSError
 from .ffi import library
 from .models import Limits, Message, Role, Version
+from .runtime import offload
 
 GUID = library.soyokaze_websocket_guid().text()
 """The fixed string a ``Sec-WebSocket-Accept`` is derived with."""
@@ -178,7 +183,11 @@ class WebSocketConnection:
 
     Work in messages with :meth:`receive_message`, which reassembles
     fragments and answers pings on its own, or in frames with
-    :meth:`receive` where that control is wanted.
+    :meth:`receive` where that control is wanted. Usable as an async context
+    manager, which runs the closing handshake on the way out::
+
+        async with await client.websocket(url) as socket:
+            ...
     """
 
     def __init__(self, handle):
@@ -189,6 +198,14 @@ class WebSocketConnection:
         if getattr(self, "handle", None):
             library.soyokaze_websocket_free(self.handle)
             self.handle = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, kind, value, traceback):
+        if self.handle and not self.closing():
+            await self.close()
+        return False
 
     @property
     def role(self):
@@ -203,22 +220,24 @@ class WebSocketConnection:
         """The identifier of the connection this came from."""
         return library.soyokaze_websocket_id(self.handle).take()
 
-    def send(self, frame):
+    async def send(self, frame):
         """Sends one frame. The mask is set from the role."""
         payload = ffi.Library.encoded(frame.payload)
         error = Error.out()
-        Error.raise_for(library.soyokaze_websocket_send(self.handle, frame.fin, int(frame.opcode), payload, len(payload), ctypes.byref(error)), error)
+        status = await offload(library.soyokaze_websocket_send, self.handle, frame.fin, int(frame.opcode), payload, len(payload), ctypes.byref(error))
+        Error.raise_for(status, error)
 
-    def receive(self):
+    async def receive(self):
         """Receives one frame, without reassembling or answering anything."""
         fin = ctypes.c_bool()
         opcode = ctypes.c_uint8()
         out = ffi.Buffer()
         error = Error.out()
-        Error.raise_for(library.soyokaze_websocket_receive(self.handle, ctypes.byref(fin), ctypes.byref(opcode), ctypes.byref(out), ctypes.byref(error)), error)
+        status = await offload(library.soyokaze_websocket_receive, self.handle, ctypes.byref(fin), ctypes.byref(opcode), ctypes.byref(out), ctypes.byref(error))
+        Error.raise_for(status, error)
         return Frame(Opcode(opcode.value), out.take(), fin.value)
 
-    def send_message(self, opcode, payload):
+    async def send_message(self, opcode, payload):
         """Sends a whole message as one unfragmented frame.
 
         The mirror of :meth:`receive_message`, which hands back the same pair
@@ -231,9 +250,10 @@ class WebSocketConnection:
 
         payload = ffi.Library.encoded(payload)
         error = Error.out()
-        Error.raise_for(library.soyokaze_websocket_send_message(self.handle, int(Opcode(opcode)), payload, len(payload), ctypes.byref(error)), error)
+        status = await offload(library.soyokaze_websocket_send_message, self.handle, int(Opcode(opcode)), payload, len(payload), ctypes.byref(error))
+        Error.raise_for(status, error)
 
-    def receive_message(self):
+    async def receive_message(self):
         """Receives one whole message, reassembling fragments.
 
         A ping is answered with a pong along the way, and a close is echoed
@@ -243,17 +263,18 @@ class WebSocketConnection:
         opcode = ctypes.c_uint8()
         out = ffi.Buffer()
         error = Error.out()
-        Error.raise_for(library.soyokaze_websocket_receive_message(self.handle, ctypes.byref(opcode), ctypes.byref(out), ctypes.byref(error)), error)
+        status = await offload(library.soyokaze_websocket_receive_message, self.handle, ctypes.byref(opcode), ctypes.byref(out), ctypes.byref(error))
+        Error.raise_for(status, error)
         return Opcode(opcode.value), out.take()
 
     def limits(self):
         """The limits this connection is running under."""
         return WebSocketLimits.taken(library.soyokaze_websocket_limits(self.handle))
 
-    def close(self, code=CloseCode.NORMAL, reason=""):
+    async def close(self, code=CloseCode.NORMAL, reason=""):
         """Closes the connection, running the closing handshake."""
         encoded = ffi.Library.encoded(reason)
-        if not library.soyokaze_websocket_close(self.handle, int(CloseCode(code)), encoded, len(encoded)):
+        if not await offload(library.soyokaze_websocket_close, self.handle, int(CloseCode(code)), encoded, len(encoded)):
             raise InvalidError("the close was refused")
 
 class Upgrade:

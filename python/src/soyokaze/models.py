@@ -15,7 +15,7 @@ from . import ffi
 from .errors import Error, InvalidError
 from .ffi import library
 from .responses import ResponseMixin
-from .runtime import Runtime
+from .runtime import Runtime, offload
 
 class Version(enum.IntEnum):
     """An HTTP version."""
@@ -775,12 +775,19 @@ class Message(ResponseMixin):
         length = library.soyokaze_message_body_len(self.handle)
         return None if length < 0 else length
 
-    def body(self, runtime=None):
-        """The body as octets, reading the file behind it if there is one."""
+    async def body(self, runtime=None):
+        """The body as octets, reading the file behind it if there is one.
+
+        A body already in memory is handed back without waiting for anything,
+        but a file body is read here, so this is awaited either way rather
+        than being one call in one case and another in the other. Use
+        :meth:`body_inline` where only what is already in hand will do.
+        """
         runtime = runtime if runtime is not None else Runtime.default()
         out = ffi.Buffer()
         error = Error.out()
-        Error.raise_for(library.soyokaze_message_body(runtime.handle, self.handle, ctypes.byref(out), ctypes.byref(error)), error)
+        status = await offload(library.soyokaze_message_body, runtime.handle, self.handle, ctypes.byref(out), ctypes.byref(error))
+        Error.raise_for(status, error)
         return out.take()
 
     def __repr__(self):

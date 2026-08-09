@@ -73,27 +73,27 @@ def test_trailers_mirror_headers():
     assert message.remove_trailer("checksum")
     assert message.trailers == []
 
-def test_a_body_reads_back_whichever_way_it_was_set(tmp_path):
+async def test_a_body_reads_back_whichever_way_it_was_set(tmp_path):
     message = Message.response(200)
     assert message.body_len() is None
-    assert message.body() == b""
+    assert await message.body() == b""
 
     message.set_body(b"octets")
     assert message.body_len() == 6
-    assert message.body() == b"octets"
+    assert await message.body() == b"octets"
 
     message.set_body("text")
-    assert message.body() == b"text"
+    assert await message.body() == b"text"
 
     path = tmp_path / "payload"
     path.write_bytes(b"from a file")
     message.set_body(pathlib.Path(path))
     assert message.body_len() is None, "a file body has no length until it is read"
-    assert message.body() == b"from a file"
+    assert await message.body() == b"from a file", "a file body is read on a worker thread, not on the loop"
 
     message.set_body(pathlib.Path(tmp_path / "missing"))
     with pytest.raises(soyokaze.IOError):
-        message.body()
+        await message.body()
 
 def test_stream_and_connection_facts_default_to_absent():
     message = Message.response(200)

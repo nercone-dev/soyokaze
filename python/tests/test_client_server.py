@@ -1,17 +1,18 @@
 """A client and a server, talking to each other through the bindings.
 
 Everything runs over a kernel-chosen plaintext TCP port, so the tests name
-none and need no certificates.
+none and need no certificates. Every exchange is awaited, so each test is a
+coroutine and the event loop is the one thing all of them share.
 """
 
-import threading
+import asyncio
 
 import pytest
 
 import soyokaze
 from soyokaze import Client, ClientConfig, Limits, Message, Method, Port, Server, ServerConfig, ServerLimits, URL, Version
 
-def echo(request):
+async def echo(request):
     """Answers with the request's own target, so the round trip proves the
     request reached the handler intact."""
     response = Message.text(request.target or "")
@@ -20,144 +21,168 @@ def echo(request):
         response.insert_header("x-probe-echo", request.header("x-probe"))
     return response
 
-def serve(handler=echo, on_websocket=None, config=None):
+async def serve(handler=echo, on_websocket=None, config=None):
     """A server on a kernel-chosen port, and the origin to reach it by."""
     server = Server(config)
-    handle = server.serve(handler, [Port.TCP(0)], on_websocket=on_websocket)
+    handle = await server.serve(handler, [Port.TCP(0)], on_websocket=on_websocket)
     assert handle.port != 0, "a port of zero must report the one the kernel chose"
     return server, handle, f"http://127.0.0.1:{handle.port}"
 
-def test_a_request_crosses_to_the_handler_and_its_answer_crosses_back():
-    server, handle, origin = serve()
-    try:
+async def test_a_request_crosses_to_the_handler_and_its_answer_crosses_back():
+    server, handle, origin = await serve()
+    async with handle:
         client = Client()
-        response = client.fetch(Method.GET, f"{origin}/hello", headers=[("x-probe", "sent")])
+        response = await client.fetch(Method.GET, f"{origin}/hello", headers=[("x-probe", "sent")])
 
         assert response.status_code == 200
         assert response.header("x-answered-by") == "python"
         assert response.header("x-probe-echo") == "sent"
-        assert response.body() == b"/hello"
-    finally:
-        handle.close(5)
+        assert await response.body() == b"/hello"
 
-def test_every_shorthand_reaches_the_server():
+async def test_every_shorthand_reaches_the_server():
     seen = []
 
-    def record(request):
-        seen.append((request.method, request.body()))
+    async def record(request):
+        seen.append((request.method, await request.body()))
         return Message.text("ok")
 
-    server, handle, origin = serve(record)
+    server, handle, origin = await serve(record)
     try:
         client = Client()
-        client.get(f"{origin}/")
-        client.head(f"{origin}/")
-        client.post(f"{origin}/", b"data")
-        client.put(f"{origin}/", "text")
-        client.delete(f"{origin}/")
+        await client.get(f"{origin}/")
+        await client.head(f"{origin}/")
+        await client.post(f"{origin}/", b"data")
+        await client.put(f"{origin}/", "text")
+        await client.delete(f"{origin}/")
 
         assert [method for method, body in seen] == [Method.GET, Method.HEAD, Method.POST, Method.PUT, Method.DELETE]
         assert seen[2][1] == b"data"
         assert seen[3][1] == b"text"
     finally:
-        handle.close(5)
+        await handle.close(5)
 
-def test_a_handler_that_raises_answers_with_a_bare_500(capsys):
-    def broken(request):
+async def test_a_plain_handler_is_served_without_ever_reaching_the_loop():
+    """A handler that waits for nothing need not be a coroutine function."""
+
+    def synchronous(request):
+        return Message.text("plain")
+
+    server, handle, origin = await serve(synchronous)
+    try:
+        assert await (await Client().get(f"{origin}/")).body() == b"plain"
+    finally:
+        await handle.close(5)
+
+async def test_a_handler_that_raises_answers_with_a_bare_500(capsys):
+    async def broken(request):
         raise ValueError("deliberate")
 
-    server, handle, origin = serve(broken)
+    server, handle, origin = await serve(broken)
     try:
-        response = Client().get(f"{origin}/")
+        response = await Client().get(f"{origin}/")
         assert response.status_code == 500
         assert "deliberate" in capsys.readouterr().err, "the traceback must not vanish"
     finally:
-        handle.close(5)
+        await handle.close(5)
 
-def test_several_messages_go_over_one_connection():
-    server, handle, origin = serve()
+async def test_several_messages_go_over_one_connection():
+    server, handle, origin = await serve()
     try:
         client = Client(ClientConfig(secure=False))
-        connection = client.connect("127.0.0.1", Port.TCP(handle.port))
+        async with await client.connect("127.0.0.1", Port.TCP(handle.port)) as connection:
+            assert connection.version == Version.V1_1
+            assert connection.role == soyokaze.Role.USER_AGENT
+            assert connection.role.is_client(), "a connection the client opened sends requests"
 
-        assert connection.version == Version.V1_1
-        assert connection.role == soyokaze.Role.USER_AGENT
-        assert connection.role.is_client(), "a connection the client opened sends requests"
-
-        for index in range(3):
-            response = client.request(connection, Message.request(Method.GET, f"/turn/{index}"))
-            assert response.body() == f"/turn/{index}".encode()
-            assert connection.reusable()
-
-        connection.close()
+            for index in range(3):
+                response = await client.request(connection, Message.request(Method.GET, f"/turn/{index}"))
+                assert await response.body() == f"/turn/{index}".encode()
+                assert connection.reusable()
     finally:
-        handle.close(5)
+        await handle.close(5)
 
-def test_send_and_receive_expose_the_raw_exchange():
-    server, handle, origin = serve()
+async def test_requests_awaited_together_do_not_wait_for_one_another():
+    """The point of the migration: the loop is free while a request is in flight."""
+    started = asyncio.Event()
+
+    async def slow(request):
+        if request.target == "/slow":
+            started.set()
+            await asyncio.sleep(0.2)
+        return Message.text(request.target or "")
+
+    server, handle, origin = await serve(slow)
+    try:
+        client = Client()
+        slow_request = asyncio.create_task(client.get(f"{origin}/slow"))
+        await asyncio.wait_for(started.wait(), 5)
+
+        quick = await asyncio.wait_for(client.get(f"{origin}/quick"), 5)
+        assert await quick.body() == b"/quick", "a second request must not queue behind the first"
+
+        assert await (await slow_request).body() == b"/slow"
+    finally:
+        await handle.close(5)
+
+async def test_send_and_receive_expose_the_raw_exchange():
+    server, handle, origin = await serve()
     try:
         client = Client(ClientConfig(secure=False))
-        connection = client.open(URL(origin))
-
-        connection.send(Message.request(Method.GET, "/raw"))
-        response = connection.receive()
-        assert response.status_code == 200
-        assert response.body() == b"/raw"
-
-        connection.close()
+        async with await client.open(URL(origin)) as connection:
+            await connection.send(Message.request(Method.GET, "/raw"))
+            response = await connection.receive()
+            assert response.status_code == 200
+            assert await response.body() == b"/raw"
     finally:
-        handle.close(5)
+        await handle.close(5)
 
-def test_a_pinned_version_and_ceilinged_limits_still_serve():
+async def test_a_pinned_version_and_ceilinged_limits_still_serve():
     limits = ServerLimits(message=Limits(max_header_count=32), max_connections=16)
     config = ServerConfig(versions=[Version.V1_1], limits=limits)
 
-    server, handle, origin = serve(config=config)
+    server, handle, origin = await serve(config=config)
     try:
         client = Client(ClientConfig(versions=[Version.V1_1]))
-        assert client.get(f"{origin}/pinned").status_code == 200
+        assert (await client.get(f"{origin}/pinned")).status_code == 200
     finally:
-        handle.close(5)
+        await handle.close(5)
 
-def test_the_cluster_spreads_the_same_server_across_workers():
+async def test_the_cluster_spreads_the_same_server_across_workers():
     server = Server()
-    cluster = server.run(echo, [Port.TCP(0)], workers=2)
-    try:
+    async with await server.run(echo, [Port.TCP(0)], workers=2) as cluster:
         assert cluster.workers() == 2
         assert cluster.port != 0
 
-        response = Client().get(f"http://127.0.0.1:{cluster.port}/clustered")
-        assert response.body() == b"/clustered"
-    finally:
-        cluster.close(5)
+        response = await Client().get(f"http://127.0.0.1:{cluster.port}/clustered")
+        assert await response.body() == b"/clustered"
 
-def test_the_websocket_callback_runs_the_socket_both_ways():
+async def test_the_websocket_callback_runs_the_socket_both_ways():
     received = []
 
-    def on_websocket(socket):
-        opcode, payload = socket.receive_message()
+    async def on_websocket(socket):
+        opcode, payload = await socket.receive_message()
         received.append((opcode, payload))
-        socket.send_message(opcode, payload.decode().upper())
-        socket.close(soyokaze.CloseCode.NORMAL, "done")
+        await socket.send_message(opcode, payload.decode().upper())
+        await socket.close(soyokaze.CloseCode.NORMAL, "done")
 
-    server, handle, origin = serve(on_websocket=on_websocket)
+    server, handle, origin = await serve(on_websocket=on_websocket)
     try:
         client = Client()
-        socket = client.websocket(f"ws://127.0.0.1:{handle.port}/chat")
+        socket = await client.websocket(f"ws://127.0.0.1:{handle.port}/chat")
 
-        socket.send_message(soyokaze.Opcode.TEXT, "hello")
-        opcode, payload = socket.receive_message()
+        await socket.send_message(soyokaze.Opcode.TEXT, "hello")
+        opcode, payload = await socket.receive_message()
         assert (opcode, payload) == (soyokaze.Opcode.TEXT, b"HELLO"), "receive_message hands back what send_message takes, in that order"
 
-        opcode, payload = socket.receive_message()
+        opcode, payload = await socket.receive_message()
         assert opcode == soyokaze.Opcode.CLOSE, "the server's close reaches the client"
 
         assert received == [(soyokaze.Opcode.TEXT, b"hello")]
     finally:
-        handle.close(5)
+        await handle.close(5)
 
-def test_the_client_keeps_cookies_across_requests():
-    def set_then_expect(request):
+async def test_the_client_keeps_cookies_across_requests():
+    async def set_then_expect(request):
         response = Message.text("ok")
         if request.target == "/set":
             response.set_cookie(soyokaze.SetCookie("sid", "abc"))
@@ -165,21 +190,21 @@ def test_the_client_keeps_cookies_across_requests():
             response.insert_header("x-got-cookie", request.header("cookie") or "none")
         return response
 
-    server, handle, origin = serve(set_then_expect)
+    server, handle, origin = await serve(set_then_expect)
     try:
         client = Client()
-        client.get(f"{origin}/set")
-        response = client.get(f"{origin}/again")
+        await client.get(f"{origin}/set")
+        response = await client.get(f"{origin}/again")
         assert response.header("x-got-cookie") == "sid=abc"
 
         stateless = Client(ClientConfig(cookies=False))
-        stateless.get(f"{origin}/set")
-        response = stateless.get(f"{origin}/again")
+        await stateless.get(f"{origin}/set")
+        response = await stateless.get(f"{origin}/again")
         assert response.header("x-got-cookie") == "none"
     finally:
-        handle.close(5)
+        await handle.close(5)
 
-def test_dialling_nothing_raises_rather_than_hanging():
+async def test_dialling_nothing_raises_rather_than_hanging():
     client = Client()
     with pytest.raises(soyokaze.Error):
-        client.get("http://127.0.0.1:1/")
+        await client.get("http://127.0.0.1:1/")
