@@ -57,6 +57,130 @@ fn refuses_a_malformed_start_line() {
     }
 }
 
+/// `reason-phrase = 1*( HTAB / SP / VCHAR / obs-text )` — RFC 9112 §4, with
+/// `VCHAR = %x21-7E` from RFC 5234 and `obs-text = %x80-FF` from RFC 9110
+/// §5.6.4. Every other octet, which is to say every control octet but the tab,
+/// is outside the grammar.
+fn is_reason_octet(octet: u8) -> bool {
+    octet == 0x09 || octet == 0x20 || (0x21..=0x7e).contains(&octet) || octet >= 0x80
+}
+
+#[test]
+fn classifies_every_octet_of_a_reason_phrase_as_the_grammar_does() {
+    for octet in 0..=u8::MAX {
+        let allowed = h1::Octets::TABLE[octet as usize] & h1::Octets::FIELD != 0;
+        assert_eq!(allowed, is_reason_octet(octet), "octet {octet:#04x} is classified against RFC 9112 §4");
+        assert_eq!(h1::Octets::is_reason_bytes(&[octet]), is_reason_octet(octet), "octet {octet:#04x} as a reason phrase");
+    }
+}
+
+/// `obs-text` is `%x80-FF`, which is not UTF-8, so a status line has to be read
+/// as octets rather than as text for RFC 9112 §4 to be met.
+#[test]
+fn accepts_a_reason_phrase_of_raw_obs_text_octets() {
+    for octet in 0x80..=u8::MAX {
+        let mut line = b"HTTP/1.1 200 Not".to_vec();
+        line.push(octet);
+        line.extend_from_slice(b"OK");
+
+        assert!(h1::Octets::is_reason_bytes(&line[13..]), "obs-text {octet:#04x} is a reason phrase");
+
+        let message = h1::StartLine::parse_bytes(&line).unwrap_or_else(|error| panic!("obs-text {octet:#04x} did not parse: {error}"));
+        assert_eq!(message.status_code, Some(200));
+        assert_eq!(message.version, Version::V1_1);
+    }
+
+    let every = (0x80..=u8::MAX).collect::<Vec<u8>>();
+    let mut line = b"HTTP/1.0 204 ".to_vec();
+    line.extend_from_slice(&every);
+
+    assert!(std::str::from_utf8(&line).is_err(), "the fixture should not be valid UTF-8");
+
+    let message = h1::StartLine::parse_bytes(&line).expect("a reason phrase of every obs-text octet did not parse");
+    assert_eq!(message.status_code, Some(204));
+    assert_eq!(message.version, Version::V1_0);
+}
+
+#[tokio::test]
+async fn a_status_line_carrying_obs_text_and_a_tab_is_received() {
+    let (client_pipe, mut server_pipe) = tokio::io::duplex(64 * 1024);
+    let mut client = H1Connection::new(client_pipe, Role::UserAgent, id(), limits());
+
+    let response = b"HTTP/1.1 503 Service\tUnavailable \xe2\x98\x83 \xff\xfe\r\ncontent-length: 0\r\n\r\n";
+    server_pipe.write_all(response).await.expect("the fixture did not write");
+
+    let message = client.receive().await.expect("a status line with obs-text did not arrive");
+    assert_eq!(message.status_code, Some(503));
+}
+
+#[test]
+fn accepts_a_reason_phrase_of_htab_sp_vchar_and_obs_text() {
+    for reason in ["OK", "Not Found", "\tOK", "OK\t", "No\tContent", "\t", " ", "", "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"] {
+        assert!(h1::Octets::is_reason(reason), "{reason:?} is a reason phrase");
+
+        let line = format!("HTTP/1.1 200 {reason}");
+        let message = h1::StartLine::parse(&line).unwrap_or_else(|error| panic!("{line:?} did not parse: {error}"));
+        assert_eq!(message.status_code, Some(200));
+    }
+
+    for octet in (0x21..=0x7e).chain(std::iter::once(0x20)) {
+        let reason = String::from_utf8(vec![octet]).expect("an ASCII octet is UTF-8");
+        assert!(h1::Octets::is_reason(&reason), "VCHAR {octet:#04x} is a reason phrase");
+        assert!(h1::StartLine::parse(&format!("HTTP/1.1 200 {reason}")).is_ok(), "VCHAR {octet:#04x} did not parse");
+    }
+
+    for reason in ["理由句", "\u{80}\u{ff}", "Ünicode", "café"] {
+        assert!(reason.bytes().any(|octet| octet >= 0x80), "{reason:?} should carry obs-text");
+        assert!(h1::Octets::is_reason(reason), "obs-text {reason:?} is a reason phrase");
+        assert!(h1::StartLine::parse(&format!("HTTP/1.1 200 {reason}")).is_ok(), "obs-text {reason:?} did not parse");
+    }
+}
+
+#[test]
+fn refuses_a_reason_phrase_carrying_a_control_octet() {
+    for octet in (0x00..=0x1fu8).chain(std::iter::once(0x7f)).filter(|octet| *octet != 0x09) {
+        let reason = String::from_utf8(vec![b'O', octet, b'K']).expect("an ASCII octet is UTF-8");
+        assert!(!h1::Octets::is_reason(&reason), "control octet {octet:#04x} is not a reason phrase");
+        assert!(h1::StartLine::parse(&format!("HTTP/1.1 200 {reason}")).is_err(), "control octet {octet:#04x} parsed");
+    }
+}
+
+/// A reason phrase that could carry a CR or an LF would let a peer write a line
+/// terminator into a response another recipient reads as the start of the next
+/// message, so the relaxation to RFC 9112 §4 must not reach either.
+#[test]
+fn refuses_a_reason_phrase_carrying_a_line_terminator() {
+    for reason in ["OK\rInjected", "OK\nInjected", "OK\r\nInjected", "\r", "\n", "OK\r", "OK\n", "OK\0Injected", "OK\u{7f}"] {
+        assert!(!h1::Octets::is_reason(reason), "{reason:?} is not a reason phrase");
+        assert!(h1::StartLine::parse(&format!("HTTP/1.1 200 {reason}")).is_err(), "{reason:?} parsed");
+    }
+
+    assert!(h1::Octets::TABLE[0x0d] & h1::Octets::FIELD == 0, "CR is never a reason phrase octet");
+    assert!(h1::Octets::TABLE[0x0a] & h1::Octets::FIELD == 0, "LF is never a reason phrase octet");
+
+    for terminator in [b"\r".as_slice(), b"\n", b"\r\n"] {
+        let mut line = b"HTTP/1.1 200 OK".to_vec();
+        line.extend_from_slice(terminator);
+        line.extend_from_slice(b"\xffInjected");
+
+        assert!(h1::StartLine::parse_bytes(&line).is_err(), "{terminator:?} beside obs-text parsed");
+    }
+}
+
+/// A request target is US-ASCII by RFC 9112 §3.2 and RFC 3986, so unlike a
+/// reason phrase it gains nothing from being read as octets, and the octets it
+/// is refused for must not depend on where in the line they sit.
+#[test]
+fn refuses_a_request_target_that_is_not_text() {
+    for line in [b"GET /\xff HTTP/1.1".as_slice(), b"GET \xc3\x28 HTTP/1.1", b"GET \xff HTTP/1.1"] {
+        assert!(h1::StartLine::parse_bytes(line).is_err(), "{line:?} should not parse");
+        assert_eq!(h1::StartLine::error_status_bytes(line), 400, "{line:?} is the client's fault");
+    }
+
+    assert_eq!(h1::StartLine::error_status_bytes(b"\xff / HTTP/1.1"), 501, "a method that is not text is not recognised");
+    assert_eq!(h1::StartLine::error_status_bytes(b"GET / HTTP/\xff.1"), 505, "a version that is not text is not spoken");
+}
+
 #[test]
 fn writes_a_start_line_for_each_half() {
     let request = Message::request(Method::POST, "/submit", Version::V1_1);

@@ -274,67 +274,70 @@ impl StartLine {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Protocol`] for a malformed line — a missing field, a
-    /// status code that is not three digits, a control octet in the reason
-    /// phrase, an unrecognised method, or a request target that is empty or
-    /// carries a space or a control octet — and [`Error::Version`] for a
-    /// version that is not HTTP/1.x.
+    /// As [`StartLine::parse_bytes`].
+    #[inline]
     pub fn parse(line: &str) -> Result<Message, Error> {
-        if line.as_bytes().starts_with(b"HTTP/") {
-            let Some(first) = scan::find(line.as_bytes(), b' ') else {
-                return Err(Error::Protocol("status line has no status code".into()));
-            };
-
-            let (version, rest) = Self::split(line, first);
-            let (status_code, reason) = match scan::find(rest.as_bytes(), b' ') {
-                Some(second) => Self::split(rest, second),
-                None => return Err(Error::Protocol("status line has no reason phrase".into())),
-            };
-
-            if status_code.len() != 3 || !status_code.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err(Error::Protocol(format!("status code {status_code:?} is not three digits")));
-            }
-
-            if !Octets::is_reason(reason) {
-                return Err(Error::Protocol("reason phrase contains a control character".into()));
-            }
-
-            let status_code = status_code
-                .parse()
-                .map_err(|_| Error::Protocol(format!("status code {status_code:?} is not three digits")))?;
-
-            return Ok(Message::response(status_code, Self::version(version)?));
-        }
-
-        let Some(first) = scan::find(line.as_bytes(), b' ') else {
-            return Err(Error::Protocol("request line has no target".into()));
-        };
-
-        let (method, rest) = Self::split(line, first);
-        let (target, version) = match scan::find(rest.as_bytes(), b' ') {
-            Some(second) => Self::split(rest, second),
-            None => return Err(Error::Protocol("request line has no version".into())),
-        };
-
-        let method: Method = method.parse().map_err(|_| Error::Protocol(format!("method {method:?} is not recognised")))?;
-
-        if !Octets::is_target(target) {
-            return Err(Error::Protocol(format!("request target {target:?} is malformed")));
-        }
-
-        Ok(Message::request(method, target, Self::version(version)?))
+        Self::parse_bytes(line.as_bytes())
     }
 
     /// [`StartLine::parse`] over raw octets.
     ///
+    /// A status line is read an octet at a time, so a reason phrase carrying
+    /// `obs-text` — which RFC 9112 admits and UTF-8 does not — parses. A
+    /// request line still has to be UTF-8, since a target is held as text.
+    ///
     /// # Errors
     ///
-    /// Returns [`Error::Protocol`] when the line is not valid UTF-8, and
-    /// otherwise as [`StartLine::parse`].
-    #[inline]
+    /// Returns [`Error::Protocol`] for a malformed line — a missing field, a
+    /// status code that is not three digits, a control octet other than a tab
+    /// in the reason phrase, an unrecognised method, or a request target that
+    /// is empty, is not UTF-8, or carries a space or a control octet — and
+    /// [`Error::Version`] for a version that is not HTTP/1.x.
     pub fn parse_bytes(line: &[u8]) -> Result<Message, Error> {
-        let line = std::str::from_utf8(line).map_err(|_| Error::Protocol("start line is not valid UTF-8".into()))?;
-        Self::parse(line)
+        if line.starts_with(b"HTTP/") {
+            let Some(first) = scan::find(line, b' ') else {
+                return Err(Error::Protocol("status line has no status code".into()));
+            };
+
+            let (version, rest) = Self::split(line, first);
+            let (status_code, reason) = match scan::find(rest, b' ') {
+                Some(second) => Self::split(rest, second),
+                None => return Err(Error::Protocol("status line has no reason phrase".into())),
+            };
+
+            if status_code.len() != 3 || !status_code.iter().all(u8::is_ascii_digit) {
+                return Err(Error::Protocol(format!("status code {:?} is not three digits", String::from_utf8_lossy(status_code))));
+            }
+
+            if !Octets::is_reason_bytes(reason) {
+                return Err(Error::Protocol("reason phrase contains a control character other than a tab".into()));
+            }
+
+            let status_code = u16::from(status_code[0] - b'0') * 100 + u16::from(status_code[1] - b'0') * 10 + u16::from(status_code[2] - b'0');
+
+            return Ok(Message::response(status_code, Self::version_bytes(version)?));
+        }
+
+        let Some(first) = scan::find(line, b' ') else {
+            return Err(Error::Protocol("request line has no target".into()));
+        };
+
+        let (method, rest) = Self::split(line, first);
+        let (target, version) = match scan::find(rest, b' ') {
+            Some(second) => Self::split(rest, second),
+            None => return Err(Error::Protocol("request line has no version".into())),
+        };
+
+        let Some(method) = std::str::from_utf8(method).ok().and_then(|method| method.parse::<Method>().ok()) else {
+            return Err(Error::Protocol(format!("method {:?} is not recognised", String::from_utf8_lossy(method))));
+        };
+
+        let target = match std::str::from_utf8(target) {
+            Ok(text) if Octets::is_target(text) => text,
+            _ => return Err(Error::Protocol(format!("request target {:?} is malformed", String::from_utf8_lossy(target)))),
+        };
+
+        Ok(Message::request(method, target, Self::version_bytes(version)?))
     }
 
     /// The status a server should answer a request line it could not parse
@@ -343,51 +346,59 @@ impl StartLine {
     /// 501 for a method that is not recognised, 505 for a version that is not
     /// HTTP/1.x, and 400 for everything else — so the client is told which part
     /// it got wrong rather than just that something was.
+    #[inline]
     pub fn error_status(line: &str) -> u16 {
-        let Some(first) = scan::find(line.as_bytes(), b' ') else {
+        Self::error_status_bytes(line.as_bytes())
+    }
+
+    /// [`StartLine::error_status`] over raw octets.
+    pub fn error_status_bytes(line: &[u8]) -> u16 {
+        let Some(first) = scan::find(line, b' ') else {
             return 400;
         };
 
         let (method, rest) = Self::split(line, first);
-        let (target, version) = match scan::find(rest.as_bytes(), b' ') {
+        let (target, version) = match scan::find(rest, b' ') {
             Some(second) => Self::split(rest, second),
             None => return 400,
         };
 
-        if method.parse::<Method>().is_err() {
+        if !matches!(std::str::from_utf8(method), Ok(method) if method.parse::<Method>().is_ok()) {
             return 501;
         }
 
-        if !Octets::is_target(target) {
+        if !matches!(std::str::from_utf8(target), Ok(target) if Octets::is_target(target)) {
             return 400;
         }
 
-        if Self::version(version).is_err() {
+        if Self::version_bytes(version).is_err() {
             return 505;
         }
 
         400
     }
 
-    /// [`StartLine::error_status`] over raw octets.
-    pub fn error_status_bytes(line: &[u8]) -> u16 {
-        match std::str::from_utf8(line) {
-            Ok(line) => Self::error_status(line),
-            Err(_) => 400,
-        }
+    /// Reads an HTTP/1.x version from a start line.
+    ///
+    /// # Errors
+    ///
+    /// As [`StartLine::version_bytes`].
+    #[inline]
+    pub fn version(text: &str) -> Result<Version, Error> {
+        Self::version_bytes(text.as_bytes())
     }
 
-    /// Reads an HTTP/1.x version from a start line.
+    /// [`StartLine::version`] over raw octets.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Version`] for anything that is not `HTTP/1.0` or
     /// `HTTP/1.1`.
-    pub fn version(text: &str) -> Result<Version, Error> {
+    pub fn version_bytes(text: &[u8]) -> Result<Version, Error> {
         match text {
-            "HTTP/1.0" => Ok(Version::V1_0),
-            "HTTP/1.1" => Ok(Version::V1_1),
-            _ => Err(Error::Version(format!("{text:?} is not an HTTP/1.x version"))),
+            b"HTTP/1.0" => Ok(Version::V1_0),
+            b"HTTP/1.1" => Ok(Version::V1_1),
+            _ => Err(Error::Version(format!("{:?} is not an HTTP/1.x version", String::from_utf8_lossy(text)))),
         }
     }
 
@@ -395,8 +406,8 @@ impl StartLine {
     ///
     /// # Panics
     ///
-    /// Panics when `at` is not a character boundary, or is past the end.
-    pub fn split(line: &str, at: usize) -> (&str, &str) {
+    /// Panics when `at` is past the end.
+    pub fn split(line: &[u8], at: usize) -> (&[u8], &[u8]) {
         (&line[..at], &line[at + 1..])
     }
 }
@@ -411,22 +422,21 @@ impl Octets {
     /// [`Octets::TABLE`]: the octet may appear in a token, and so in a field
     /// name.
     pub const TOKEN: u8 = 1 << 0;
-    /// [`Octets::TABLE`]: the octet may appear in a field value.
+    /// [`Octets::TABLE`]: the octet may appear in a field value, and so in a
+    /// reason phrase.
+    ///
+    /// `field-vchar = VCHAR / obs-text` with a space or a tab between, and
+    /// `reason-phrase = 1*( HTAB / SP / VCHAR / obs-text )`, are the same set of
+    /// octets: everything but a control octet, a tab excepted.
     pub const FIELD: u8 = 1 << 1;
     /// [`Octets::TABLE`]: the octet may appear in a request target.
     ///
     /// A target is delimited by the spaces around it, so unlike a field value
     /// it admits neither a space nor a tab.
     pub const TARGET: u8 = 1 << 2;
-    /// [`Octets::TABLE`]: the octet may appear in a reason phrase.
-    ///
-    /// Exactly the octets [`Octets::is_control`] rejects: a reason phrase runs
-    /// to the end of the line, so a space is fine where a control octet — a
-    /// tab included — would let the line be read as two.
-    pub const REASON: u8 = 1 << 3;
 
-    /// The or of [`Octets::TOKEN`], [`Octets::FIELD`], [`Octets::TARGET`] and
-    /// [`Octets::REASON`] for each octet.
+    /// The or of [`Octets::TOKEN`], [`Octets::FIELD`] and [`Octets::TARGET`] for
+    /// each octet.
     pub const TABLE: &'static [u8; 256] = &{
         let mut octets = [0u8; 256];
         let mut value = 0usize;
@@ -442,9 +452,8 @@ impl Octets {
 
             let field = byte == b'\t' || (byte >= 0x20 && byte != 0x7f);
             let target = byte > 0x20 && byte != 0x7f;
-            let reason = byte >= 0x20 && byte != 0x7f;
 
-            octets[value] = (token as u8) | (field as u8) << 1 | (target as u8) << 2 | (reason as u8) << 3;
+            octets[value] = (token as u8) | (field as u8) << 1 | (target as u8) << 2;
             value += 1;
         }
 
@@ -464,20 +473,32 @@ impl Octets {
     /// Whether a string is a non-empty request target.
     #[inline]
     pub fn is_target(text: &str) -> bool {
-        !text.is_empty() && scan::all_in_class(text.as_bytes(), Self::TABLE, Self::TARGET)
+        Self::is_target_bytes(text.as_bytes())
     }
 
-    /// Whether a string is usable as a reason phrase, carrying no control
-    /// octet.
+    /// Whether a string is usable as a reason phrase, carrying no control octet
+    /// other than a tab.
     #[inline]
     pub fn is_reason(text: &str) -> bool {
-        scan::all_in_class(text.as_bytes(), Self::TABLE, Self::REASON)
+        Self::is_reason_bytes(text.as_bytes())
     }
 
     /// [`Octets::is_token`] over raw octets.
     #[inline]
     pub fn is_token_bytes(text: &[u8]) -> bool {
         !text.is_empty() && scan::all_in_class(text, Self::TABLE, Self::TOKEN)
+    }
+
+    /// [`Octets::is_target`] over raw octets.
+    #[inline]
+    pub fn is_target_bytes(text: &[u8]) -> bool {
+        !text.is_empty() && scan::all_in_class(text, Self::TABLE, Self::TARGET)
+    }
+
+    /// [`Octets::is_reason`] over raw octets.
+    #[inline]
+    pub fn is_reason_bytes(text: &[u8]) -> bool {
+        scan::all_in_class(text, Self::TABLE, Self::FIELD)
     }
 }
 
