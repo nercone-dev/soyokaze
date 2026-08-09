@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '0 0/6 * * *'
 
 permissions:
   contents: read
@@ -203,3 +205,13 @@ jobs:
 
       - name: Build Docs
         run: cargo doc --no-deps --all-features
+
+  osv-scanner:
+    name: OSV-Scanner
+    if: ${{ github.event_name != 'pull_request' }}
+    uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.5.0"
+
+  osv-scanner-pr:
+    name: OSV-Scanner (Pull Request)
+    if: ${{ github.event_name == 'pull_request' }}
+    uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@v2.5.0"

@@ -205,8 +205,12 @@ jobs:
       - name: Build Docs
         run: cargo doc --release --no-deps --all-features
 
+  osv-scanner:
+    name: OSV-Scanner
+    uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.5.0"
+
   update:
-    needs: [test, test-ffi, test-python, test-doc]
+    needs: [test, test-ffi, test-python, test-doc, osv-scanner]
     name: Update
     runs-on: ubuntu-latest
     permissions:
