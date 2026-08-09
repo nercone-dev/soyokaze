@@ -423,12 +423,6 @@ jobs:
           path: python/dist/*.whl
           if-no-files-found: error
 
-      - name: Attach to the release
-        run: gh release upload "$TAG" python/dist/*.whl --clobber
-        env:
-          TAG: ${{ github.event.release.tag_name }}
-          GH_TOKEN: ${{ github.token }}
-
   package:
     name: Package (${{ matrix.arch }}-${{ matrix.os }})
     needs: [build, build-python]
