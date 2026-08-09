@@ -109,28 +109,27 @@ jobs:
         with:
           key: test-ffi-${{ matrix.arch }}-${{ matrix.os }}
 
-      - name: Build every library form
+      - name: Build FFI
         run: cargo build --lib --all-features
 
-      - name: Build and run the C test against the shared library
-        run: |
-          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c -Ltarget/debug -lsoyokaze -o ffi-shared
-          case "$RUNNER_OS" in
-            Linux) LD_LIBRARY_PATH=target/debug ./ffi-shared ;;
-            macOS) DYLD_LIBRARY_PATH=target/debug ./ffi-shared ;;
-          esac
-
-      - name: Build and run the C test against the static library
+      - name: Check FFI
         env:
           CARGO_TERM_COLOR: never
         run: |
-          libs=$(cargo rustc --lib --all-features --crate-type staticlib -- --print native-static-libs 2>&1 \
-                 | sed -n 's/^note: native-static-libs: //p' | tail -n1)
+          cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c -Ltarget/debug -lsoyokaze -o ffi-shared
+
+          case "${{ matrix.os }}" in
+            linux) LD_LIBRARY_PATH=target/debug ./ffi-shared ;;
+            macos) DYLD_LIBRARY_PATH=target/debug ./ffi-shared ;;
+          esac
+
+          libs=$(cargo rustc --lib --all-features --crate-type staticlib -- --print native-static-libs 2>&1 | sed -n 's/^note: native-static-libs: //p' | tail -n1)
           if [ -z "$libs" ]; then
             echo "::error::rustc reported no native static libs; the link would fail obscurely"
             exit 1
           fi
           echo "native static libs: $libs"
+
           cc -std=c11 -Wall -Wextra -Iinclude tests/ffi.c target/debug/libsoyokaze.a $libs -o ffi-static
           ./ffi-static
 
@@ -176,18 +175,18 @@ jobs:
         with:
           key: test-python-${{ matrix.arch }}-${{ matrix.os }}
 
-      - name: Build the shared library
+      - name: Build FFI
         run: cargo build --lib --all-features
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
 
-      - name: Run the Python test suite
+      - name: Run pytest
         working-directory: python
         run: uv run pytest
 
   test-doc:
-    name: Test Documentation
+    name: Test Docs
     runs-on: ubuntu-latest
 
     steps:
@@ -202,5 +201,5 @@ jobs:
         with:
           key: test-doc
 
-      - name: Build the documentation
+      - name: Build Docs
         run: cargo doc --no-deps --all-features
