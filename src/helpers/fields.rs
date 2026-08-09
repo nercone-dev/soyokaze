@@ -37,9 +37,42 @@ impl HeaderField {
     /// full of empty fields still has a bounded entry count.
     pub const OVERHEAD: usize = 32;
 
+    /// The fewest fields a section is given room for before it is decoded.
+    pub const SECTION_FLOOR: usize = 8;
+
+    /// The room left beyond what the last section carried.
+    ///
+    /// A decoded section rarely stays as it arrived: an HTTP/2 or HTTP/3
+    /// request gains the `Host` its `:authority` folds into. Leaving a slot
+    /// spare is what keeps that from reallocating a list that was otherwise
+    /// sized exactly.
+    pub const SECTION_SPARE: usize = 1;
+
+    /// The most fields a section is given room for before it is decoded.
+    ///
+    /// A section carrying more still decodes; what the ceiling bounds is the
+    /// room a decoder goes on holding afterwards, so that one outsized section
+    /// does not leave every later one sized for it.
+    pub const SECTION_CEILING: usize = 128;
+
     /// A field with this name and value.
     pub fn new(name: impl Into<Text>, value: impl Into<Text>) -> Self {
         Self { name: name.into(), value: value.into() }
+    }
+
+    /// How many fields to make room for, given what the last section carried.
+    ///
+    /// Field sections on one connection are near enough alike that the last
+    /// one is the best guess available for the next, and a guess is worth
+    /// having: a list grown from empty reallocates several times on its way to
+    /// an ordinary request's length. The block's own size says little, since
+    /// compressing against a warm table is exactly what makes a long section
+    /// short on the wire.
+    ///
+    /// A decoder asks this of its first field rather than before it, so a
+    /// block refused before any field decodes never allocates at all.
+    pub fn section_hint(previous: usize) -> usize {
+        previous.saturating_add(Self::SECTION_SPARE).clamp(Self::SECTION_FLOOR, Self::SECTION_CEILING)
     }
 
     /// What this field costs against a dynamic table's size.

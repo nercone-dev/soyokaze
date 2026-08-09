@@ -1475,7 +1475,7 @@ pub unsafe extern "C" fn soyokaze_headers_is_empty(headers: *const Headers) -> b
 /// As [`soyokaze_headers_len`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_headers_name(headers: *const Headers, index: usize) -> Slice {
-    Slice::maybe(unsafe { headers.as_ref() }.and_then(|headers| headers.fields().get(index)).map(|(name, _)| name.as_str()))
+    Slice::maybe(unsafe { headers.as_ref() }.and_then(|headers| headers.fields().get(index)).map(|field| field.name.as_str()))
 }
 
 /// The value of the field at `index`, borrowed from the section.
@@ -1485,7 +1485,7 @@ pub unsafe extern "C" fn soyokaze_headers_name(headers: *const Headers, index: u
 /// As [`soyokaze_headers_len`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_headers_value(headers: *const Headers, index: usize) -> Slice {
-    Slice::maybe(unsafe { headers.as_ref() }.and_then(|headers| headers.fields().get(index)).map(|(_, value)| value.as_str()))
+    Slice::maybe(unsafe { headers.as_ref() }.and_then(|headers| headers.fields().get(index)).map(|field| field.value.as_str()))
 }
 
 /// Whether the section carries `name` at all.
@@ -1743,7 +1743,7 @@ pub unsafe extern "C" fn soyokaze_message_set_target(message: *mut Message, targ
         return false;
     };
 
-    message.target = Some(target.to_owned());
+    message.target = Some(crate::helpers::text::Text::from_str(target));
     true
 }
 

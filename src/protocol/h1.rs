@@ -295,7 +295,7 @@ impl StartLine {
                 return Err(Error::Protocol(format!("status code {status_code:?} is not three digits")));
             }
 
-            if reason.bytes().any(Octets::is_control) {
+            if !Octets::is_reason(reason) {
                 return Err(Error::Protocol("reason phrase contains a control character".into()));
             }
 
@@ -318,7 +318,7 @@ impl StartLine {
 
         let method: Method = method.parse().map_err(|_| Error::Protocol(format!("method {method:?} is not recognised")))?;
 
-        if target.is_empty() || target.bytes().any(|byte| byte == b' ' || Octets::is_control(byte)) {
+        if !Octets::is_target(target) {
             return Err(Error::Protocol(format!("request target {target:?} is malformed")));
         }
 
@@ -358,7 +358,7 @@ impl StartLine {
             return 501;
         }
 
-        if target.is_empty() || target.bytes().any(|byte| byte == b' ' || Octets::is_control(byte)) {
+        if !Octets::is_target(target) {
             return 400;
         }
 
@@ -413,8 +413,20 @@ impl Octets {
     pub const TOKEN: u8 = 1 << 0;
     /// [`Octets::TABLE`]: the octet may appear in a field value.
     pub const FIELD: u8 = 1 << 1;
+    /// [`Octets::TABLE`]: the octet may appear in a request target.
+    ///
+    /// A target is delimited by the spaces around it, so unlike a field value
+    /// it admits neither a space nor a tab.
+    pub const TARGET: u8 = 1 << 2;
+    /// [`Octets::TABLE`]: the octet may appear in a reason phrase.
+    ///
+    /// Exactly the octets [`Octets::is_control`] rejects: a reason phrase runs
+    /// to the end of the line, so a space is fine where a control octet — a
+    /// tab included — would let the line be read as two.
+    pub const REASON: u8 = 1 << 3;
 
-    /// The or of [`Octets::TOKEN`] and [`Octets::FIELD`] for each octet.
+    /// The or of [`Octets::TOKEN`], [`Octets::FIELD`], [`Octets::TARGET`] and
+    /// [`Octets::REASON`] for each octet.
     pub const TABLE: &'static [u8; 256] = &{
         let mut octets = [0u8; 256];
         let mut value = 0usize;
@@ -429,8 +441,10 @@ impl Octets {
                 );
 
             let field = byte == b'\t' || (byte >= 0x20 && byte != 0x7f);
+            let target = byte > 0x20 && byte != 0x7f;
+            let reason = byte >= 0x20 && byte != 0x7f;
 
-            octets[value] = (token as u8) | (field as u8) << 1;
+            octets[value] = (token as u8) | (field as u8) << 1 | (target as u8) << 2 | (reason as u8) << 3;
             value += 1;
         }
 
@@ -445,6 +459,19 @@ impl Octets {
     /// Whether a string is a non-empty token, and so usable as a field name.
     pub fn is_token(text: &str) -> bool {
         Self::is_token_bytes(text.as_bytes())
+    }
+
+    /// Whether a string is a non-empty request target.
+    #[inline]
+    pub fn is_target(text: &str) -> bool {
+        !text.is_empty() && scan::all_in_class(text.as_bytes(), Self::TABLE, Self::TARGET)
+    }
+
+    /// Whether a string is usable as a reason phrase, carrying no control
+    /// octet.
+    #[inline]
+    pub fn is_reason(text: &str) -> bool {
+        scan::all_in_class(text.as_bytes(), Self::TABLE, Self::REASON)
     }
 
     /// [`Octets::is_token`] over raw octets.

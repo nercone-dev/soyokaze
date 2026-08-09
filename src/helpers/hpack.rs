@@ -424,6 +424,7 @@ pub struct Decoder {
     max_capacity: usize,
     max_decoded_size: usize,
     scratch: Vec<u8>,
+    section: usize,
 }
 
 impl Decoder {
@@ -438,6 +439,7 @@ impl Decoder {
             max_capacity: DynamicTable::DEFAULT_CAPACITY,
             max_decoded_size: Self::DEFAULT_MAX_DECODED_SIZE,
             scratch: Vec::new(),
+            section: HeaderField::SECTION_FLOOR,
         }
     }
 
@@ -500,7 +502,7 @@ impl Decoder {
                 }
 
                 if headers.is_empty() {
-                    headers.reserve(block.len().min(64));
+                    headers.reserve(HeaderField::section_hint(self.section));
                 }
 
                 headers.push(field);
@@ -509,6 +511,7 @@ impl Decoder {
             rest = &rest[consumed..];
         }
 
+        self.section = headers.len();
         Ok(headers)
     }
 

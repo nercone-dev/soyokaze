@@ -213,6 +213,13 @@ pub struct H3Session {
     /// tells the peer they were not processed and may be retried elsewhere.
     pub goaway_sent: Option<u64>,
 
+    /// The field list an outgoing message is framed from, kept between
+    /// messages so that framing one costs no list of its own.
+    pub fields: Vec<HeaderField>,
+    /// The field block an outgoing section is encoded into, kept for the same
+    /// reason and given back through [`common::Buffer::reclaim_octets`].
+    pub block: Vec<u8>,
+
     /// What the transport underneath turned out to be, stamped on every
     /// message this session hands over.
     ///
@@ -266,6 +273,8 @@ impl H3Session {
             total_streams: 0,
             goaway: None,
             goaway_sent: None,
+            fields: Vec::new(),
+            block: Vec::new(),
             security: std::sync::Arc::new(std::sync::Mutex::new(Security::quic(None))),
         }
     }
@@ -344,6 +353,36 @@ impl H3Session {
         }
     }
 
+    /// Encodes a field section and appends it as a frame of `kind`.
+    ///
+    /// The list and the block are the session's own and are refilled rather
+    /// than made afresh, so `gather` says what goes in them and nothing else
+    /// has to know they are reused. The block shrinks again once an outsized
+    /// section has gone out.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `gather` returns.
+    pub fn write_block(
+        &mut self,
+        stream_id: StreamID,
+        kind: FrameType,
+        out: &mut BytesMut,
+        gather: impl FnOnce(&mut Vec<HeaderField>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.fields.clear();
+        gather(&mut self.fields)?;
+
+        self.block.clear();
+        self.encoder.encode_into(&mut self.block, stream_id.0, &self.fields);
+        Frame::write(kind, &self.block, out);
+
+        let idle = self.limits.idle_capacity as usize;
+        common::Buffer::reclaim_octets(&mut self.block, idle);
+
+        Ok(())
+    }
+
     /// Frames a message into HEADERS, DATA and trailing HEADERS.
     ///
     /// Any QPACK instructions the field sections need are queued for the
@@ -356,10 +395,7 @@ impl H3Session {
     /// must be read before it reaches here, and otherwise as
     /// [`common::Fields::of`].
     pub fn frame_message(&mut self, stream_id: StreamID, message: &Message, out: &mut BytesMut) -> Result<bool, Error> {
-        let fields = common::Fields::of(message)?;
-        let block = self.encoder.encode(stream_id.0, &fields);
-
-        Frame::Headers(block.into()).encode_into(out);
+        self.write_block(stream_id, FrameType::Headers, out, |fields| common::Fields::write(message, fields))?;
 
         if let Some(body) = &message.body {
             let body = body
@@ -371,9 +407,10 @@ impl H3Session {
         }
 
         if let Some(trailers) = message.trailers.as_ref().filter(|trailers| !trailers.is_empty()) {
-            let fields: Vec<HeaderField> = trailers.fields().iter().map(|(name, value)| HeaderField::new(name.clone(), value.clone())).collect();
-            let block = self.encoder.encode(stream_id.0, &fields);
-            Frame::Headers(block.into()).encode_into(out);
+            self.write_block(stream_id, FrameType::Headers, out, |fields| {
+                fields.extend_from_slice(trailers.fields());
+                Ok(())
+            })?;
         }
 
         let state = self.streams.entry(stream_id).or_default();

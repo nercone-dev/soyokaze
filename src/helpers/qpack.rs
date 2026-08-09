@@ -1073,6 +1073,7 @@ pub struct Decoder {
     max_blocked_streams: usize,
     blocked: fields::FieldMap<u64, u64>,
     scratch: Vec<u8>,
+    section: usize,
     idle_capacity: usize,
     stream_out: Vec<u8>,
     stream_recv: BytesMut,
@@ -1107,6 +1108,7 @@ impl Decoder {
             max_blocked_streams: Self::DEFAULT_MAX_BLOCKED_STREAMS,
             blocked: fields::FieldMap::default(),
             scratch: Vec::new(),
+            section: HeaderField::SECTION_FLOOR,
             idle_capacity: Self::DEFAULT_IDLE_CAPACITY,
             stream_out: Vec::new(),
             stream_recv: BytesMut::new(),
@@ -1391,7 +1393,7 @@ impl Decoder {
             }
 
             if headers.is_empty() {
-                headers.reserve(block.len().min(64));
+                headers.reserve(HeaderField::section_hint(self.section));
             }
 
             headers.push(field);
@@ -1400,6 +1402,7 @@ impl Decoder {
 
         let acknowledgment = (required > 0).then_some(DecoderInstruction::SectionAcknowledgment { stream_id });
 
+        self.section = headers.len();
         Ok((headers, acknowledgment))
     }
 

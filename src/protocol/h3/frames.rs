@@ -287,6 +287,18 @@ impl Frame {
         debug_assert_eq!(out.len() - start, length, "payload_len disagreed with write_payload");
     }
 
+    /// Appends a frame of `kind` carrying `payload`.
+    ///
+    /// [`Frame::encode_into`] needs a [`Frame`], and a frame owns its payload;
+    /// this is for a caller framing octets it means to keep, such as a field
+    /// block encoded into a buffer it reuses between messages.
+    pub fn write(kind: FrameType, payload: &[u8], out: &mut BytesMut) {
+        out.reserve(payload.len() + 2 * Varint::len(Varint::MAXIMUM));
+        Varint::encode(out, kind.code());
+        Varint::encode(out, payload.len() as u64);
+        out.extend_from_slice(payload);
+    }
+
     /// The whole frame as its own buffer.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = BytesMut::with_capacity(self.payload_len() + 2 * Varint::len(Varint::MAXIMUM));

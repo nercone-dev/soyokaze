@@ -325,7 +325,23 @@ impl Fields {
     /// response, or when it carries a [`Fields::CONNECTION_SPECIFIC`] field, which has no
     /// meaning above HTTP/1.1.
     pub fn of(message: &Message) -> Result<Vec<HeaderField>, Error> {
-        let mut fields = Vec::with_capacity(Self::PSEUDO_REQUEST.len() + message.headers.as_ref().map_or(0, Headers::len));
+        let mut fields = Vec::new();
+        Self::write(message, &mut fields)?;
+        Ok(fields)
+    }
+
+    /// [`Fields::of`], appending to a list the caller owns.
+    ///
+    /// A connection frames a message on every send, and the list is the same
+    /// shape every time; keeping one and refilling it is what stops each
+    /// message paying for a list of its own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Fields::of`]. The list may hold a partial field list when this
+    /// fails.
+    pub fn write(message: &Message, fields: &mut Vec<HeaderField>) -> Result<(), Error> {
+        fields.reserve(Self::PSEUDO_REQUEST.len() + message.headers.as_ref().map_or(0, Headers::len));
 
         if let Some(method) = message.method {
             let target = message.target.as_deref().unwrap_or("/");
@@ -356,20 +372,20 @@ impl Fields {
         }
 
         if let Some(headers) = &message.headers {
-            for (name, value) in headers.fields() {
-                if name.starts_with(':') || name == "host" {
+            for field in headers.fields() {
+                if field.name.starts_with(':') || field.name == "host" {
                     continue;
                 }
 
-                if Self::connection_specific(name) {
-                    return Err(Error::Protocol(format!("connection-specific field {name:?} cannot be framed")));
+                if Self::connection_specific(&field.name) {
+                    return Err(Error::Protocol(format!("connection-specific field {:?} cannot be framed", field.name)));
                 }
 
-                fields.push(HeaderField { name: name.clone(), value: value.clone() });
+                fields.push(field.clone());
             }
         }
 
-        Ok(fields)
+        Ok(())
     }
 
     /// [`Fields::into_message`] over a borrowed field list.
@@ -378,7 +394,9 @@ impl Fields {
     ///
     /// As [`Fields::into_message`].
     pub fn message(fields: &[HeaderField], version: Version) -> Result<Message, Error> {
-        Self::into_message(fields.to_vec(), version)
+        let mut owned = Vec::with_capacity(HeaderField::section_hint(fields.len()));
+        owned.extend_from_slice(fields);
+        Self::into_message(owned, version)
     }
 
     /// Turns a decoded field list back into a [`Message`], enforcing the rules
@@ -407,14 +425,16 @@ impl Fields {
         const PSEUDO_PROTOCOL: u8 = 1 << 5;
 
         let mut message = Message::new(version);
-        let mut headers = Headers::with_capacity(fields.len() + 1);
         let mut regular = false;
 
         let mut seen = 0u8;
         let mut authority: Option<Text> = None;
         let mut path: Option<Text> = None;
 
-        for field in fields {
+        // The list is walked by reference and then becomes the field section
+        // as it stands: a decoded block already is what a section holds, so
+        // rebuilding one field at a time would copy every field to no end.
+        for field in &fields {
             if field.name.bytes().any(|byte| byte.is_ascii_uppercase()) {
                 return Err(Error::Protocol(format!("field name {:?} is not lowercase", field.name)));
             }
@@ -429,7 +449,6 @@ impl Fields {
                 }
 
                 regular = true;
-                headers.append_lowercase(field.name, field.value);
                 continue;
             }
 
@@ -469,8 +488,6 @@ impl Fields {
                 PSEUDO_PATH => path = Some(field.value.clone()),
                 _ => {}
             }
-
-            headers.append_lowercase(field.name, field.value);
         }
 
         let stray = if message.method.is_some() {
@@ -495,9 +512,11 @@ impl Fields {
             return Err(Error::Protocol("message has neither :method nor :status".into()));
         }
 
+        let mut headers = Headers::from_fields(fields);
+
         if let Some(method) = message.method {
             if method == Method::CONNECT && seen & PSEUDO_PROTOCOL == 0 {
-                message.target = authority.as_deref().map(str::to_owned);
+                message.target = authority.clone();
                 if message.target.is_none() || seen & (PSEUDO_SCHEME | PSEUDO_PATH) != 0 {
                     return Err(Error::Protocol("CONNECT carries an authority and nothing else".into()));
                 }
@@ -506,7 +525,7 @@ impl Fields {
                 if path.is_empty() || seen & PSEUDO_SCHEME == 0 {
                     return Err(Error::Protocol("request needs both a scheme and a non-empty path".into()));
                 }
-                message.target = Some(path.into_string());
+                message.target = Some(path);
             }
 
             if let Some(authority) = authority {

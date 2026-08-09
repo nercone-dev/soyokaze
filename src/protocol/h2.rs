@@ -263,6 +263,7 @@ pub struct H2Connection<T> {
     ready: VecDeque<Message>,
     out: BytesMut,
     block: Vec<u8>,
+    fields: Vec<HeaderField>,
     buffered_bound: u64,
 
     premature_resets: u32,
@@ -319,6 +320,7 @@ where
             ready: VecDeque::new(),
             out: BytesMut::new(),
             block: Vec::new(),
+            fields: Vec::new(),
             buffered_bound: 0,
 
             premature_resets: 0,
@@ -564,11 +566,12 @@ where
 
         self.streams.entry(stream_id).or_insert_with(|| H2Stream::new(stream_id, window_local, window_remote));
 
-        let fields = common::Fields::of(&message)?;
+        self.fields.clear();
+        common::Fields::write(&message, &mut self.fields)?;
 
         let mut block = std::mem::take(&mut self.block);
         block.clear();
-        self.hpack_encoder.encode_into(&mut block, &fields);
+        self.hpack_encoder.encode_into(&mut block, &self.fields);
 
         let body = match message.body.take() {
             Some(body) => Some(body.into_bytes().await?),
@@ -595,11 +598,12 @@ where
         }
 
         if let Some(trailers) = trailers {
-            let fields = trailers.fields().iter().map(|(name, value)| HeaderField { name: name.clone(), value: value.clone() }).collect::<Vec<_>>();
+            self.fields.clear();
+            self.fields.extend_from_slice(trailers.fields());
 
             let mut block = std::mem::take(&mut self.block);
             block.clear();
-            self.hpack_encoder.encode_into(&mut block, &fields);
+            self.hpack_encoder.encode_into(&mut block, &self.fields);
 
             let written = self.write_block(stream_id, &block, true).await;
             self.block = block;

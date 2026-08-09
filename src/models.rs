@@ -11,6 +11,7 @@ use std::str::FromStr;
 use bytes::Bytes;
 
 use crate::errors::Error;
+use crate::helpers::fields::HeaderField;
 use crate::helpers::text::Text;
 use crate::tls::Security;
 
@@ -607,7 +608,7 @@ impl Body {
 /// Two sections are equal when they hold the same fields in the same order.
 #[derive(Debug, Clone)]
 pub struct Headers {
-    fields: Vec<(Text, Text)>,
+    fields: Vec<HeaderField>,
     present: u32,
 }
 
@@ -702,7 +703,7 @@ impl Headers {
     /// Whether any field carries this name.
     #[inline]
     pub fn contains(&self, name: &str) -> bool {
-        !self.absent(name) && self.fields.iter().any(|(stored, _)| Self::named(stored, name))
+        !self.absent(name) && self.fields.iter().any(|field| Self::named(&field.name, name))
     }
 
     /// The value of the first field with this name.
@@ -712,7 +713,7 @@ impl Headers {
             return None;
         }
 
-        self.fields.iter().find(|(stored, _)| Self::named(stored, name)).map(|(_, value)| value.as_str())
+        self.fields.iter().find(|field| Self::named(&field.name, name)).map(|field| field.value.as_str())
     }
 
     /// The values of every field with this name, in order.
@@ -720,7 +721,7 @@ impl Headers {
     pub fn get_all<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> {
         let fields = if self.absent(name) { &self.fields[..0] } else { &self.fields[..] };
 
-        fields.iter().filter(move |(stored, _)| Self::named(stored, name)).map(|(_, value)| value.as_str())
+        fields.iter().filter(move |field| Self::named(&field.name, name)).map(|field| field.value.as_str())
     }
 
     /// Adds a field, keeping any field that already carries this name.
@@ -731,7 +732,7 @@ impl Headers {
         name.make_ascii_lowercase();
 
         self.present |= Self::well_known(&name);
-        self.fields.push((name, value.into()));
+        self.fields.push(HeaderField { name, value: value.into() });
     }
 
     /// [`Headers::append`] for a name already known to be lowercase.
@@ -744,7 +745,7 @@ impl Headers {
         debug_assert!(!name.bytes().any(|byte| byte.is_ascii_uppercase()), "{name:?} is not lowercase");
 
         self.present |= Self::well_known(&name);
-        self.fields.push((name, value.into()));
+        self.fields.push(HeaderField { name, value: value.into() });
     }
 
     /// Adds a field, dropping every field that already carries this name.
@@ -755,11 +756,11 @@ impl Headers {
         name.make_ascii_lowercase();
 
         if !self.absent(&name) {
-            self.fields.retain(|(stored, _)| *stored != name);
+            self.fields.retain(|field| field.name != name);
         }
 
         self.present |= Self::well_known(&name);
-        self.fields.push((name, value.into()));
+        self.fields.push(HeaderField { name, value: value.into() });
     }
 
     /// Drops every field with this name, reporting whether any were there.
@@ -769,30 +770,64 @@ impl Headers {
         }
 
         let len_before = self.fields.len();
-        self.fields.retain(|(stored, _)| !Self::named(stored, name));
+        self.fields.retain(|field| !Self::named(&field.name, name));
 
         if self.fields.len() == len_before {
             return false;
         }
 
-        self.present = self.fields.iter().fold(0, |present, (stored, _)| present | Self::well_known(stored));
+        self.present = Self::presence(&self.fields);
         true
     }
 
     /// Every field in order, as name and value pairs.
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.fields.iter().map(|(name, value)| (name.as_str(), value.as_str()))
+        self.fields.iter().map(|field| (field.name.as_str(), field.value.as_str()))
     }
 
-    /// Every field in order, as the [`Text`] pairs they are stored as.
+    /// Every field in order, as the [`HeaderField`]s they are stored as.
     ///
-    /// This is what the binary versions build their field lists from: cloning
-    /// a [`Text`] shares a long value rather than copying it, which
+    /// This is what the binary versions build their field lists from: a
+    /// section holds exactly the type [`hpack`] and [`qpack`] encode, and
+    /// cloning a [`Text`] shares a long value rather than copying it, which
     /// [`Headers::iter`] and `&str` cannot.
+    ///
+    /// [`hpack`]: crate::helpers::hpack
+    /// [`qpack`]: crate::helpers::qpack
     #[inline]
-    pub fn fields(&self) -> &[(Text, Text)] {
+    pub fn fields(&self) -> &[HeaderField] {
         &self.fields
+    }
+
+    /// The presence bits standing for every well-known name in `fields`.
+    #[inline]
+    pub fn presence(fields: &[HeaderField]) -> u32 {
+        fields.iter().fold(0, |present, field| present | Self::well_known(&field.name))
+    }
+
+    /// Takes an already-built field list as the section itself.
+    ///
+    /// This is what a decoded field block becomes: [`hpack`] and [`qpack`]
+    /// hand back exactly the list a section is made of, so it is moved in
+    /// rather than copied field by field into a second one.
+    ///
+    /// Every name must already be lowercase, as both codecs guarantee.
+    ///
+    /// [`hpack`]: crate::helpers::hpack
+    /// [`qpack`]: crate::helpers::qpack
+    pub fn from_fields(fields: Vec<HeaderField>) -> Self {
+        debug_assert!(
+            !fields.iter().any(|field| field.name.bytes().any(|byte| byte.is_ascii_uppercase())),
+            "a field name is not lowercase"
+        );
+
+        Self { present: Self::presence(&fields), fields }
+    }
+
+    /// Gives up the field list the section holds.
+    pub fn into_fields(self) -> Vec<HeaderField> {
+        self.fields
     }
 }
 
@@ -864,7 +899,7 @@ pub struct Message {
     /// The request target, set on requests only.
     ///
     /// Ordinarily a path; for a `CONNECT` without `:protocol`, an authority.
-    pub target: Option<String>,
+    pub target: Option<Text>,
 
     // Response
     /// The status code, set on responses only.
@@ -908,7 +943,7 @@ impl Message {
     }
 
     /// A request for `target`.
-    pub fn request(method: Method, target: impl Into<String>, version: Version) -> Self {
+    pub fn request(method: Method, target: impl Into<Text>, version: Version) -> Self {
         Self { method: Some(method), target: Some(target.into()), ..Self::new(version) }
     }
 
