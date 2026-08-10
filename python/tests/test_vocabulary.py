@@ -3,7 +3,7 @@
 import pytest
 
 import soyokaze
-from soyokaze import ALPN, BodyKind, HeaderCase, Headers, Method, Port, Role, TransportKind, URL, Version
+from soyokaze import ALPN, BodyKind, Compression, HeaderCase, Headers, Method, Port, Role, TransportKind, URL, Version
 from soyokaze.helpers import fields, scan, sync, text
 
 def test_versions_carry_their_rfc_alpn_identifiers():
@@ -215,3 +215,93 @@ def test_text_stays_inline_until_it_outgrows_the_inline_capacity():
     lowered = text.Text.from_ascii_lowercase(b"Content-Length")
     assert lowered.as_str() == "content-length"
     assert text.Text.from_str("abc") == "abc"
+
+def test_content_codings_round_trip_through_their_tokens():
+    # RFC 9110 §8.4.1 registers these tokens; the enum must spell them exactly.
+    assert Compression.ZSTD.as_str() == "zstd"
+    assert Compression.BROTLI.as_str() == "br"
+    assert Compression.GZIP.as_str() == "gzip"
+    assert Compression.DEFLATE.as_str() == "deflate"
+
+    for coding in Compression.codings():
+        assert Compression.parse(coding.as_str()) is coding
+        assert str(coding) == coding.as_str()
+
+    # The token is read whatever case it was written in, and x-gzip is gzip.
+    assert Compression.parse("GZIP") is Compression.GZIP
+    assert Compression.parse("X-Gzip") is Compression.GZIP
+    assert Compression.parse("Br") is Compression.BROTLI
+
+def test_auto_names_no_coding_of_its_own():
+    assert Compression.AUTO.as_str() == ""
+    assert Compression.AUTO not in Compression.codings()
+
+    for token in ("compress", "identity", "auto", "", "nonsense"):
+        assert Compression.parse(token) is None, f"{token!r} must not name a coding"
+
+    with pytest.raises(soyokaze.ProtocolError):
+        Compression.AUTO.encode(b"hello")
+
+def test_the_advertised_field_lists_every_coding_the_library_decodes():
+    advertised = tuple(Compression.parse(token) for token in Compression.accepted_field().split(","))
+    assert advertised == Compression.codings()
+
+def test_accept_encoding_selection_follows_rfc_9110_quality_rules():
+    def accepted(value):
+        headers = Headers()
+        headers.append("accept-encoding", value)
+        return Compression.accepted(headers)
+
+    # Quality settles what is acceptable to the peer; which of the acceptable
+    # ones to send is this end's own preference order.
+    assert accepted("gzip;q=1.0, zstd;q=0.1") is Compression.ZSTD
+    assert accepted("deflate, gzip") is Compression.GZIP
+
+    # A coding at q=0 is refused, and * stands for what the field does not name.
+    assert accepted("zstd;q=0, br;q=0, gzip") is Compression.GZIP
+    assert accepted("*") is Compression.ZSTD
+    assert accepted("*, zstd;q=0") is Compression.BROTLI
+    assert accepted("*;q=0") is None
+
+    # An absent field permits nothing rather than everything.
+    assert Compression.accepted(Headers()) is None
+    assert accepted("identity") is None
+
+    assert Compression.quality("gzip") == 1.0
+    assert Compression.quality("gzip;q=0") == 0.0
+
+def test_content_encoding_names_a_coding_only_when_it_names_one():
+    def applied(*values):
+        headers = Headers()
+        for value in values:
+            headers.append("content-encoding", value)
+        return headers
+
+    assert Compression.applied(applied("gzip")) is Compression.GZIP
+    assert Compression.applied(applied("gzip, br")) is None
+    assert Compression.applied(applied("gzip", "br")) is None
+    assert Compression.applied(applied("compress")) is None
+    assert Compression.applied(Headers()) is None
+
+    # A body is coded whether or not the library can decode it; identity codes
+    # nothing at all.
+    assert Compression.encoded(applied("compress"))
+    assert Compression.encoded(applied("gzip"))
+    assert not Compression.encoded(applied("identity"))
+    assert not Compression.encoded(Headers())
+
+def test_every_coding_round_trips_and_stops_at_its_ceiling():
+    body = b"a" * 4096
+
+    for coding in Compression.codings():
+        encoded = coding.encode(body)
+        assert len(encoded) < len(body), f"{coding} did not shrink a compressible body"
+        assert coding.decode(encoded, 1 << 20) == body
+
+        # The ceiling admits a body of exactly its size and nothing past it.
+        assert coding.decode(encoded, 4096) == body
+        with pytest.raises(soyokaze.LimitError):
+            coding.decode(encoded, 4095)
+
+        with pytest.raises(soyokaze.ProtocolError):
+            coding.decode(b"not a compressed stream at all", 1 << 20)

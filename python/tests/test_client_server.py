@@ -10,7 +10,7 @@ import asyncio
 import pytest
 
 import soyokaze
-from soyokaze import Client, ClientConfig, Limits, Message, Method, Port, Server, ServerConfig, ServerLimits, URL, Version
+from soyokaze import Client, ClientConfig, Compression, Limits, Message, Method, Port, Server, ServerConfig, ServerLimits, URL, Version
 
 async def echo(request):
     """Answers with the request's own target, so the round trip proves the
@@ -208,3 +208,73 @@ async def test_dialling_nothing_raises_rather_than_hanging():
     client = Client()
     with pytest.raises(soyokaze.Error):
         await client.get("http://127.0.0.1:1/")
+
+async def test_a_served_response_is_compressed_when_the_request_accepts_it():
+    """The whole path: the client advertises what it decodes, the server codes
+    the answer in one of those, and the client hands it back decoded."""
+
+    body = "a" * 8192
+    seen = {}
+
+    async def compressing(request):
+        seen["accept"] = request.header("accept-encoding")
+        seen["client"] = request.client
+
+        response = Message.text(body)
+        response.compression = Compression.AUTO
+        return response
+
+    server, handle, origin = await serve(compressing)
+    async with handle:
+        client = Client()
+        response = await client.get(f"{origin}/")
+
+        # RFC 9110 §12.5.3: the client says what it decodes without being asked.
+        assert seen["accept"] == Compression.accepted_field()
+
+        # The answer comes back decoded, with the field that named the coding
+        # gone and the coding it arrived in still reported.
+        assert response.compression is Compression.ZSTD
+        assert not response.compressed()
+        assert response.header("content-encoding") is None
+        assert response.header("vary") == "Accept-Encoding"
+        assert (await response.body()).decode() == body
+
+async def test_a_request_that_accepts_nothing_is_answered_uncoded():
+    async def compressing(request):
+        response = Message.text("a" * 8192)
+        response.compression = Compression.AUTO
+        return response
+
+    server, handle, origin = await serve(compressing)
+    async with handle:
+        client = Client()
+        response = await client.fetch(Method.GET, f"{origin}/", headers=[("accept-encoding", "identity")])
+
+        assert response.compression is None, "a peer that accepts nothing gets the body as it stands"
+        assert not response.compressed()
+        assert response.header("content-length") == "8192"
+
+async def test_the_handler_sees_the_address_the_request_came_from():
+    seen = {}
+
+    async def record(request):
+        seen["client"] = request.client
+        return Message.text("ok")
+
+    server, handle, origin = await serve(record)
+    async with handle:
+        client = Client()
+        await client.get(f"{origin}/")
+
+    address = seen["client"]
+    assert address is not None, "a handler must be told where the request came from"
+    assert address.rsplit(":", 1)[-1].isdigit(), f"{address!r} must carry the port the peer dialled from"
+
+async def test_a_response_a_client_receives_names_no_access_source():
+    server, handle, origin = await serve()
+    async with handle:
+        client = Client()
+        response = await client.get(f"{origin}/")
+
+        assert response.client is None, "a response names no access source"

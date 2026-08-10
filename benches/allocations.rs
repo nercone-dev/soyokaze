@@ -120,7 +120,7 @@ fn message_framing() {
 
 fn http3_cycle() {
     let mut group = Group::new("http/3 request cycle allocations");
-    let response = response();
+    let mut response = response();
 
     let mut peer = session(Role::UserAgent);
     let mut server = session(Role::Origin);
@@ -133,7 +133,7 @@ fn http3_cycle() {
         server.on_stream_bytes(stream, &wire, true).expect("the request did not parse");
         std::hint::black_box(server.take_ready().expect("the request never completed"));
 
-        server.encode_message_into(stream, &response, &mut outbound).expect("the response did not encode");
+        server.encode_message_into(stream, &mut response, &mut outbound).expect("the response did not encode");
         outbound.clear();
         server.retire(stream);
     });
@@ -149,7 +149,7 @@ fn http3_cycle() {
         server.on_stream_bytes(stream, &wire, true).expect("the request did not parse");
         std::hint::black_box(server.take_ready().expect("the request never completed"));
 
-        let (bytes, _) = server.encode_message(stream, &response).expect("the response did not encode");
+        let (bytes, _) = server.encode_message(stream, &mut response).expect("the response did not encode");
         outbound.extend_from_slice(&bytes);
         outbound.clear();
         server.retire(stream);

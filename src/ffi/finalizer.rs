@@ -222,21 +222,23 @@ pub unsafe extern "C" fn soyokaze_message_finalize_response(message: *mut Messag
     true
 }
 
-/// Fills in the authority a request is expected to carry.
+/// Fills in the fields a request is expected to carry.
 ///
-/// Writes `Host` for HTTP/1.x and `:authority` above it, and leaves whichever
-/// is already there alone.
+/// Writes `Host` for HTTP/1.x and `:authority` above it, and `Accept-Encoding`
+/// naming every coding the library decodes; whichever is already there is left
+/// alone. A null `authority` leaves `Host` out, for a connection that was
+/// built over a transport the caller already had and so knows none.
 ///
 /// # Safety
 ///
-/// `message` must be a handle that has not been freed, and `authority` must
-/// point to `authority_len` readable octets.
+/// `message` must be a handle that has not been freed, and `authority` must be
+/// null or point to `authority_len` readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_message_finalize_request(message: *mut Message, authority: *const u8, authority_len: usize) -> bool {
-    let (Some(message), Some(authority)) = (unsafe { message.as_mut() }, unsafe { Slice::borrow_text(authority, authority_len) }) else {
+    let Some(message) = (unsafe { message.as_mut() }) else {
         return false;
     };
 
-    message.finalize_request(authority);
+    message.finalize_request(unsafe { Slice::borrow_text(authority, authority_len) });
     true
 }

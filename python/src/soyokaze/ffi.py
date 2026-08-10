@@ -16,7 +16,7 @@ import os
 import pathlib
 import sys
 
-from ctypes import CFUNCTYPE, POINTER, Structure, c_bool, c_char_p, c_double, c_int32, c_int64, c_size_t, c_ssize_t, c_uint8, c_uint16, c_uint32, c_uint64, c_void_p
+from ctypes import CFUNCTYPE, POINTER, Structure, c_bool, c_char_p, c_double, c_float, c_int32, c_int64, c_size_t, c_ssize_t, c_uint8, c_uint16, c_uint32, c_uint64, c_void_p
 
 class Slice(Structure):
     """A borrowed view of octets: ``soyokaze_slice_t``.
@@ -79,6 +79,7 @@ class Limits(Structure):
     _fields_ = [
         ("max_message_size", c_uint64),
         ("max_message_body_size", c_uint64),
+        ("max_decompressed_body_size", c_uint64),
         ("max_startline_size", c_uint32),
         ("max_headers_size", c_uint64),
         ("max_header_count", c_uint16),
@@ -264,6 +265,7 @@ class H1Limits(Structure):
     _fields_ = [
         ("max_message_size", c_uint64),
         ("max_message_body_size", c_uint64),
+        ("max_decompressed_body_size", c_uint64),
         ("max_startline_size", c_uint32),
         ("max_headers_size", c_uint64),
         ("max_header_count", c_uint16),
@@ -284,6 +286,7 @@ class H2Limits(Structure):
     _fields_ = [
         ("max_message_size", c_uint64),
         ("max_message_body_size", c_uint64),
+        ("max_decompressed_body_size", c_uint64),
         ("max_headers_size", c_uint64),
         ("max_header_count", c_uint16),
         ("max_concurrent_streams", c_uint32),
@@ -306,6 +309,7 @@ class H3Limits(Structure):
     _fields_ = [
         ("max_message_size", c_uint64),
         ("max_message_body_size", c_uint64),
+        ("max_decompressed_body_size", c_uint64),
         ("max_headers_size", c_uint64),
         ("max_header_count", c_uint16),
         ("max_concurrent_streams", c_uint32),
@@ -576,6 +580,28 @@ Library.declare("soyokaze_message_body_inline", Slice, c_void_p)
 Library.declare("soyokaze_message_body_path", Slice, c_void_p)
 Library.declare("soyokaze_message_body_len", c_int64, c_void_p)
 Library.declare("soyokaze_message_body", c_int32, c_void_p, c_void_p, POINTER(Buffer), POINTER(c_void_p))
+Library.declare("soyokaze_message_client", Buffer, c_void_p)
+Library.declare("soyokaze_message_compression", c_int32, c_void_p)
+Library.declare("soyokaze_message_set_compression", c_bool, c_void_p, c_int32)
+Library.declare("soyokaze_message_compressed", c_bool, c_void_p)
+Library.declare("soyokaze_message_accepted", c_int32, c_void_p)
+Library.declare("soyokaze_message_materialize", c_int32, c_void_p, c_void_p, POINTER(c_void_p))
+Library.declare("soyokaze_message_compress", c_int32, c_void_p, c_int32, POINTER(c_void_p))
+Library.declare("soyokaze_message_decompress", c_int32, c_void_p, c_uint64, POINTER(c_void_p))
+
+# -------------------------------------------------------------- compression
+
+Library.declare("soyokaze_compression_name", Slice, c_int32)
+Library.declare("soyokaze_compression_parse", c_int32, c_char_p, c_size_t)
+Library.declare("soyokaze_compression_count", c_size_t)
+Library.declare("soyokaze_compression_coding", c_int32, c_size_t)
+Library.declare("soyokaze_compression_accepted_field", Slice)
+Library.declare("soyokaze_compression_accepted", c_int32, c_void_p)
+Library.declare("soyokaze_compression_applied", c_int32, c_void_p)
+Library.declare("soyokaze_compression_encoded", c_bool, c_void_p)
+Library.declare("soyokaze_compression_quality", c_float, c_char_p, c_size_t)
+Library.declare("soyokaze_compression_encode", c_int32, c_int32, c_char_p, c_size_t, POINTER(Buffer), POINTER(c_void_p))
+Library.declare("soyokaze_compression_decode", c_int32, c_int32, c_char_p, c_size_t, c_uint64, POINTER(Buffer), POINTER(c_void_p))
 
 # ---------------------------------------------------------------- responses
 Library.declare("soyokaze_response_with_body", c_void_p, c_uint16, c_int32, c_char_p, c_size_t)
@@ -739,6 +765,7 @@ Library.declare("soyokaze_client_websocket", c_int32, c_void_p, c_void_p, c_char
 Library.declare("soyokaze_connection_version", c_int32, c_void_p)
 Library.declare("soyokaze_connection_role", c_uint32, c_void_p)
 Library.declare("soyokaze_connection_id", Buffer, c_void_p)
+Library.declare("soyokaze_connection_client", Buffer, c_void_p)
 Library.declare("soyokaze_connection_reusable", c_bool, c_void_p)
 Library.declare("soyokaze_connection_send", c_int32, c_void_p, c_void_p, c_void_p, POINTER(c_void_p))
 Library.declare("soyokaze_connection_receive", c_int32, c_void_p, c_void_p, POINTER(c_void_p), POINTER(c_void_p))

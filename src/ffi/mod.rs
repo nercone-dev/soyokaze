@@ -94,6 +94,7 @@ pub mod helpers {
     pub mod fields;
     pub mod hpack;
     pub mod qpack;
+    pub mod compression;
 }
 
 pub use errors::Status;

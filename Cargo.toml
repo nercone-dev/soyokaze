@@ -15,6 +15,7 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 [dependencies]
 boring = "=4.22.0"
 boring-sys = "=4.22.0"
+brotli = "8"
 bytes = "1.12.1"
 flate2 = "1"
 foreign-types = "0.5"
@@ -23,6 +24,7 @@ socket2 = "0.6.5"
 tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-boring = "=4.22.0"
 tokio-quiche = "0.19"
+zstd = "0.13"
 
 [dev-dependencies]
 rcgen = "0.14.5"

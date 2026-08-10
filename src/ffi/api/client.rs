@@ -456,6 +456,25 @@ pub unsafe extern "C" fn soyokaze_connection_id(connection: *const AnyConnection
     }
 }
 
+/// The address the peer connected from, and its port, as text.
+///
+/// Empty on a client connection, and on one over a Unix socket, whose accepted
+/// address names nothing. This is what every request the connection receives is
+/// stamped with. Free the result with [`soyokaze_buffer_free`].
+///
+/// [`soyokaze_buffer_free`]: crate::ffi::soyokaze_buffer_free
+///
+/// # Safety
+///
+/// As [`soyokaze_connection_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_connection_client(connection: *const AnyConnection) -> Buffer {
+    match unsafe { connection.as_ref() }.and_then(Connection::client) {
+        Some(client) => Buffer::new(client.to_string().into_bytes()),
+        None => Buffer::EMPTY,
+    }
+}
+
 /// Sends one message over an open connection, without waiting for anything
 /// back.
 ///

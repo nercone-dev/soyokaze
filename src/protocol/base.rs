@@ -52,6 +52,18 @@ pub trait Connection {
         Security::default()
     }
 
+    /// The address the peer connected from, when there is one.
+    ///
+    /// Every request the connection receives is stamped with it, which is
+    /// where [`Message::client`] comes from. A client connection has nothing
+    /// to report, and neither has one over a Unix socket, whose accepted
+    /// address names nothing.
+    ///
+    /// [`Message::client`]: crate::models::Message::client
+    fn client(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
+
     /// Sends a message.
     ///
     /// # Errors
@@ -207,6 +219,7 @@ impl Connection for AnyConnection {
         fn id(&self) -> ConnectionID;
         fn reusable(&self) -> bool;
         fn security(&self) -> Security;
+        fn client(&self) -> Option<std::net::SocketAddr>;
 
         async fn send(&mut self, message: Message) -> Result<(), Error>;
         async fn receive(&mut self) -> Result<Message, Error>;

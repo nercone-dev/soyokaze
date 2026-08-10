@@ -283,7 +283,7 @@ fn hsts_is_only_advertised_on_a_secure_response() {
 fn a_request_gains_the_authority_it_was_dialled_with() {
     // RFC 9112 §3.2 requires Host on every HTTP/1.1 request.
     let mut request = Message::request(soyokaze::Method::GET, "/", Version::V1_1);
-    request.finalize_request("example.test:8443");
+    request.finalize_request(Some("example.test:8443"));
     assert_eq!(
         request.headers.as_ref().and_then(|headers| headers.get("host")),
         Some("example.test:8443"),
@@ -295,7 +295,7 @@ fn a_request_gains_the_authority_it_was_dialled_with() {
     // so every version has to be given one.
     for version in [Version::V2_0, Version::V3_0] {
         let mut later = Message::request(soyokaze::Method::GET, "/", version);
-        later.finalize_request("example.test");
+        later.finalize_request(Some("example.test"));
 
         let fields = Fields::of(&later).expect("a well-formed request did not frame");
         assert!(
@@ -311,7 +311,7 @@ fn a_request_gains_the_authority_it_was_dialled_with() {
     // Nothing the caller set is overwritten.
     let mut chosen = Message::request(soyokaze::Method::GET, "/", Version::V1_1);
     chosen.headers.get_or_insert_with(Headers::new).append("host", "chosen.test");
-    chosen.finalize_request("example.test");
+    chosen.finalize_request(Some("example.test"));
     assert_eq!(
         chosen.headers.as_ref().and_then(|headers| headers.get("host")),
         Some("chosen.test"),
@@ -320,7 +320,7 @@ fn a_request_gains_the_authority_it_was_dialled_with() {
 
     // Only a request carries an authority.
     let mut response = Message::response(200, Version::V1_1);
-    response.finalize_request("example.test");
+    response.finalize_request(Some("example.test"));
     assert!(
         !response.headers.as_ref().is_some_and(|headers| headers.contains("host")),
         "a response must not gain an authority",

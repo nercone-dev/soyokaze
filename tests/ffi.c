@@ -103,6 +103,9 @@ static void check_layouts(void) {
     assert(limits.max_header_count == 100);
     assert(limits.read_timeout == 30.0);
     assert(limits.max_hsts_entries == 4096);
+    /* A coded body is small on the wire and large once decoded, so its ceiling
+     * has to be the roomier of the two. */
+    assert(limits.max_decompressed_body_size > limits.max_message_body_size);
 
     soyokaze_client_limits_t client_limits = soyokaze_client_limits_default();
     assert(client_limits.connection_timeout == 10.0);
@@ -151,6 +154,86 @@ static void check_codecs(void) {
     soyokaze_hpack_encoder_free(encoder);
 }
 
+/* The content codings: the tokens either way, the preference order, the round
+ * trip, the ceiling, and what a message says about its own coding. */
+static void check_compression(void) {
+    assert(soyokaze_compression_count() == 4);
+    assert(soyokaze_compression_coding(0) == SOYOKAZE_COMPRESSION_ZSTD);
+    assert(soyokaze_compression_coding(4) == -1);
+
+    soyokaze_slice_t advertised = soyokaze_compression_accepted_field();
+    assert(advertised.len == strlen("zstd, br, gzip, deflate"));
+
+    for (size_t index = 0; index < soyokaze_compression_count(); index++) {
+        int32_t coding = soyokaze_compression_coding(index);
+        soyokaze_slice_t token = soyokaze_compression_name(coding);
+
+        assert(token.len > 0);
+        assert(soyokaze_compression_parse(token.data, token.len) == coding);
+    }
+
+    /* AUTO names nothing on the wire, and nonsense names no coding at all. */
+    assert(soyokaze_compression_name(SOYOKAZE_COMPRESSION_AUTO).len == 0);
+    assert(soyokaze_compression_parse(LIT("nonsense")) == -1);
+    assert(soyokaze_compression_parse(LIT("identity")) == -1);
+
+    /* An entry with no q parameter is fully acceptable. */
+    assert(soyokaze_compression_quality(LIT("gzip")) == 1.0f);
+    assert(soyokaze_compression_quality(LIT("gzip;q=0")) == 0.0f);
+
+    soyokaze_buffer_t coded = {NULL, 0, 0};
+    assert(soyokaze_compression_encode(SOYOKAZE_COMPRESSION_GZIP, LIT("hello, soyokaze"), &coded, NULL) == SOYOKAZE_OK);
+    assert(coded.len > 0);
+
+    soyokaze_buffer_t plain = {NULL, 0, 0};
+    assert(soyokaze_compression_decode(SOYOKAZE_COMPRESSION_GZIP, coded.data, coded.len, 1024, &plain, NULL) == SOYOKAZE_OK);
+    assert(plain.len == strlen("hello, soyokaze"));
+    assert(memcmp(plain.data, "hello, soyokaze", plain.len) == 0);
+    soyokaze_buffer_free(plain);
+
+    /* A ceiling smaller than the body refuses it rather than holding it. */
+    assert(soyokaze_compression_decode(SOYOKAZE_COMPRESSION_GZIP, coded.data, coded.len, 4, NULL, NULL) == SOYOKAZE_LIMIT);
+    soyokaze_buffer_free(coded);
+
+    /* AUTO names no coding to code in. */
+    assert(soyokaze_compression_encode(SOYOKAZE_COMPRESSION_AUTO, LIT("hello"), NULL, NULL) != SOYOKAZE_OK);
+
+    soyokaze_message_t *message = soyokaze_message_response(200, SOYOKAZE_HTTP_1_1);
+    assert(message != NULL);
+
+    /* A message the caller built has crossed nothing. */
+    soyokaze_buffer_t client = soyokaze_message_client(message);
+    assert(client.data == NULL);
+    soyokaze_buffer_free(client);
+
+    assert(soyokaze_message_compression(message) == -1);
+    assert(!soyokaze_message_compressed(message));
+    assert(soyokaze_message_accepted(message) == -1);
+
+    assert(soyokaze_message_set_compression(message, SOYOKAZE_COMPRESSION_BROTLI));
+    assert(soyokaze_message_compression(message) == SOYOKAZE_COMPRESSION_BROTLI);
+    assert(!soyokaze_message_set_compression(message, 99));
+    assert(soyokaze_message_set_compression(message, -1));
+    assert(soyokaze_message_compression(message) == -1);
+
+    /* A body coded and then decoded comes back as it went in, and the field
+     * that named the coding is gone. */
+    static const char body[] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    assert(soyokaze_message_set_body_data(message, (const uint8_t *)body, strlen(body)));
+    assert(soyokaze_message_set_compression(message, SOYOKAZE_COMPRESSION_ZSTD));
+    assert(soyokaze_message_compress(message, -1, NULL) == SOYOKAZE_OK);
+    assert(soyokaze_message_compressed(message));
+
+    assert(soyokaze_message_decompress(message, 1024, NULL) == SOYOKAZE_OK);
+    assert(!soyokaze_message_compressed(message));
+
+    soyokaze_slice_t inline_body = soyokaze_message_body_inline(message);
+    assert(inline_body.len == strlen(body));
+    assert(memcmp(inline_body.data, body, inline_body.len) == 0);
+
+    soyokaze_message_free(message);
+}
+
 int main(void) {
     soyokaze_slice_t crate = soyokaze_version();
     printf("soyokaze %.*s\n", (int)crate.len, crate.data);
@@ -160,6 +243,7 @@ int main(void) {
     check_null_handles();
     check_layouts();
     check_codecs();
+    check_compression();
 
     soyokaze_runtime_t *runtime = soyokaze_runtime_new(0);
     assert(runtime != NULL);

@@ -181,7 +181,7 @@ fn finalizing() {
 
     group.time("finalize_request", || {
         let mut request = Message::request(Method::GET, "/index.html", black_box(Version::V1_1));
-        request.finalize_request("www.example.com");
+        request.finalize_request(Some("www.example.com"));
         request
     });
 

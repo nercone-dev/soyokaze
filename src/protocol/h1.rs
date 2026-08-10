@@ -20,6 +20,7 @@ use std::ops::Range;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
+use crate::helpers::compression::Compression;
 use crate::helpers::scan;
 use crate::helpers::text::Text;
 use crate::models::{Body, ConnectionID, HeaderCase, Headers, Limits, Message, Method, Role, Version};
@@ -42,6 +43,8 @@ pub struct H1Limits {
     pub max_message_size: u64,
     /// In bytes, the message body size allowed for reception.
     pub max_message_body_size: u64,
+    /// In bytes, the size a received body may reach once its content coding is undone.
+    pub max_decompressed_body_size: u64,
     /// In bytes, the request/status line ceiling.
     pub max_startline_size: u32,
     /// In bytes, the whole header (or trailer) block.
@@ -79,6 +82,7 @@ impl From<Limits> for H1Limits {
         Self {
             max_message_size: limits.max_message_size,
             max_message_body_size: limits.max_message_body_size,
+            max_decompressed_body_size: limits.max_decompressed_body_size,
             max_startline_size: limits.max_startline_size,
             max_headers_size: limits.max_headers_size,
             max_header_count: limits.max_header_count,
@@ -1054,6 +1058,32 @@ impl BodyLength {
     }
 }
 
+/// One request awaiting its response.
+///
+/// A client remembers one as it sends a request and takes it back as the
+/// answer arrives; a server does the reverse. What is kept is what a response
+/// cannot be framed or coded without: the method that asked for it, and the
+/// best coding the request said it would take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Exchange {
+    /// The method of the request.
+    pub method: Method,
+    /// The best coding the request's `Accept-Encoding` permits.
+    pub accepted: Option<Compression>,
+}
+
+impl Exchange {
+    /// An exchange for a request with `method`, permitting `accepted`.
+    pub fn new(method: Method, accepted: Option<Compression>) -> Self {
+        Self { method, accepted }
+    }
+
+    /// The exchange a received request opens, or `None` for a response.
+    pub fn of(message: &Message) -> Option<Self> {
+        Some(Self::new(message.method?, message.accepted()))
+    }
+}
+
 /// An HTTP/1.0 or HTTP/1.1 connection.
 ///
 /// One message at a time in each direction. As a client it may pipeline, up to
@@ -1068,10 +1098,11 @@ pub struct H1Connection<T> {
     role: Role,
     version: Version,
     id: ConnectionID,
+    client: Option<std::net::SocketAddr>,
     limits: H1Limits,
     buffer: Buffer,
     scratch: BytesMut,
-    pending: VecDeque<Method>,
+    pending: VecDeque<Exchange>,
     closing: bool,
     request_finalizer: crate::finalizer::RequestFinalizer,
     response_finalizer: crate::finalizer::ResponseFinalizer,
@@ -1102,6 +1133,7 @@ where
             role,
             version: Version::V1_1,
             id,
+            client: None,
             limits,
             buffer,
             scratch: BytesMut::new(),
@@ -1163,6 +1195,16 @@ where
     /// this connection receives.
     pub fn with_security(mut self, security: Security) -> Self {
         self.security = security;
+        self
+    }
+
+    /// Attaches the address the peer connected from, to be stamped on every
+    /// request this connection receives.
+    ///
+    /// A client connection is told none, and neither is one over a Unix
+    /// socket, so [`Message::client`] stays absent on both.
+    pub fn with_client(mut self, client: Option<std::net::SocketAddr>) -> Self {
+        self.client = client;
         self
     }
 
@@ -1237,8 +1279,23 @@ where
     }
 
     /// How many requests may be in flight at once.
+    ///
+    /// It bounds the pipeline in both directions: what a client may send
+    /// before the first answer arrives, and how many received requests a
+    /// server remembers before it starts answering them.
     pub fn pipeline_depth(&self) -> usize {
         (self.limits.max_concurrent_streams as usize).max(1)
+    }
+
+    /// The coding the exchange a message belongs to permits.
+    ///
+    /// A server answers from the request it is about to answer, which is the
+    /// one at the front of the pipeline. A client has no exchange to consult —
+    /// nothing tells it what an origin accepts — and so permits nothing, which
+    /// is what leaves [`Compression::Auto`] sending a request body as it
+    /// stands.
+    pub fn accepted(&self, message: &Message) -> Option<Compression> {
+        message.is_response().then(|| self.pending.front()?.accepted).flatten()
     }
 
     /// Writes one whole message: start line, fields, and body.
@@ -1269,6 +1326,9 @@ where
         let mut message = message;
         self.request_finalizer.finalize(self.role, &mut message);
         self.response_finalizer.finalize(self.role, self.security.secure, &mut message);
+
+        message.materialize().await?;
+        message.compress(self.accepted(&message))?;
 
         let body = match message.body.take().map(Body::into_inline) {
             Some(Ok(data)) => Some(data),
@@ -1352,6 +1412,7 @@ where
         };
 
         let method = message.method;
+        let informational = message.is_informational();
         drop(message);
 
         if let Some(body) = trailing {
@@ -1365,8 +1426,10 @@ where
         common::Buffer::reclaim_bytes(&mut out, self.limits.idle_capacity as usize);
         self.scratch = out;
 
-        if let Some(method) = method {
-            self.pending.push_back(method);
+        match method {
+            Some(method) => self.pending.push_back(Exchange::new(method, None)),
+            None if self.role.is_server() && !informational => drop(self.pending.pop_front()),
+            None => {}
         }
 
         Ok(())
@@ -1412,6 +1475,7 @@ where
 
         message.headers = Some(headers);
         message.connection_id = Some(self.id.clone());
+        message.client = self.client;
         self.security.apply(&mut message);
 
         self.closing = self.closing || !Persistence::keep_alive(message.headers.as_ref(), message.version);
@@ -1421,7 +1485,16 @@ where
             return Err(Error::Limit(format!("message head of {head} octets exceeds {limit}")));
         };
 
-        let method = if message.is_response() { self.pending.pop_front() } else { None };
+        if let Some(exchange) = self.role.is_server().then(|| Exchange::of(&message)).flatten() {
+            if self.pending.len() >= self.pipeline_depth() {
+                let reason = format!("more than {} requests are awaiting an answer", self.pipeline_depth());
+                return Err(Error::Limit(reason));
+            }
+
+            self.pending.push_back(exchange);
+        }
+
+        let method = if message.is_response() { self.pending.pop_front().map(|exchange| exchange.method) } else { None };
 
         let length = BodyLength::of(&message, method)?;
 
@@ -1433,6 +1506,8 @@ where
         if length == BodyLength::Chunked {
             message.trailers = Some(self.read_header_block().await?.0);
         }
+
+        message.decompress(self.limits.max_decompressed_body_size)?;
 
         self.buffer.reclaim(self.limits.idle_capacity as usize);
         Ok(message)
@@ -1589,6 +1664,10 @@ where
 
     fn security(&self) -> Security {
         self.security
+    }
+
+    fn client(&self) -> Option<std::net::SocketAddr> {
+        self.client
     }
 
     async fn send(&mut self, message: Message) -> Result<(), Error> {

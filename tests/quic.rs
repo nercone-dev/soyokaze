@@ -4,7 +4,7 @@ use soyokaze::models::{Body, ConnectionID, Message, Method, Port, Version};
 use soyokaze::protocol::base::{AnyConnection, Connection};
 use soyokaze::models::Limits;
 use soyokaze::websocket::{CloseCode, Opcode};
-use soyokaze::{Client, ClientConfig, Handler, Identity, Server, ServerConfig};
+use soyokaze::{Client, ClientConfig, Compression, Handler, Identity, Server, ServerConfig};
 
 #[derive(Clone)]
 struct Echo;
@@ -251,4 +251,86 @@ fn a_connection_is_wound_down_at_its_request_ceiling() {
 
     cluster.close(Some(1.0));
     assert_eq!(served, CEILING, "the connection did not serve exactly its ceiling before winding down");
+}
+
+/// Answers with what the connection was told about its peer, coded as the
+/// request asked.
+#[derive(Clone)]
+struct Reflector;
+
+impl Handler for Reflector {
+    async fn on_connection(&self, connection: AnyConnection) {
+        let mut connection = connection;
+
+        while let Ok(request) = connection.receive().await {
+            let seen = request.client.map_or_else(|| "none".to_owned(), |client| client.to_string());
+
+            let mut response = Message::response(200, connection.version());
+            response.stream_id = request.stream_id;
+            response.body = Some(Body::Data(Bytes::from(format!("{seen}|{}", "x".repeat(8192)))));
+            response.compression = Some(Compression::Auto);
+
+            if connection.send(response).await.is_err() {
+                break;
+            }
+        }
+
+        connection.close().await;
+    }
+}
+
+/// The whole HTTP/3 path: the client advertises what it decodes, the server
+/// codes the answer in one of those, the client hands it back decoded, and the
+/// address QUIC reported at accept reaches the handler.
+#[test]
+fn an_http_3_exchange_is_compressed_and_names_the_peer() {
+    let certificate = certificate();
+
+    let server = Server::new(ServerConfig {
+        versions: vec![Version::V3_0],
+        identity: Some(Identity::new(vec![certificate.der.clone()], certificate.key)),
+        ..ServerConfig::default()
+    });
+
+    let cluster = server.run(Reflector, &[Port::QUIC(0)], 1).expect("the QUIC port did not open");
+    let port = cluster.address().expect("the cluster has no address").port();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("no runtime");
+
+    runtime.block_on(async move {
+        let client = Client::new(ClientConfig {
+            versions: vec![Version::V3_0],
+            roots: Some(vec![certificate.der]),
+            ..ClientConfig::default()
+        });
+
+        let id = ConnectionID(Bytes::from_static(b"test"));
+        let mut connection = client
+            .connect_quic("localhost", port, id, "localhost")
+            .await
+            .expect("the client could not reach the server over QUIC");
+
+        let request = Message::request(Method::GET, "/index.html", Version::V3_0);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), client.request(&mut connection, request))
+            .await
+            .expect("the server never answered")
+            .expect("the exchange failed");
+
+        assert_eq!(response.status_code, Some(200));
+        assert_eq!(response.compression, Some(Compression::Zstd), "the answer must come back in the coding the request permitted");
+        assert!(!response.compressed(), "a decoded body must carry no Content-Encoding");
+        assert_eq!(response.headers.as_ref().and_then(|headers| headers.get("vary")), Some("Accept-Encoding"));
+        assert_eq!(response.client, None, "a response names no access source");
+
+        let body = response.body.as_ref().and_then(Body::inline).expect("the answer carried no body");
+        let text = String::from_utf8_lossy(&body).into_owned();
+        let (seen, padding) = text.split_once('|').expect("the answer did not name what the handler saw");
+
+        assert_eq!(padding.len(), 8192, "the body must survive the round trip");
+        assert!(seen.parse::<std::net::SocketAddr>().is_ok(), "the handler saw {seen:?} rather than the address QUIC reported");
+
+        connection.close().await;
+    });
+
+    cluster.close(Some(1.0));
 }

@@ -129,12 +129,25 @@ typedef enum {
     SOYOKAZE_ROLE_TUNNEL = 4
 } soyokaze_role_t;
 
+/* A content coding a message body may be carried in. SOYOKAZE_COMPRESSION_AUTO
+ * names nothing on the wire: it is a choice, settled against what the peer said
+ * it accepts just before the body goes out. Wherever a coding may be absent it
+ * crosses as -1. */
+typedef enum {
+    SOYOKAZE_COMPRESSION_AUTO = 0,
+    SOYOKAZE_COMPRESSION_ZSTD = 1,
+    SOYOKAZE_COMPRESSION_BROTLI = 2,
+    SOYOKAZE_COMPRESSION_GZIP = 3,
+    SOYOKAZE_COMPRESSION_DEFLATE = 4
+} soyokaze_compression_t;
+
 /* What one connection is allowed to spend on the peer's behalf. Every field
  * is a ceiling; timeouts are in seconds and zero waits forever. Start from
  * soyokaze_limits_default() and adjust. */
 typedef struct {
     uint64_t max_message_size;
     uint64_t max_message_body_size;
+    uint64_t max_decompressed_body_size; /* what a received body may reach once decoded */
 
     uint32_t max_startline_size;
     uint64_t max_headers_size;
@@ -415,6 +428,34 @@ bool soyokaze_message_set_stream_id(soyokaze_message_t *message, int64_t stream_
 soyokaze_slice_t soyokaze_message_connection_id(const soyokaze_message_t *message);
 /* A NULL `id` clears it. */
 bool soyokaze_message_set_connection_id(soyokaze_message_t *message, const uint8_t *id, size_t id_len);
+
+/* The address the request was received from, and its port, as text. Empty on a
+ * response, on a message the caller built, and over a Unix socket, whose
+ * accepted address names nothing. Free with soyokaze_buffer_free. */
+soyokaze_buffer_t soyokaze_message_client(const soyokaze_message_t *message);
+
+/* The content coding the body is to go out in. Set it before sending to have
+ * the body coded on the way out; on a message that was received it reads as
+ * what the coding the connection took off the body. This is Content-Encoding
+ * and nothing else: Transfer-Encoding frames a body rather than codes it. */
+int32_t soyokaze_message_compression(const soyokaze_message_t *message); /* -1 when none */
+bool soyokaze_message_set_compression(soyokaze_message_t *message, int32_t compression); /* -1 clears it */
+/* Whether the body is currently carried compressed, per Content-Encoding. */
+bool soyokaze_message_compressed(const soyokaze_message_t *message);
+/* The best coding the message's Accept-Encoding permits. */
+int32_t soyokaze_message_accepted(const soyokaze_message_t *message); /* -1 when none */
+
+/* Reads a body that is still a file into memory, so it can be coded. */
+soyokaze_status_t soyokaze_message_materialize(soyokaze_message_t *message,
+                                               const soyokaze_runtime_t *runtime,
+                                               soyokaze_error_t **error);
+/* Codes the body in soyokaze_message_compression. `accepted` is the coding the
+ * exchange permits, which is what SOYOKAZE_COMPRESSION_AUTO settles on; -1
+ * permits none. The body must already be in memory. */
+soyokaze_status_t soyokaze_message_compress(soyokaze_message_t *message, int32_t accepted, soyokaze_error_t **error);
+/* Decodes a body that arrived coded and takes Content-Encoding off it. `max`
+ * bounds what the decoded body may reach; passing it is SOYOKAZE_STATUS_LIMIT. */
+soyokaze_status_t soyokaze_message_decompress(soyokaze_message_t *message, uint64_t max, soyokaze_error_t **error);
 
 /* What the transport underneath turned out to be. Stamped on every message a
  * connection receives, so these read as absent on one the caller built. A
@@ -811,6 +852,9 @@ soyokaze_status_t soyokaze_client_websocket(soyokaze_runtime_t *runtime, const s
 soyokaze_version_t soyokaze_connection_version(const soyokaze_connection_t *connection);
 soyokaze_role_t soyokaze_connection_role(const soyokaze_connection_t *connection);
 soyokaze_buffer_t soyokaze_connection_id(const soyokaze_connection_t *connection);
+/* The address the peer connected from, and its port, as text. Empty on a client
+ * connection and over a Unix socket. Free with soyokaze_buffer_free. */
+soyokaze_buffer_t soyokaze_connection_client(const soyokaze_connection_t *connection);
 bool soyokaze_connection_reusable(const soyokaze_connection_t *connection);
 /* `message` is consumed. */
 soyokaze_status_t soyokaze_connection_send(soyokaze_runtime_t *runtime,
@@ -1156,6 +1200,7 @@ soyokaze_security_t soyokaze_quic_handshake_security(uint32_t quic_version);
 typedef struct {
     uint64_t max_message_size;
     uint64_t max_message_body_size;
+    uint64_t max_decompressed_body_size;
     uint32_t max_startline_size;
     uint64_t max_headers_size;
     uint16_t max_header_count;
@@ -1236,6 +1281,7 @@ soyokaze_buffer_t soyokaze_h1_hexadecimal(uint64_t value);
 typedef struct {
     uint64_t max_message_size;
     uint64_t max_message_body_size;
+    uint64_t max_decompressed_body_size;
     uint64_t max_headers_size;
     uint16_t max_header_count;
     uint32_t max_concurrent_streams;
@@ -1383,6 +1429,7 @@ soyokaze_slice_t soyokaze_h2_error_code_name(uint32_t code);
 typedef struct {
     uint64_t max_message_size;
     uint64_t max_message_body_size;
+    uint64_t max_decompressed_body_size;
     uint64_t max_headers_size;
     uint16_t max_header_count;
     uint32_t max_concurrent_streams;
@@ -1526,6 +1573,43 @@ bool soyokaze_timeout_armed(double seconds);
 int64_t soyokaze_timeout_nanos(double seconds);
 soyokaze_buffer_t soyokaze_elapsed_message(double seconds);
 soyokaze_status_t soyokaze_elapsed_status(void);
+
+/* --- compression. The content codings a message body may be carried in. */
+
+/* The coding's token, as Content-Encoding spells it. Empty for
+ * SOYOKAZE_COMPRESSION_AUTO, which names no coding, and for a code that names
+ * none. Borrowed from the library. */
+soyokaze_slice_t soyokaze_compression_name(int32_t compression);
+/* The coding a token names, ignoring case. Never answers AUTO. */
+int32_t soyokaze_compression_parse(const uint8_t *token, size_t token_len); /* -1 when none */
+
+/* Every coding that names something, in the order one is preferred over the
+ * next, and that list written as an Accept-Encoding value. */
+size_t soyokaze_compression_count(void);
+int32_t soyokaze_compression_coding(size_t index); /* -1 past the end */
+soyokaze_slice_t soyokaze_compression_accepted_field(void);
+
+/* What a field section says about coding: the best coding its Accept-Encoding
+ * permits, the coding its Content-Encoding applied, and whether the body is
+ * coded at all -- which stays true for a coding this library does not decode. */
+int32_t soyokaze_compression_accepted(const soyokaze_headers_t *headers); /* -1 when none */
+int32_t soyokaze_compression_applied(const soyokaze_headers_t *headers); /* -1 when none */
+bool soyokaze_compression_encoded(const soyokaze_headers_t *headers);
+
+/* The quality one entry of a coding list carries; an entry with no q parameter
+ * is fully acceptable and reads as 1. -1 when the entry is unreadable. */
+float soyokaze_compression_quality(const uint8_t *entry, size_t entry_len);
+
+/* Codes octets, and undoes it. Encoding refuses SOYOKAZE_COMPRESSION_AUTO,
+ * which names no coding. Decoding produces at most `max` octets; passing it is
+ * SOYOKAZE_STATUS_LIMIT and produces nothing. Free `out` with
+ * soyokaze_buffer_free. */
+soyokaze_status_t soyokaze_compression_encode(int32_t compression,
+                                              const uint8_t *data, size_t data_len,
+                                              soyokaze_buffer_t *out, soyokaze_error_t **error);
+soyokaze_status_t soyokaze_compression_decode(int32_t compression,
+                                              const uint8_t *data, size_t data_len, uint64_t max,
+                                              soyokaze_buffer_t *out, soyokaze_error_t **error);
 
 /* --- base64. The standard alphabet, always padded, decoded strictly. */
 

@@ -357,7 +357,7 @@ fn wire_request(peer: &mut H3Session, stream_id: u64) -> Bytes {
 }
 
 /// One request and one response over an HTTP/3 session.
-fn h3_cycle(session: &mut H3Session, wire: &Bytes, stream_id: u64, response: &Message) {
+fn h3_cycle(session: &mut H3Session, wire: &Bytes, stream_id: u64, response: &mut Message) {
     let stream = StreamID(stream_id);
 
     session.on_stream_bytes(stream, wire, true).expect("the request did not parse");
@@ -393,7 +393,7 @@ fn http3_session() {
         let stream = StreamID(next);
         next += 4;
 
-        let encoded = server.encode_message(stream, black_box(&response)).expect("the response did not encode");
+        let encoded = server.encode_message(stream, black_box(&mut response)).expect("the response did not encode");
         server.forget(stream);
         encoded
     });
@@ -410,7 +410,7 @@ fn http3_session() {
         let mut next = 0u64;
         for _ in 0..*served {
             let wire = wire_request(&mut peer, next);
-            h3_cycle(&mut server, &wire, next, &response);
+            h3_cycle(&mut server, &wire, next, &mut response);
             next += 4;
         }
 
@@ -418,7 +418,7 @@ fn http3_session() {
         group.time(&format!("a cycle after {served} requests"), || {
             let stream_id = next;
             next += 4;
-            h3_cycle(&mut server, black_box(&wire), stream_id, &response);
+            h3_cycle(&mut server, black_box(&wire), stream_id, &mut response);
         });
     }
 

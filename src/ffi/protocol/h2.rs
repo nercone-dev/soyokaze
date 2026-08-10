@@ -25,6 +25,8 @@ pub struct H2Limits {
     pub max_message_size: u64,
     /// How large one message body may grow.
     pub max_message_body_size: u64,
+    /// How large one message body may grow once its content coding is undone.
+    pub max_decompressed_body_size: u64,
     /// How large the field section may grow.
     pub max_headers_size: u64,
     /// How many fields one section may hold.
@@ -61,6 +63,7 @@ impl H2Limits {
         Self {
             max_message_size: limits.max_message_size,
             max_message_body_size: limits.max_message_body_size,
+            max_decompressed_body_size: limits.max_decompressed_body_size,
             max_headers_size: limits.max_headers_size,
             max_header_count: limits.max_header_count,
             max_concurrent_streams: limits.max_concurrent_streams,

@@ -44,6 +44,7 @@ from .api.gate import Gate, Permit
 from .api.server import RawSocket, Server, ServerConfig, ServerHandle, ServerLimits
 from .errors import ClosedError, Error, InvalidError, IOError, LimitError, ProtocolError, Status, StreamError, TimeoutError, TLSError, VersionError
 from .finalizer import DateCache, RequestFinalizer, ResponseFinalizer
+from .helpers.compression import Compression
 from .cookies import Cookie, CookieJar, CookieLimits, SameSite, SetCookie, StoredCookie
 from .hsts import HSTSLimits, HSTSPolicy, HSTSStore
 from .models import ALPN, BodyKind, HeaderCase, Headers, Limits, Message, Method, Port, PortKind, Role, TransportKind, URL, Version

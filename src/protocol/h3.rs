@@ -37,6 +37,8 @@ pub struct H3Limits {
     pub max_message_size: u64,
     /// In bytes, the message body size allowed for reception.
     pub max_message_body_size: u64,
+    /// In bytes, the size a received body may reach once its content coding is undone.
+    pub max_decompressed_body_size: u64,
     /// In bytes, the whole header (or trailer) block.
     pub max_headers_size: u64,
     /// The number of header fields allowed in one block.
@@ -82,6 +84,7 @@ impl From<Limits> for H3Limits {
         Self {
             max_message_size: limits.max_message_size,
             max_message_body_size: limits.max_message_body_size,
+            max_decompressed_body_size: limits.max_decompressed_body_size,
             max_headers_size: limits.max_headers_size,
             max_header_count: limits.max_header_count,
             max_concurrent_streams: limits.max_concurrent_streams,
@@ -106,6 +109,7 @@ pub mod frames;
 
 pub use frames::{Code, Frame, FrameType, Settings, StreamKind};
 
+use crate::helpers::compression::Compression;
 use crate::helpers::fields::HeaderField;
 use crate::helpers::qpack::{self, Decoder, Encoder, EncoderInstruction};
 use crate::models::{Body, ConnectionID, Headers, Limits, Message, Method, Role, StreamID, Version};
@@ -126,6 +130,9 @@ pub struct StreamState {
     pub message: Option<Message>,
     /// The request method, kept so a tunnel can be recognised.
     pub method: Option<Method>,
+    /// The best coding the request said it would take, kept so the response
+    /// can be coded in something the peer reads.
+    pub accepted: Option<Compression>,
     /// A field block waiting on QPACK insertions that have not arrived.
     pub pending: Option<Bytes>,
     /// Whether the peer has finished sending on this stream.
@@ -163,6 +170,8 @@ pub struct H3Session {
     pub role: Role,
     /// The connection's identifier.
     pub id: ConnectionID,
+    /// The address the peer connected from, stamped on every request received.
+    pub client: Option<std::net::SocketAddr>,
     /// The limits this connection holds itself to.
     pub limits: H3Limits,
 
@@ -258,6 +267,7 @@ impl H3Session {
         Self {
             role,
             id,
+            client: None,
             limits,
             settings_local,
             settings_remote: None,
@@ -277,6 +287,15 @@ impl H3Session {
             block: Vec::new(),
             security: std::sync::Arc::new(std::sync::Mutex::new(Security::quic(None))),
         }
+    }
+
+    /// Attaches the address the peer connected from.
+    ///
+    /// QUIC knows it before the handshake runs, unlike [`H3Session::security`],
+    /// so it needs no shared cell: the paired [`H3Connection`] takes a copy.
+    pub fn with_client(mut self, client: Option<std::net::SocketAddr>) -> Self {
+        self.client = client;
+        self
     }
 
     /// The SETTINGS frame that must lead this end's control stream.
@@ -327,7 +346,7 @@ impl H3Session {
     /// # Errors
     ///
     /// As [`H3Session::frame_message`].
-    pub fn encode_message(&mut self, stream_id: StreamID, message: &Message) -> Result<(Bytes, bool), Error> {
+    pub fn encode_message(&mut self, stream_id: StreamID, message: &mut Message) -> Result<(Bytes, bool), Error> {
         let mut out = BytesMut::new();
         let fin = self.encode_message_into(stream_id, message, &mut out)?;
         Ok((out.freeze(), fin))
@@ -341,7 +360,7 @@ impl H3Session {
     /// # Errors
     ///
     /// As [`H3Session::frame_message`].
-    pub fn encode_message_into(&mut self, stream_id: StreamID, message: &Message, out: &mut BytesMut) -> Result<bool, Error> {
+    pub fn encode_message_into(&mut self, stream_id: StreamID, message: &mut Message, out: &mut BytesMut) -> Result<bool, Error> {
         let start = out.len();
 
         match self.frame_message(stream_id, message, out) {
@@ -393,8 +412,12 @@ impl H3Session {
     ///
     /// Returns [`Error::Protocol`] when the body is a [`Body::File`], which
     /// must be read before it reaches here, and otherwise as
-    /// [`common::Fields::of`].
-    pub fn frame_message(&mut self, stream_id: StreamID, message: &Message, out: &mut BytesMut) -> Result<bool, Error> {
+    /// [`Message::compress`] and [`common::Fields::of`].
+    pub fn frame_message(&mut self, stream_id: StreamID, message: &mut Message, out: &mut BytesMut) -> Result<bool, Error> {
+        let accepted = message.is_response().then(|| self.streams.get(&stream_id)?.accepted).flatten();
+        message.compress(accepted)?;
+
+        let message = &*message;
         self.write_block(stream_id, FrameType::Headers, out, |fields| common::Fields::write(message, fields))?;
 
         if let Some(body) = &message.body {
@@ -740,6 +763,7 @@ impl H3Session {
         }
 
         let id = self.id.clone();
+        let client = self.client;
         let state = self.streams.get_mut(&stream_id).ok_or(Error::Closed)?;
 
         if let Some(message) = state.message.as_mut() {
@@ -757,10 +781,12 @@ impl H3Session {
         let mut message = common::Fields::into_message(fields, Version::V3_0).map_err(|err| err.on_stream(stream_id, Code::MESSAGE_ERROR))?;
         message.stream_id = Some(stream_id);
         message.connection_id = Some(id);
+        message.client = client;
         Lock::on(&self.security).apply(&mut message);
 
         if message.is_request() {
             state.method = message.method;
+            state.accepted = message.accepted();
         }
 
         if message.tunneling(state.method) {
@@ -794,6 +820,11 @@ impl H3Session {
 ///
 /// The worker owns the QUIC connection, so everything that needs it goes
 /// through here.
+///
+/// A [`Message`] is much the largest of these. Boxing it would shrink the
+/// channel's slots at the cost of an allocation on every message sent, which
+/// is the wrong trade on the hottest path the connection has.
+#[allow(clippy::large_enum_variant)]
 pub enum H3Command {
     /// Frame and send a message.
     Send(Message),
@@ -812,6 +843,10 @@ pub enum H3Command {
 }
 
 /// What an [`H3Worker`] reports back to its [`H3Connection`].
+///
+/// A [`Message`] dwarfs an [`Error`] here, and is left unboxed for the reason
+/// [`H3Command`] gives: boxing would cost an allocation per message received.
+#[allow(clippy::large_enum_variant)]
 pub enum H3Event {
     /// A message has completed.
     Message(Message),
@@ -837,6 +872,12 @@ pub struct H3Connection {
     pub id: ConnectionID,
     /// Which end of the connection this is.
     pub role: Role,
+    /// The address the peer connected from, as the paired [`H3Session`] holds it.
+    ///
+    /// A copy rather than a shared cell, for the reason
+    /// [`H3Connection::settings_local`] gives: QUIC settles it before the
+    /// worker starts.
+    pub client: Option<std::net::SocketAddr>,
     /// The limits this connection holds itself to.
     pub limits: H3Limits,
     /// Keeps the QUIC connection alive for as long as this handle exists.
@@ -876,6 +917,7 @@ impl H3Connection {
             raw,
             id: session.id.clone(),
             role: session.role,
+            client: session.client,
             limits: session.limits,
             guard: None,
             settings_local: session.settings_local,
@@ -947,9 +989,7 @@ impl H3Connection {
         self.request_finalizer.finalize(self.role, &mut message);
         self.response_finalizer.finalize(self.role, Lock::on(&self.security).secure, &mut message);
 
-        if let Some(body) = message.body.take() {
-            message.body = Some(Body::Data(body.into_bytes().await?));
-        }
+        message.materialize().await?;
 
         self.commands.send(H3Command::Send(message)).await.map_err(|_| Error::Closed)
     }
@@ -965,7 +1005,10 @@ impl H3Connection {
     /// worker is gone.
     pub async fn receive_message(&mut self) -> Result<Message, Error> {
         match self.events.recv().await {
-            Some(H3Event::Message(message)) => Ok(message),
+            Some(H3Event::Message(mut message)) => {
+                message.decompress(self.limits.max_decompressed_body_size)?;
+                Ok(message)
+            }
             Some(H3Event::Failed(error)) => Err(error),
             None => Err(Error::Closed),
         }
@@ -1214,6 +1257,10 @@ impl Connection for H3Connection {
 
     fn security(&self) -> Security {
         *Lock::on(&self.security)
+    }
+
+    fn client(&self) -> Option<std::net::SocketAddr> {
+        self.client
     }
 
     async fn send(&mut self, message: Message) -> Result<(), Error> {
@@ -1520,12 +1567,13 @@ impl H3Worker {
     pub fn execute(&mut self, transport: &mut impl QUICTransport, command: H3Command) -> Result<(), Error> {
         match command {
             H3Command::Send(message) => {
+                let mut message = message;
                 let stream_id = message.stream_id.unwrap_or_else(|| self.session.open());
                 self.session.streams.entry(stream_id).or_default().responded = true;
 
                 let entry = self.outbound.entry(stream_id.0).or_default();
                 let before = entry.0.len();
-                let fin = self.session.encode_message_into(stream_id, &message, &mut entry.0)?;
+                let fin = self.session.encode_message_into(stream_id, &mut message, &mut entry.0)?;
                 entry.1 |= fin;
 
                 let framed = entry.0.len().saturating_sub(before) as u64;

@@ -26,7 +26,9 @@ use soyokaze::ffi::models::{
     soyokaze_message_insert_header, soyokaze_message_is_request, soyokaze_message_is_response, soyokaze_message_method,
     soyokaze_message_remove_header, soyokaze_message_request, soyokaze_message_response, soyokaze_message_set_body_data,
     soyokaze_message_set_body_file, soyokaze_message_set_body_text, soyokaze_message_status_code, soyokaze_message_target,
-    soyokaze_message_version, soyokaze_url_authority, soyokaze_url_free, soyokaze_url_host, soyokaze_url_parse,
+    soyokaze_message_accepted, soyokaze_message_client, soyokaze_message_compress, soyokaze_message_compressed,
+    soyokaze_message_compression, soyokaze_message_body_inline, soyokaze_message_decompress,
+    soyokaze_message_set_compression, soyokaze_message_version, soyokaze_url_authority, soyokaze_url_free, soyokaze_url_host, soyokaze_url_parse,
     soyokaze_url_port, soyokaze_url_scheme, soyokaze_url_secure, soyokaze_url_target, Port, PortKind,
 };
 use soyokaze::ffi::api::server::{
@@ -38,6 +40,11 @@ use soyokaze::ffi::tls::{soyokaze_tls_config_default, TLSConfig};
 use soyokaze::ffi::{
     soyokaze_buffer_free, soyokaze_runtime_free, soyokaze_runtime_new, soyokaze_version, Buffer, Runtime, Slice,
 };
+use soyokaze::ffi::helpers::compression::{
+    soyokaze_compression_accepted_field, soyokaze_compression_coding, soyokaze_compression_count,
+    soyokaze_compression_decode, soyokaze_compression_encode, soyokaze_compression_name, soyokaze_compression_parse,
+};
+use soyokaze::helpers::compression::Compression;
 use soyokaze::models::{Message, Method, Version};
 
 /// The pointer and length a call takes text as.
@@ -1340,4 +1347,134 @@ fn a_connection_exposes_the_raw_exchange() {
     unsafe { soyokaze_server_handle_close(runtime, handle, 5.0) };
     unsafe { soyokaze_server_free(server) };
     unsafe { soyokaze_runtime_free(runtime) };
+}
+
+/// The codings cross as their own codes, and `-1` stands for "no coding"
+/// wherever one may be absent — the same sentinel every other enum uses.
+#[test]
+fn a_coding_crosses_as_its_code_and_its_token() {
+    assert_eq!(soyokaze_compression_count(), Compression::CODINGS.len());
+
+    for index in 0..soyokaze_compression_count() {
+        let code = soyokaze_compression_coding(index);
+        let token = read(soyokaze_compression_name(code)).expect("a coding always names itself");
+
+        assert_eq!(code, Compression::CODINGS[index] as i32, "the codings must cross in preference order");
+        assert_eq!(token, Compression::CODINGS[index].as_str().as_bytes());
+
+        let (data, len) = text(Compression::CODINGS[index].as_str());
+        assert_eq!(unsafe { soyokaze_compression_parse(data, len) }, code);
+    }
+
+    assert_eq!(soyokaze_compression_coding(Compression::CODINGS.len()), -1, "past the end names nothing");
+    assert_eq!(read(soyokaze_compression_name(Compression::Auto as i32)), Some(&b""[..]), "Auto names nothing on the wire");
+
+    let (data, len) = text("nonsense");
+    assert_eq!(unsafe { soyokaze_compression_parse(data, len) }, -1);
+    assert_eq!(unsafe { soyokaze_compression_parse(ptr::null(), 0) }, -1, "a null token names nothing");
+
+    let advertised = read(soyokaze_compression_accepted_field()).expect("the advertised field is never absent");
+    assert_eq!(advertised, Compression::ACCEPTED.as_bytes());
+}
+
+#[test]
+fn compression_encodes_and_decodes_across_the_boundary() {
+    let body = vec![b'a'; 4096];
+    let mut coded = Buffer::EMPTY;
+
+    let status = unsafe { soyokaze_compression_encode(Compression::Zstd as i32, body.as_ptr(), body.len(), &mut coded, ptr::null_mut()) };
+    assert_eq!(status, Status::Ok);
+    assert!(coded.len > 0 && coded.len < body.len());
+
+    let mut plain = Buffer::EMPTY;
+    let held = unsafe { std::slice::from_raw_parts(coded.data, coded.len) }.to_vec();
+
+    let status = unsafe { soyokaze_compression_decode(Compression::Zstd as i32, held.as_ptr(), held.len(), 1 << 20, &mut plain, ptr::null_mut()) };
+    assert_eq!(status, Status::Ok);
+    assert_eq!(take(plain), body);
+
+    take(coded);
+}
+
+#[test]
+fn compression_reports_the_ceiling_and_the_unsettled_coding_as_failures() {
+    let body = vec![0u8; 1024 * 1024];
+    let mut coded = Buffer::EMPTY;
+
+    unsafe { soyokaze_compression_encode(Compression::Gzip as i32, body.as_ptr(), body.len(), &mut coded, ptr::null_mut()) };
+    let held = unsafe { std::slice::from_raw_parts(coded.data, coded.len) }.to_vec();
+    take(coded);
+
+    let mut error: *mut ErrorHandle = ptr::null_mut();
+    let status = unsafe { soyokaze_compression_decode(Compression::Gzip as i32, held.as_ptr(), held.len(), 1024, ptr::null_mut(), &mut error) };
+
+    assert_eq!(status, Status::Limit, "a body past the ceiling is a limit failure");
+    assert!(!error.is_null(), "a failure writes a handle when one is asked for");
+    unsafe { soyokaze_error_free(error) };
+
+    let status = unsafe { soyokaze_compression_encode(Compression::Auto as i32, body.as_ptr(), body.len(), ptr::null_mut(), ptr::null_mut()) };
+    assert_eq!(status, Status::Protocol, "Auto names no coding to code in");
+
+    let status = unsafe { soyokaze_compression_encode(99, body.as_ptr(), body.len(), ptr::null_mut(), ptr::null_mut()) };
+    assert_eq!(status, Status::Invalid, "a code that names no coding is refused");
+}
+
+#[test]
+fn a_message_carries_its_coding_and_the_address_it_came_from() {
+    let message = soyokaze_message_response(200, Version::V1_1);
+
+    let client = unsafe { soyokaze_message_client(message) };
+    assert!(client.data.is_null(), "a message the caller built has no access source");
+    unsafe { soyokaze_buffer_free(client) };
+
+    assert_eq!(unsafe { soyokaze_message_compression(message) }, -1);
+    assert!(!unsafe { soyokaze_message_compressed(message) });
+    assert_eq!(unsafe { soyokaze_message_accepted(message) }, -1);
+
+    assert!(unsafe { soyokaze_message_set_compression(message, Compression::Brotli as i32) });
+    assert_eq!(unsafe { soyokaze_message_compression(message) }, Compression::Brotli as i32);
+
+    assert!(!unsafe { soyokaze_message_set_compression(message, 99) }, "a code that names no coding is refused");
+    assert_eq!(unsafe { soyokaze_message_compression(message) }, Compression::Brotli as i32, "a refused code changes nothing");
+
+    assert!(unsafe { soyokaze_message_set_compression(message, -1) }, "-1 clears the coding");
+    assert_eq!(unsafe { soyokaze_message_compression(message) }, -1);
+
+    let (name, name_len) = text("accept-encoding");
+    let (value, value_len) = text("gzip");
+    unsafe { soyokaze_message_append_header(message, name, name_len, value, value_len) };
+    assert_eq!(unsafe { soyokaze_message_accepted(message) }, Compression::Gzip as i32);
+
+    unsafe { soyokaze_message_free(message) };
+}
+
+#[test]
+fn a_message_codes_and_uncodes_its_own_body() {
+    let message = soyokaze_message_response(200, Version::V1_1);
+    let body = vec![b'a'; 4096];
+
+    unsafe { soyokaze_message_set_body_data(message, body.as_ptr(), body.len()) };
+    assert!(unsafe { soyokaze_message_set_compression(message, Compression::Gzip as i32) });
+
+    assert_eq!(unsafe { soyokaze_message_compress(message, -1, ptr::null_mut()) }, Status::Ok);
+    assert!(unsafe { soyokaze_message_compressed(message) });
+    assert!(unsafe { soyokaze_message_body_len(message) } < body.len() as i64);
+
+    let mut error: *mut ErrorHandle = ptr::null_mut();
+    assert_eq!(unsafe { soyokaze_message_decompress(message, 16, &mut error) }, Status::Limit, "the ceiling holds across the boundary");
+    assert!(!error.is_null());
+    unsafe { soyokaze_error_free(error) };
+
+    assert_eq!(unsafe { soyokaze_message_decompress(message, 1 << 20, ptr::null_mut()) }, Status::Ok);
+    assert!(!unsafe { soyokaze_message_compressed(message) });
+    assert_eq!(read(unsafe { soyokaze_message_body_inline(message) }), Some(&body[..]));
+
+    unsafe { soyokaze_message_free(message) };
+}
+
+/// The wire ceiling counts what arrived; the decoded one counts what it becomes.
+#[test]
+fn the_default_limits_bound_a_decoded_body_separately() {
+    let limits = soyokaze_limits_default();
+    assert!(limits.max_decompressed_body_size > limits.max_message_body_size);
 }

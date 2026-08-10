@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use crate::helpers::compression;
 use crate::models::StreamID;
 
 /// What went wrong.
@@ -95,5 +96,16 @@ impl From<std::io::Error> for Error {
 impl From<crate::helpers::sync::Elapsed> for Error {
     fn from(elapsed: crate::helpers::sync::Elapsed) -> Self {
         Self::Timeout(elapsed.to_string())
+    }
+}
+
+impl From<compression::Error> for Error {
+    fn from(err: compression::Error) -> Self {
+        let reason = err.to_string();
+
+        match err {
+            compression::Error::TooLarge(_) => Self::Limit(reason),
+            compression::Error::Settled | compression::Error::Coding(_) => Self::Protocol(reason),
+        }
     }
 }

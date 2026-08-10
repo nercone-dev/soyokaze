@@ -102,9 +102,26 @@ pub enum Incoming {
         transport: Box<dyn Transport>,
         /// The peer's address, or `unix` for a Unix socket.
         id: ConnectionID,
+        /// The address the peer connected from, when it has one.
+        client: Option<std::net::SocketAddr>,
     },
     /// A QUIC connection.
     QUIC(QUICIncoming),
+}
+
+impl Incoming {
+    /// The address the peer connected from, when it has one.
+    ///
+    /// A Unix socket has none: the address of an accepted Unix socket names
+    /// nothing. This is what [`Message::client`] is stamped from.
+    ///
+    /// [`Message::client`]: crate::models::Message::client
+    pub fn client(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            Self::Stream { client, .. } => *client,
+            Self::QUIC(incoming) => Some(incoming.peer_addr()),
+        }
+    }
 }
 
 /// Everything needed to turn an [`Incoming`] into a connection.
@@ -137,8 +154,8 @@ impl Negotiation {
     /// when it fails, and [`Error::Version`] when nothing usable is agreed.
     pub async fn accept(&self, incoming: Incoming) -> Result<AnyConnection, Error> {
         match incoming {
-            Incoming::Stream { transport, id } => {
-                let assembling = std::pin::pin!(self.assemble(transport, id));
+            Incoming::Stream { transport, id, client } => {
+                let assembling = std::pin::pin!(self.assemble(transport, id, client));
                 sync::Timeout::within(self.limits.read_timeout, assembling).await?
             }
 
@@ -165,7 +182,8 @@ impl Negotiation {
     /// Returns [`Error::Version`] when the port offers nothing, or offers a
     /// version that does not run over QUIC.
     pub fn assemble_quic(&self, incoming: QUICIncoming) -> Result<AnyConnection, Error> {
-        let id = ConnectionID(Bytes::from(incoming.peer_addr().to_string()));
+        let client = incoming.peer_addr();
+        let id = ConnectionID(Bytes::from(client.to_string()));
 
         let Some(version) = self.versions.first().copied() else {
             return Err(Error::Version("this port offers no version".into()));
@@ -173,7 +191,7 @@ impl Negotiation {
 
         match version {
             Version::V3_0 => {
-                let session = H3Session::new(Role::Origin, id, self.limits);
+                let session = H3Session::new(Role::Origin, id, self.limits).with_client(Some(client));
                 let (connection, worker) = H3Connection::pair(session);
                 let connection = connection.with_response_finalizer(self.response_finalizer);
 
@@ -197,9 +215,9 @@ impl Negotiation {
     /// Returns [`Error::TLS`] when the handshake fails and [`Error::Version`]
     /// when nothing usable is negotiated, or when what was negotiated cannot
     /// run over a stream transport.
-    pub async fn assemble(&self, transport: Box<dyn Transport>, id: ConnectionID) -> Result<AnyConnection, Error> {
+    pub async fn assemble(&self, transport: Box<dyn Transport>, id: ConnectionID, client: Option<std::net::SocketAddr>) -> Result<AnyConnection, Error> {
         let Some(acceptor) = &self.acceptor else {
-            return self.assemble_plain(transport, id).await;
+            return self.assemble_plain(transport, id, client).await;
         };
 
         let stream = tokio_boring::accept(acceptor, transport).await.map_err(|err| Error::TLS(err.to_string()))?;
@@ -209,11 +227,11 @@ impl Negotiation {
         let transport = Box::new(stream) as Box<dyn Transport>;
         match version {
             Version::V1_0 | Version::V1_1 => {
-                let connection = H1Connection::new(transport, Role::Origin, id, self.limits).with_version(version).with_response_finalizer(self.response_finalizer).with_security(security);
+                let connection = H1Connection::new(transport, Role::Origin, id, self.limits).with_version(version).with_response_finalizer(self.response_finalizer).with_security(security).with_client(client);
                 Ok(AnyConnection::H1(connection))
             }
             Version::V2_0 => {
-                let connection = H2Connection::new(transport, Role::Origin, id, self.limits).with_response_finalizer(self.response_finalizer).with_security(security);
+                let connection = H2Connection::new(transport, Role::Origin, id, self.limits).with_response_finalizer(self.response_finalizer).with_security(security).with_client(client);
                 Ok(AnyConnection::H2(connection))
             }
             Version::V3_0 => Err(Error::Version("HTTP/3 needs a QUIC port".into())),
@@ -236,7 +254,7 @@ impl Negotiation {
     ///
     /// As [`Buffer::fill`], and [`Error::Version`] when the port offers no
     /// version the sniffed octets match.
-    pub async fn assemble_plain(&self, mut transport: Box<dyn Transport>, id: ConnectionID) -> Result<AnyConnection, Error> {
+    pub async fn assemble_plain(&self, mut transport: Box<dyn Transport>, id: ConnectionID, client: Option<std::net::SocketAddr>) -> Result<AnyConnection, Error> {
         let mut buffer = Buffer::with_chunk_size(self.limits.read_chunk_size as usize);
 
         let probe = h2::PREFACE.len().min(4);
@@ -248,13 +266,13 @@ impl Negotiation {
             && buffer.as_slice()[..sniffed] == h2::PREFACE[..sniffed];
 
         if h2 {
-            return Ok(AnyConnection::H2(H2Connection::resume(transport, Role::Origin, id, self.limits, buffer)));
+            return Ok(AnyConnection::H2(H2Connection::resume(transport, Role::Origin, id, self.limits, buffer).with_client(client)));
         }
 
         let Some(version) = self.versions.iter().copied().find(|version| version.major() == 1) else {
             return Err(Error::Version("the peer sent no HTTP/2 preface and this port offers no HTTP/1.x".into()));
         };
 
-        Ok(AnyConnection::H1(H1Connection::resume(transport, Role::Origin, id, self.limits, buffer).with_version(version)))
+        Ok(AnyConnection::H1(H1Connection::resume(transport, Role::Origin, id, self.limits, buffer).with_version(version).with_client(client)))
     }
 }

@@ -135,9 +135,10 @@ pub mod helpers {
     //! The codecs and utilities the protocol implementations share.
     //!
     //! [`huffman`], [`hpack`] and [`qpack`] are the field compression formats,
-    //! over the shared vocabulary in [`fields`]; [`base64`] and [`sha1`] are
-    //! what the WebSocket handshake needs; and [`text`], [`scan`] and [`sync`]
-    //! are small pieces the parsers lean on.
+    //! over the shared vocabulary in [`fields`]; [`compression`] is the other
+    //! kind, the content codings a body is carried in; [`base64`] and [`sha1`]
+    //! are what the WebSocket handshake needs; and [`text`], [`scan`] and
+    //! [`sync`] are small pieces the parsers lean on.
 
     pub mod base64;
     pub mod scan;
@@ -148,6 +149,7 @@ pub mod helpers {
     pub mod fields;
     pub mod hpack;
     pub mod qpack;
+    pub mod compression;
 }
 
 pub use errors::Error;
@@ -161,5 +163,6 @@ pub use api::gate::{Gate, Permit};
 pub use api::cluster::Cluster;
 pub use tls::{ECHConfig, ECHConfigList, ECHKeys, ECHStatus, Format, Identity, Security, TLSCipher, TLSGroup, TLSVersion};
 pub use hsts::{HSTSLimits, HSTSPolicy, HSTSStore};
+pub use helpers::compression::Compression;
 pub use helpers::text::Text;
 pub use websocket::{WebSocketConnection, WebSocketLimits};

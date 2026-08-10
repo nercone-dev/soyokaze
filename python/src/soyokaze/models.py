@@ -14,6 +14,7 @@ import pathlib
 from . import ffi
 from .errors import Error, InvalidError
 from .ffi import library
+from .helpers.compression import Compression
 from .responses import ResponseMixin
 from .runtime import Runtime, offload
 
@@ -621,6 +622,77 @@ class Message(ResponseMixin):
     def connection_id(self, connection_id):
         encoded = None if connection_id is None else ffi.Library.encoded(connection_id)
         library.soyokaze_message_set_connection_id(self.handle, encoded, 0 if encoded is None else len(encoded))
+
+    @property
+    def client(self):
+        """The address the request was received from, and its port, as text.
+
+        ``None`` on a response, on a message you built, and over a Unix socket,
+        whose accepted address names nothing.
+        """
+        client = library.soyokaze_message_client(self.handle).take()
+        return None if not client else client.decode()
+
+    @property
+    def compression(self):
+        """The content coding the body is to go out in, or ``None``.
+
+        Set it before sending to have the body coded on the way out; on a
+        message that was received it reads as the coding the connection took
+        off the body. This is ``Content-Encoding`` and nothing else:
+        ``Transfer-Encoding`` frames a body rather than codes it.
+        """
+        coding = library.soyokaze_message_compression(self.handle)
+        return None if coding < 0 else Compression(coding)
+
+    @compression.setter
+    def compression(self, compression):
+        library.soyokaze_message_set_compression(self.handle, -1 if compression is None else int(compression))
+
+    def compressed(self):
+        """Whether the body is currently carried compressed.
+
+        Judged from ``Content-Encoding`` alone. A body the library decoded has
+        had the field taken off it, so a message that still carries one is
+        still coded — including in a coding the library does not implement.
+        """
+        return library.soyokaze_message_compressed(self.handle)
+
+    def accepted(self):
+        """The best coding this message's ``Accept-Encoding`` permits."""
+        coding = library.soyokaze_message_accepted(self.handle)
+        return None if coding < 0 else Compression(coding)
+
+    async def materialize(self, runtime=None):
+        """Reads a body that is still a file into memory, so it can be coded.
+
+        Every other body is left alone and nothing is read.
+        """
+        runtime = runtime if runtime is not None else Runtime.default()
+        error = Error.out()
+        status = await offload(library.soyokaze_message_materialize, self.handle, runtime.handle, ctypes.byref(error))
+        Error.raise_for(status, error)
+
+    def compress(self, accepted=None):
+        """Codes the body in :attr:`compression`.
+
+        ``accepted`` is the coding the exchange permits, which is what
+        :attr:`Compression.AUTO` settles on; ``None`` permits none, so an
+        automatic coding sends the body as it stands. The body must already be
+        in memory — see :meth:`materialize`.
+        """
+        error = Error.out()
+        status = library.soyokaze_message_compress(self.handle, -1 if accepted is None else int(accepted), ctypes.byref(error))
+        Error.raise_for(status, error)
+
+    def decompress(self, max):
+        """Decodes a body that arrived coded, taking ``Content-Encoding`` off it.
+
+        Raises :class:`LimitError` once the decoded body would pass ``max``.
+        """
+        error = Error.out()
+        status = library.soyokaze_message_decompress(self.handle, max, ctypes.byref(error))
+        Error.raise_for(status, error)
 
     @property
     def early_data(self):

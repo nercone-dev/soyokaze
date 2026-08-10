@@ -15,8 +15,9 @@ use std::cell::Cell;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::hsts::HSTSPolicy;
+use crate::helpers::compression::Compression;
 use crate::helpers::text::Text;
-use crate::models::{Headers, Message, Role};
+use crate::models::{Headers, Message, Method, Role};
 
 /// Weekday names as an HTTP date spells them, indexed from Sunday.
 pub const DAY_NAMES: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -213,21 +214,37 @@ impl Message {
 
     /// Fills in the fields a client owes on a request.
     ///
-    /// Adds `Host` when the caller left it out. Nothing here is version
-    /// specific: HTTP/1.x puts the authority in `Host` and sends it as it
-    /// stands, and HTTP/2 and HTTP/3 frame the same field as `:authority`,
-    /// which is what [`Fields::of`] does with it. Responses are left alone.
+    /// Adds `Host` when the caller left it out and there is an `authority` to
+    /// add — a connection built over a transport the caller already had knows
+    /// none. Nothing here is version specific: HTTP/1.x puts the authority in
+    /// `Host` and sends it as it stands, and HTTP/2 and HTTP/3 frame the same
+    /// field as `:authority`, which is what [`Fields::of`] does with it.
+    ///
+    /// Adds `Accept-Encoding` too, naming every coding this crate decodes, so
+    /// that a response may come back compressed and be handed to the caller
+    /// decoded. It is added whether or not an authority is known, since it
+    /// concerns the response rather than where the request is going, and it is
+    /// left off a `CONNECT`, which carries no content either way.
+    ///
+    /// Responses are left alone.
     ///
     /// [`Fields::of`]: crate::protocol::common::Fields::of
-    pub fn finalize_request(&mut self, authority: &str) {
+    pub fn finalize_request(&mut self, authority: Option<&str>) {
         if !self.is_request() {
             return;
         }
 
+        let tunneling = self.method == Some(Method::CONNECT);
         let headers = self.headers.get_or_insert_with(Headers::new);
 
-        if !headers.contains("host") {
+        if let Some(authority) = authority
+            && !headers.contains("host")
+        {
             headers.append_lowercase("host", authority);
+        }
+
+        if !tunneling && !headers.contains("accept-encoding") {
+            headers.append_lowercase("accept-encoding", Compression::ACCEPTED);
         }
     }
 }
@@ -256,13 +273,12 @@ impl RequestFinalizer {
     /// Finalises a request about to leave a client connection.
     ///
     /// Does nothing on a server, or to a response: only a client owes the
-    /// request its authority, and only a request carries one.
+    /// request the fields [`Message::finalize_request`] fills in, and only a
+    /// request carries them. A connection that knows no authority still runs,
+    /// because only the `Host` half of that depends on one.
     pub fn finalize(&self, role: Role, message: &mut Message) {
-        if let Some(authority) = &self.authority
-            && role.is_client()
-            && message.is_request()
-        {
-            message.finalize_request(authority);
+        if role.is_client() && message.is_request() {
+            message.finalize_request(self.authority.as_deref());
         }
     }
 }

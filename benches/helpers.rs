@@ -17,9 +17,10 @@ use soyokaze::helpers::fields::{Integer, StringLiteral};
 use soyokaze::helpers::hpack::{Decoder as HpackDecoder, Encoder as HpackEncoder};
 use soyokaze::helpers::qpack::{self, Decoder as QpackDecoder, DecoderInstruction, Encoder as QpackEncoder, EncoderInstruction};
 use soyokaze::helpers::text::{Text, INLINE};
+use soyokaze::helpers::compression::Compression;
 use soyokaze::helpers::{base64, huffman, scan, sha1};
 
-use support::{Fixtures, Group, Section};
+use support::{Fixtures, Group, Payload, Section};
 
 fn huffman_coding() {
     let mut group = Group::new("huffman::encode");
@@ -46,6 +47,39 @@ fn huffman_coding() {
     let mut group = Group::new("huffman::decode (refused)");
     group.time("all one-bits (64 B)", || huffman::decode(black_box(&[0xffu8; 64])));
     group.time("padding longer than seven bits", || huffman::decode(black_box(&[0x3f, 0xff, 0xff, 0xff])));
+}
+
+/// The content codings, over a body that compresses like text and one that
+/// does not, so that both the work and the ratio are visible.
+///
+/// The ceiling is set past every fixture, so what is measured is the codec
+/// rather than the bound.
+fn content_codings() {
+    const ROOMY: u64 = 1 << 24;
+
+    let bodies: &[(&str, Vec<u8>)] = &[
+        ("compressible (64 KiB)", vec![b'a'; 64 * 1024]),
+        ("mixed (64 KiB)", Payload::of(64 * 1024).to_vec()),
+        ("compressible (1 MiB)", vec![b'a'; 1 << 20]),
+    ];
+
+    for coding in Compression::CODINGS {
+        let mut group = Group::new(format!("compression::encode ({coding})"));
+        for (name, body) in bodies {
+            group.throughput(name, body.len(), || coding.encode(black_box(body)));
+        }
+
+        let mut group = Group::new(format!("compression::decode ({coding})"));
+        for (name, body) in bodies {
+            let encoded = coding.encode(body).expect("the fixture did not encode");
+            group.throughput(name, body.len(), || coding.decode(black_box(&encoded), ROOMY));
+        }
+    }
+
+    let mut group = Group::new("compression negotiation");
+    group.time("accepted (four codings)", || Compression::accepted(black_box(["zstd;q=0.1, br, gzip, deflate"]).into_iter()));
+    group.time("applied (one coding)", || Compression::applied(black_box(["gzip"]).into_iter()));
+    group.time("parse a token", || Compression::parse(black_box("deflate")));
 }
 
 fn field_primitives() {
@@ -257,6 +291,7 @@ fn scanning() {
 
 fn main() {
     huffman_coding();
+    content_codings();
     field_primitives();
     hpack();
     qpack();

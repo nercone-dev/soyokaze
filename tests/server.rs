@@ -152,7 +152,7 @@ async fn sniff(versions: Vec<soyokaze::Version>, first: &[u8]) -> Result<AnyConn
     peer.write_all(first).await.expect("the peer could not write");
 
     let id = soyokaze::ConnectionID(Bytes::from_static(b"test"));
-    negotiation.assemble_plain(Box::new(port), id).await
+    negotiation.assemble_plain(Box::new(port), id, None).await
 }
 
 #[tokio::test]
@@ -331,4 +331,106 @@ async fn a_client_supplies_the_authority_it_dialled_on_every_version() {
             );
         }
     }
+}
+
+/// Answers every request with what the connection was told about its peer, and
+/// codes the answer as the request asked.
+#[derive(Clone)]
+struct Reflector;
+
+impl Handler for Reflector {
+    async fn on_connection(&self, connection: AnyConnection) {
+        let mut connection = connection;
+
+        while let Ok(request) = connection.receive().await {
+            let seen = request.client.map_or_else(|| "none".to_owned(), |client| client.to_string());
+
+            let mut response = Message::response(200, connection.version());
+            response.stream_id = request.stream_id;
+            response.body = Some(Body::Data(Bytes::from(format!("{seen}|{}", "x".repeat(4096)))));
+            response.compression = Some(soyokaze::Compression::Auto);
+
+            if connection.send(response).await.is_err() || !connection.reusable() {
+                break;
+            }
+        }
+
+        connection.close().await;
+    }
+}
+
+/// A handler must be able to see where a request came from, and it must be the
+/// address the peer actually dialled from rather than anything reconstructed.
+#[test]
+fn a_served_request_carries_the_address_it_came_from() {
+    let server = Server::new(ServerConfig::default());
+    let cluster = server.run(Reflector, &[Port::TCP(0)], 1).expect("the TCP port did not open");
+    let port = cluster.address().expect("the cluster has no address").port();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("no runtime");
+
+    runtime.block_on(async move {
+        let address = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+        let mut stream = tokio::net::TcpStream::connect(address).await.expect("the worker refused a connection");
+        let dialled = stream.local_addr().expect("the socket has no local address");
+
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("the request did not go out");
+
+        let mut response = Vec::new();
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_to_end(&mut response));
+        read.await.expect("the worker never answered").expect("the response did not come back");
+
+        let split = response.windows(4).position(|window| window == b"\r\n\r\n").expect("the response carried no field section");
+        let head = String::from_utf8_lossy(&response[..split]).into_owned();
+        let body = &response[split + 4..];
+
+        assert!(head.contains("Content-Encoding: gzip"), "a request that accepts gzip must be answered in it: {head}");
+        assert!(head.contains("Vary: Accept-Encoding"), "a response coded from Accept-Encoding must vary on it: {head}");
+        assert!(body.len() < 4096, "{} octets crossed the wire, which is the identity body", body.len());
+
+        let decoded = soyokaze::Compression::Gzip.decode(body, 1 << 20).expect("the body did not decode");
+        let seen = String::from_utf8_lossy(&decoded).into_owned();
+        let seen = seen.split('|').next().unwrap_or_default().to_owned();
+
+        assert_eq!(seen, dialled.to_string(), "the handler saw {seen:?} rather than the address the peer dialled from");
+    });
+}
+
+/// The address of an accepted Unix socket names nothing, so there is nothing to
+/// report and nothing for the gate to limit by.
+#[test]
+fn a_unix_socket_connection_reports_no_client_address() {
+    let path = std::env::temp_dir().join(format!("soyokaze-client-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let server = Server::new(ServerConfig::default());
+    let cluster = server
+        .run(Reflector, &[Port::UDS(path.to_string_lossy().into_owned())], 1)
+        .expect("the unix socket did not open");
+
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("no runtime");
+
+    runtime.block_on(async {
+        let mut stream = tokio::net::UnixStream::connect(&path).await.expect("the worker refused a connection");
+
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("the request did not go out");
+
+        let mut response = Vec::new();
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_to_end(&mut response));
+        read.await.expect("the worker never answered").expect("the response did not come back");
+
+        let text = String::from_utf8_lossy(&response).into_owned();
+        let (_, body) = text.split_once("\r\n\r\n").expect("the response carried no field section");
+
+        assert!(body.starts_with("none|"), "a unix socket connection must report no address: {body:.32?}");
+    });
+
+    drop(cluster);
+    let _ = std::fs::remove_file(&path);
 }

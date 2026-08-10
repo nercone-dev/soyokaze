@@ -26,6 +26,8 @@ pub struct H1Limits {
     pub max_message_size: u64,
     /// How large one message body may grow.
     pub max_message_body_size: u64,
+    /// How large one message body may grow once its content coding is undone.
+    pub max_decompressed_body_size: u64,
     /// How long the start line may be.
     pub max_startline_size: u32,
     /// How large the field section may grow.
@@ -58,6 +60,7 @@ impl H1Limits {
         Self {
             max_message_size: limits.max_message_size,
             max_message_body_size: limits.max_message_body_size,
+            max_decompressed_body_size: limits.max_decompressed_body_size,
             max_startline_size: limits.max_startline_size,
             max_headers_size: limits.max_headers_size,
             max_header_count: limits.max_header_count,

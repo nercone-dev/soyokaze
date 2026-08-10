@@ -3,6 +3,7 @@ use std::str::FromStr;
 use bytes::Bytes;
 
 use soyokaze::models::{Body, HeaderCase, Headers, Message, Method, Port, Role, URL, Version};
+use soyokaze::helpers::compression::Compression;
 use soyokaze::{Error, SetCookie};
 
 #[test]
@@ -357,4 +358,211 @@ fn an_authority_is_written_the_same_way_from_parts_as_from_a_url() {
             .expect("the URL did not parse");
         assert_eq!(url.authority(), expected, "a parsed URL and its parts must agree on the authority");
     }
+}
+
+/// A message the caller has not sent or received carries nothing about a
+/// connection: RFC 9110 gives none of these fields a wire form, and the crate
+/// stamps them only where they are actually known.
+#[test]
+fn a_message_the_caller_built_has_crossed_nothing() {
+    let message = Message::request(Method::GET, "/", Version::V1_1);
+
+    assert_eq!(message.client, None, "a message the caller built has no access source");
+    assert_eq!(message.compression, None, "a message the caller built is coded in nothing");
+    assert!(!message.compressed(), "a message with no Content-Encoding is not compressed");
+    assert_eq!(message.accepted(), None, "a message with no Accept-Encoding permits nothing");
+}
+
+/// RFC 9110 §8.4: `Content-Encoding` is what says a representation is coded.
+#[test]
+fn compressed_is_judged_from_content_encoding_alone() {
+    let mut message = Message::response(200, Version::V1_1);
+    message.body = Some(Body::Data(Bytes::from_static(b"not really gzip")));
+    message.compression = Some(Compression::Gzip);
+
+    assert!(!message.compressed(), "the field, not the intent, says whether a body is coded");
+
+    message.headers.get_or_insert_with(Headers::new).append("content-encoding", "gzip");
+    assert!(message.compressed());
+}
+
+#[test]
+fn compressing_sets_the_field_and_corrects_the_length() {
+    let body = vec![b'a'; 4096];
+
+    for coding in Compression::CODINGS {
+        let mut message = Message::response(200, Version::V1_1);
+        message.body = Some(Body::Data(Bytes::from(body.clone())));
+        message.compression = Some(*coding);
+        message.headers.get_or_insert_with(Headers::new).append("content-length", body.len().to_string());
+
+        message.compress(None).expect("an explicit coding did not apply");
+
+        let headers = message.headers.as_ref().expect("the message lost its fields");
+        assert_eq!(headers.get("content-encoding"), Some(coding.as_str()), "{coding} must name itself");
+        assert_eq!(message.compression, Some(*coding));
+
+        let encoded = message.body.as_ref().and_then(Body::inline).expect("the body went missing");
+        assert_eq!(headers.get("content-length"), Some(encoded.len().to_string().as_str()), "Content-Length must count the coded octets");
+        assert_eq!(coding.decode(&encoded, 1 << 20).as_deref(), Ok(&body[..]), "{coding} did not encode the body it was given");
+    }
+}
+
+/// RFC 9110 §8.4.1: a body already carrying a coding is not coded again — the
+/// field would have to list both, and this crate never writes such a body.
+#[test]
+fn an_already_encoded_body_is_never_encoded_twice() {
+    let mut message = Message::response(200, Version::V1_1);
+    message.body = Some(Body::Data(Bytes::from_static(b"already coded")));
+    message.headers.get_or_insert_with(Headers::new).append("content-encoding", "gzip");
+    message.compression = Some(Compression::Brotli);
+
+    message.compress(None).expect("compressing did not run");
+
+    assert_eq!(message.body, Some(Body::Data(Bytes::from_static(b"already coded"))));
+    assert_eq!(message.headers.as_ref().and_then(|headers| headers.get("content-encoding")), Some("gzip"));
+    assert_eq!(message.compression, None, "a body left alone is coded in nothing this end applied");
+}
+
+/// A 1xx, a 204 and a 304 carry no content (RFC 9110 §15.2, §15.3.5, §15.4.5),
+/// and a partial response carries a range of a representation, which coding it
+/// afterwards would leave naming nothing (RFC 9110 §14.4).
+#[test]
+fn nothing_without_content_of_its_own_is_compressed() {
+    let coded = |mut message: Message| {
+        message.body = Some(Body::Data(Bytes::from(vec![b'a'; 4096])));
+        message.compression = Some(Compression::Gzip);
+        message.compress(None).expect("compressing did not run");
+        message.compressed()
+    };
+
+    for status in [100, 103, 199, 204, 304, 206] {
+        assert!(!coded(Message::response(status, Version::V1_1)), "{status} must not carry a coded body");
+    }
+
+    let mut ranged = Message::response(200, Version::V1_1);
+    ranged.headers.get_or_insert_with(Headers::new).append("content-range", "bytes 0-99/1000");
+    assert!(!coded(ranged), "a partial representation must not be coded");
+
+    let mut empty = Message::response(200, Version::V1_1);
+    empty.body = Some(Body::Data(Bytes::new()));
+    empty.compression = Some(Compression::Gzip);
+    empty.compress(None).expect("compressing did not run");
+    assert!(!empty.compressed(), "an empty body has nothing to code");
+
+    assert!(!coded(Message::request(Method::CONNECT, "example.test:443", Version::V1_1)), "a tunnel carries no content");
+}
+
+/// RFC 9110 §12.5.3 permits coding a body when the peer named no preference,
+/// but a peer that asked for nothing is likelier to be one that cannot decode.
+#[test]
+fn auto_sends_the_body_as_it_stands_when_nothing_is_accepted() {
+    let mut message = Message::response(200, Version::V1_1);
+    message.body = Some(Body::Data(Bytes::from(vec![b'a'; 4096])));
+    message.compression = Some(Compression::Auto);
+
+    message.compress(None).expect("compressing did not run");
+
+    assert!(!message.compressed());
+    assert_eq!(message.compression, None);
+    assert_eq!(message.body.as_ref().and_then(Body::len), Some(4096));
+}
+
+/// RFC 9110 §12.5.5: a response that varies on Accept-Encoding must say so, or
+/// a shared cache will hand one peer's coding to another.
+#[test]
+fn a_response_coded_from_accept_encoding_carries_vary() {
+    let mut message = Message::response(200, Version::V1_1);
+    message.body = Some(Body::Data(Bytes::from(vec![b'a'; 4096])));
+    message.compression = Some(Compression::Auto);
+
+    message.compress(Some(Compression::Zstd)).expect("compressing did not run");
+
+    assert_eq!(message.compression, Some(Compression::Zstd));
+    assert_eq!(message.headers.as_ref().and_then(|headers| headers.get("vary")), Some("Accept-Encoding"));
+
+    let mut explicit = Message::response(200, Version::V1_1);
+    explicit.body = Some(Body::Data(Bytes::from(vec![b'a'; 4096])));
+    explicit.compression = Some(Compression::Gzip);
+    explicit.compress(Some(Compression::Zstd)).expect("compressing did not run");
+
+    assert_eq!(explicit.compression, Some(Compression::Gzip), "an explicit coding is what the caller asked for");
+    assert!(!explicit.headers.as_ref().is_some_and(|headers| headers.contains("vary")), "a coding that did not vary must not say it did");
+}
+
+#[test]
+fn decompressing_removes_the_field_and_corrects_the_length() {
+    let body = vec![b'a'; 4096];
+
+    for coding in Compression::CODINGS {
+        let encoded = coding.encode(&body).expect("the fixture did not encode");
+
+        let mut message = Message::response(200, Version::V1_1);
+        message.body = Some(Body::Data(encoded.clone()));
+
+        let headers = message.headers.get_or_insert_with(Headers::new);
+        headers.append("content-encoding", coding.as_str());
+        headers.append("content-length", encoded.len().to_string());
+
+        message.decompress(1 << 20).expect("a body did not decode");
+
+        assert!(!message.compressed(), "{coding} must leave no Content-Encoding behind");
+        assert_eq!(message.compression, Some(*coding), "{coding} must say what came off the body");
+        assert_eq!(message.body, Some(Body::Data(Bytes::from(body.clone()))));
+        assert_eq!(message.headers.as_ref().and_then(|headers| headers.get("content-length")), Some("4096"));
+    }
+}
+
+#[test]
+fn a_body_in_a_coding_this_crate_does_not_implement_is_left_encoded() {
+    for value in ["compress", "gzip, br"] {
+        let mut message = Message::response(200, Version::V1_1);
+        message.body = Some(Body::Data(Bytes::from_static(b"opaque octets")));
+        message.headers.get_or_insert_with(Headers::new).append("content-encoding", value);
+
+        message.decompress(1 << 20).expect("an undecodable body must not fail");
+
+        assert!(message.compressed(), "{value:?} must leave the body reported as coded");
+        assert_eq!(message.compression, None, "{value:?} names nothing this crate took off");
+        assert_eq!(message.body, Some(Body::Data(Bytes::from_static(b"opaque octets"))));
+    }
+}
+
+#[test]
+fn decompressing_past_the_ceiling_is_a_limit_error() {
+    let encoded = Compression::Gzip.encode(&vec![0u8; 1024 * 1024]).expect("the fixture did not encode");
+
+    let mut message = Message::response(200, Version::V1_1);
+    message.body = Some(Body::Data(encoded));
+    message.headers.get_or_insert_with(Headers::new).append("content-encoding", "gzip");
+
+    assert!(matches!(message.decompress(1024), Err(Error::Limit(_))), "a body past the ceiling must be a limit failure");
+}
+
+#[tokio::test]
+async fn a_file_body_is_read_before_it_is_coded() {
+    let mut message = Message::response(200, Version::V1_1);
+    message.body = Some(Body::File("README.md".to_owned()));
+    message.compression = Some(Compression::Gzip);
+
+    assert!(matches!(message.compress(None), Err(Error::Protocol(_))), "a body still on disk cannot be coded");
+
+    message.materialize().await.expect("the file did not read");
+    message.compress(None).expect("a read body did not code");
+
+    assert!(message.compressed());
+}
+
+/// A connection has one role, and the two halves of it never overlap — which
+/// is what lets HTTP/1 keep one queue of pending exchanges for both directions,
+/// a client filling it as it sends and a server as it receives.
+#[test]
+fn no_role_is_both_ends_of_an_exchange() {
+    for role in [Role::UserAgent, Role::Origin, Role::Proxy, Role::Gateway, Role::Tunnel] {
+        assert!(!(role.is_client() && role.is_server()), "{role:?} would drive the pipeline from both ends");
+    }
+
+    assert!(Role::UserAgent.is_client() && Role::Proxy.is_client());
+    assert!(Role::Origin.is_server() && Role::Gateway.is_server());
+    assert!(!Role::Tunnel.is_client() && !Role::Tunnel.is_server(), "a tunnel reads no messages to pipeline");
 }

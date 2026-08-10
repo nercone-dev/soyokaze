@@ -143,6 +143,16 @@ class Connection:
         """The connection's identifier."""
         return library.soyokaze_connection_id(self.handle).take()
 
+    def client(self):
+        """The address the peer connected from, and its port, as text.
+
+        ``None`` on a client connection, and over a Unix socket, whose accepted
+        address names nothing. This is what every request the connection
+        receives is stamped with.
+        """
+        client = library.soyokaze_connection_client(self.handle).take()
+        return None if not client else client.decode()
+
     def reusable(self):
         """Whether another message may go over the connection."""
         return library.soyokaze_connection_reusable(self.handle)

@@ -1,5 +1,6 @@
 use bytes::BytesMut;
 
+use soyokaze::helpers::compression::Compression;
 use soyokaze::helpers::fields::HeaderField;
 use soyokaze::helpers::qpack::{self, DecoderInstruction, Encoder, EncoderInstruction};
 use soyokaze::models::Limits;
@@ -250,7 +251,7 @@ fn a_finished_exchange_leaves_nothing_behind() {
         session.on_stream_bytes(stream, &Frame::Headers(block.into()).encode(), true).expect("the request was refused");
         session.take_ready().expect("no request arrived");
 
-        let (_, fin) = session.encode_message(stream, &response).expect("the response did not encode");
+        let (_, fin) = session.encode_message(stream, &mut response).expect("the response did not encode");
         assert!(fin, "an ordinary response ends its stream");
 
         session.retire(stream);
@@ -278,7 +279,7 @@ fn a_stream_is_kept_until_both_directions_have_finished() {
 
     let mut response = Message::response(200, Version::V3_0);
     response.body = Some(Body::Text("hello".to_owned()));
-    session.encode_message(StreamID(0), &response).expect("the response did not encode");
+    session.encode_message(StreamID(0), &mut response).expect("the response did not encode");
 
     session.retire(StreamID(0));
     assert!(!session.streams.contains_key(&StreamID(0)), "both directions finished");
@@ -294,8 +295,8 @@ fn a_tunnelled_stream_is_never_retired() {
     session.on_stream_bytes(StreamID(0), &Frame::Headers(block.into()).encode(), true).expect("the request was refused");
     session.take_ready().expect("no request arrived");
 
-    let response = Message::response(200, Version::V3_0);
-    let (_, fin) = session.encode_message(StreamID(0), &response).expect("the response did not encode");
+    let mut response = Message::response(200, Version::V3_0);
+    let (_, fin) = session.encode_message(StreamID(0), &mut response).expect("the response did not encode");
     assert!(!fin, "an accepted CONNECT keeps its stream open");
 
     session.retire(StreamID(0));
@@ -375,7 +376,7 @@ fn a_response_is_framed_for_its_stream() {
     let mut response = Message::response(200, Version::V3_0);
     response.body = Some(Body::Text("hello".to_owned()));
 
-    let (bytes, fin) = session.encode_message(StreamID(0), &response).expect("the response did not encode");
+    let (bytes, fin) = session.encode_message(StreamID(0), &mut response).expect("the response did not encode");
     assert!(fin, "an ordinary response ends its stream");
 
     let mut buffer = BytesMut::from(&bytes[..]);
@@ -421,7 +422,7 @@ fn settings_that_name_no_table_capacity_leave_the_encoder_shut() {
 
     let mut response = Message::response(200, Version::V3_0);
     response.headers.get_or_insert_with(Headers::new).insert("x-request-id", "0123456789abcdef");
-    session.encode_message(StreamID(0), &response).expect("the response did not encode");
+    session.encode_message(StreamID(0), &mut response).expect("the response did not encode");
 
     assert!(session.take_encoder_out().is_empty(), "the encoder inserted into a table it was never granted");
 }
@@ -576,8 +577,8 @@ fn a_forgotten_stream_releases_its_qpack_sections() {
     let mut response = Message::response(200, Version::V3_0);
     response.headers.get_or_insert_with(Headers::new).append("x-trace", "abc");
 
-    session.encode_message(stream, &response).expect("the response did not encode");
-    session.encode_message(stream, &response).expect("the second response did not encode");
+    session.encode_message(stream, &mut response).expect("the response did not encode");
+    session.encode_message(stream, &mut response).expect("the second response did not encode");
 
     assert!(session.encoder.outstanding() > 0, "nothing referenced the dynamic table");
 
@@ -842,4 +843,182 @@ fn request_streams_are_counted_once_over_the_connections_lifetime() {
 
     assert_eq!(session.total_streams, 2, "the count is the connection's lifetime total");
     assert_eq!(session.highest_peer_stream_id, 4);
+}
+
+/// The address the fixtures pretend a peer dialled from.
+fn peer() -> std::net::SocketAddr {
+    "203.0.113.7:54321".parse().expect("the fixture address did not parse")
+}
+
+fn payload() -> bytes::Bytes {
+    bytes::Bytes::from(vec![b'a'; 8192])
+}
+
+/// A server session that has already taken a request accepting `accept`.
+fn asked(accept: Option<&str>) -> H3Session {
+    let mut session = server().with_client(Some(peer()));
+    let mut encoder = Encoder::new();
+
+    let mut fields = request_fields();
+    if let Some(accept) = accept {
+        fields.push(HeaderField::new("accept-encoding", accept));
+    }
+
+    let (block, _) = section(&mut encoder, 0, &fields);
+    session.on_stream_bytes(StreamID(0), &Frame::Headers(block.into()).encode(), true).expect("the request was refused");
+    session.take_ready().expect("no request arrived");
+
+    session
+}
+
+/// Frames a response coded as `compression` asks, and returns what it settled on.
+fn answered(accept: Option<&str>, compression: Option<Compression>) -> (Message, BytesMut) {
+    let mut session = asked(accept);
+
+    let mut response = Message::response(200, Version::V3_0);
+    response.body = Some(Body::Data(payload()));
+    response.compression = compression;
+
+    let mut out = BytesMut::new();
+    session.encode_message_into(StreamID(0), &mut response, &mut out).expect("the response did not encode");
+
+    (response, out)
+}
+
+/// RFC 9110 §12.5.3: a server codes a response in something the request said it
+/// would take, and in nothing else.
+#[test]
+fn a_server_compresses_a_response_in_the_coding_the_request_accepted() {
+    for (accept, expected) in [("gzip", Compression::Gzip), ("br, gzip", Compression::Brotli), ("*", Compression::Zstd)] {
+        let (response, wire) = answered(Some(accept), Some(Compression::Auto));
+
+        assert_eq!(response.compression, Some(expected), "{accept:?} must be answered with {expected}");
+        assert!(response.compressed(), "the response that goes out names its coding");
+        assert!(wire.len() < 8192, "{accept:?} framed {} octets, which is the identity body", wire.len());
+
+        let encoded = response.body.as_ref().and_then(Body::inline).expect("the body went missing");
+        assert_eq!(expected.decode(&encoded, 1 << 20).as_deref(), Ok(&payload()[..]));
+    }
+}
+
+#[test]
+fn a_server_sends_the_body_as_it_stands_when_the_request_accepted_nothing() {
+    for accept in [None, Some("identity"), Some("*;q=0")] {
+        let (response, _) = answered(accept, Some(Compression::Auto));
+
+        assert_eq!(response.compression, None, "{accept:?} permits no coding");
+        assert!(!response.compressed());
+        assert_eq!(response.body, Some(Body::Data(payload())));
+    }
+}
+
+#[test]
+fn an_explicit_coding_is_applied_whatever_the_peer_accepts() {
+    let (response, _) = answered(Some("gzip"), Some(Compression::Brotli));
+
+    assert_eq!(response.compression, Some(Compression::Brotli), "a caller that named a coding gets it");
+    assert_eq!(response.headers.as_ref().and_then(|headers| headers.get("content-encoding")), Some("br"));
+}
+
+/// RFC 9110 §12.5.5: a response that varies on Accept-Encoding must say so.
+#[test]
+fn a_response_coded_from_accept_encoding_carries_vary() {
+    let (response, _) = answered(Some("zstd"), Some(Compression::Auto));
+
+    assert_eq!(response.headers.as_ref().and_then(|headers| headers.get("vary")), Some("Accept-Encoding"));
+}
+
+#[test]
+fn a_received_request_carries_the_address_it_came_from() {
+    let mut session = server().with_client(Some(peer()));
+    let mut encoder = Encoder::new();
+
+    let (block, _) = section(&mut encoder, 0, &request_fields());
+    session.on_stream_bytes(StreamID(0), &Frame::Headers(block.into()).encode(), true).expect("the request was refused");
+
+    let message = session.take_ready().expect("no request arrived");
+    assert_eq!(message.client, Some(peer()), "a server must be told where the request came from");
+
+    let (connection, _worker) = H3Connection::pair(server().with_client(Some(peer())));
+    assert_eq!(connection.client, Some(peer()), "the handle must report what its session was told");
+
+    let (bare, _worker) = H3Connection::pair(server());
+    assert_eq!(bare.client, None, "a connection told no address reports none");
+}
+
+/// A message only reaches the caller through the handle, which is where the
+/// content coding comes off it.
+#[tokio::test]
+async fn a_received_body_arrives_decoded_with_no_content_encoding_left() {
+    let (mut connection, mut worker) = H3Connection::pair(server());
+    let mut encoder = Encoder::new();
+
+    let coded = Compression::Gzip.encode(&payload()).expect("the fixture did not encode");
+
+    let mut fields = request_fields();
+    fields.push(HeaderField::new("content-encoding", "gzip"));
+    fields.push(HeaderField::new("content-length", coded.len().to_string()));
+
+    let (block, _) = section(&mut encoder, 0, &fields);
+    let mut wire = Frame::Headers(block.into()).encode().to_vec();
+    wire.extend_from_slice(&Frame::Data(coded.to_vec().into()).encode());
+
+    worker.session.on_stream_bytes(StreamID(0), &wire, true).expect("the request was refused");
+    worker.deliver_ready();
+
+    let message = connection.receive_message().await.expect("the request did not arrive");
+
+    assert_eq!(message.compression, Some(Compression::Gzip), "the handle must say what came off the body");
+    assert!(!message.compressed(), "a decoded body must carry no Content-Encoding");
+    assert_eq!(message.body, Some(Body::Data(payload())));
+    assert_eq!(message.headers.as_ref().and_then(|headers| headers.get("content-length")), Some("8192"));
+}
+
+#[tokio::test]
+async fn a_received_body_past_the_decoded_ceiling_is_refused() {
+    let ceiling = Limits { max_decompressed_body_size: 1024, ..limits() };
+    let mut session = H3Session::new(Role::Origin, id(), ceiling);
+    session.on_control_bytes(&Frame::Settings(Settings::default().parameters()).encode()).expect("the peer settings were refused");
+
+    let (mut connection, mut worker) = H3Connection::pair(session);
+    let mut encoder = Encoder::new();
+
+    let bomb = Compression::Gzip.encode(&vec![0u8; 1024 * 1024]).expect("the fixture did not encode");
+
+    let mut fields = request_fields();
+    fields.push(HeaderField::new("content-encoding", "gzip"));
+
+    let (block, _) = section(&mut encoder, 0, &fields);
+    let mut wire = Frame::Headers(block.into()).encode().to_vec();
+    wire.extend_from_slice(&Frame::Data(bomb.to_vec().into()).encode());
+
+    worker.session.on_stream_bytes(StreamID(0), &wire, true).expect("the request was refused");
+    worker.deliver_ready();
+
+    let failure = connection.receive_message().await.expect_err("a body past the ceiling was accepted");
+    assert!(matches!(failure, Error::Limit(_)), "a body past the ceiling must be a limit failure, not {failure}");
+}
+
+/// A client cannot know what an origin decodes, so `Auto` on a request sends
+/// the body as it stands; a coding the caller named is applied all the same.
+#[test]
+fn auto_never_compresses_a_client_request() {
+    let mut session = H3Session::new(Role::UserAgent, id(), limits());
+
+    let mut automatic = Message::request(Method::POST, "/submit", Version::V3_0);
+    automatic.headers = Some(Headers::new());
+    automatic.body = Some(Body::Data(payload()));
+    automatic.compression = Some(Compression::Auto);
+
+    session.encode_message(StreamID(0), &mut automatic).expect("the request did not encode");
+    assert_eq!(automatic.compression, None, "a client has nothing to settle Auto against");
+    assert_eq!(automatic.body, Some(Body::Data(payload())));
+
+    let mut named = Message::request(Method::POST, "/submit", Version::V3_0);
+    named.headers = Some(Headers::new());
+    named.body = Some(Body::Data(payload()));
+    named.compression = Some(Compression::Zstd);
+
+    session.encode_message(StreamID(4), &mut named).expect("the request did not encode");
+    assert_eq!(named.compression, Some(Compression::Zstd), "a request coding the caller named is applied");
 }

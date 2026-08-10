@@ -585,6 +585,157 @@ pub unsafe extern "C" fn soyokaze_message_connection_id(message: *const Message)
     }
 }
 
+/// The address the request was received from, and its port, as text.
+///
+/// Empty on a response, on a message the caller built, and on a connection
+/// over a Unix socket, whose accepted address names nothing. Free the result
+/// with [`soyokaze_buffer_free`].
+///
+/// [`soyokaze_buffer_free`]: crate::ffi::soyokaze_buffer_free
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_client(message: *const Message) -> Buffer {
+    match unsafe { message.as_ref() }.and_then(|message| message.client) {
+        Some(client) => Buffer::new(client.to_string().into_bytes()),
+        None => Buffer::EMPTY,
+    }
+}
+
+/// The content coding the body is to go out in, or `-1` when there is none.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_compression(message: *const Message) -> i32 {
+    match unsafe { message.as_ref() }.and_then(|message| message.compression) {
+        Some(compression) => compression as i32,
+        None => -1,
+    }
+}
+
+/// Sets the content coding the body is to go out in; `-1` clears it.
+///
+/// Refuses a code that names no coding.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_set_compression(message: *mut Message, compression: i32) -> bool {
+    let Some(message) = (unsafe { message.as_mut() }) else {
+        return false;
+    };
+
+    if compression < 0 {
+        message.compression = None;
+        return true;
+    }
+
+    let Some(compression) = crate::ffi::helpers::compression::coding(compression) else {
+        return false;
+    };
+
+    message.compression = Some(compression);
+    true
+}
+
+/// Whether the body is currently carried compressed, per `Content-Encoding`.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_compressed(message: *const Message) -> bool {
+    unsafe { message.as_ref() }.is_some_and(Message::compressed)
+}
+
+/// The best coding the message's `Accept-Encoding` permits, or `-1` for none.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_accepted(message: *const Message) -> i32 {
+    match unsafe { message.as_ref() }.and_then(Message::accepted) {
+        Some(compression) => compression as i32,
+        None => -1,
+    }
+}
+
+/// Reads a body that is still a file into memory, so that it can be coded.
+///
+/// Needs a runtime because reading the file is asynchronous; every other body
+/// is left alone and no I/O happens.
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`], and `runtime` must be a runtime that has
+/// not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_materialize(message: *mut Message, runtime: *const crate::ffi::Runtime, error: *mut *mut ErrorHandle) -> Status {
+    let (Some(message), Some(runtime)) = (unsafe { message.as_mut() }, unsafe { runtime.as_ref() }) else {
+        return unsafe { ErrorHandle::raise(error, Status::Invalid) };
+    };
+
+    match runtime.0.block_on(message.materialize()) {
+        Ok(()) => Status::Ok,
+        Err(failure) => unsafe { ErrorHandle::report(error, &failure) },
+    }
+}
+
+/// Encodes the body in the coding the message carries.
+///
+/// `accepted` is the coding the exchange permits, which is what
+/// `SOYOKAZE_COMPRESSION_AUTO` settles on; `-1` permits none. The body must
+/// already be in memory — see [`soyokaze_message_materialize`].
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_compress(message: *mut Message, accepted: i32, error: *mut *mut ErrorHandle) -> Status {
+    let Some(message) = (unsafe { message.as_mut() }) else {
+        return unsafe { ErrorHandle::raise(error, Status::Invalid) };
+    };
+
+    let accepted = match accepted {
+        ..0 => None,
+        code => match crate::ffi::helpers::compression::coding(code) {
+            Some(compression) => Some(compression),
+            None => return unsafe { ErrorHandle::raise(error, Status::Invalid) },
+        },
+    };
+
+    match message.compress(accepted) {
+        Ok(()) => Status::Ok,
+        Err(failure) => unsafe { ErrorHandle::report(error, &failure) },
+    }
+}
+
+/// Decodes a body that arrived coded, and takes `Content-Encoding` off it.
+///
+/// `max` bounds what the decoded body may reach; passing it is
+/// [`Status::Limit`].
+///
+/// # Safety
+///
+/// As [`soyokaze_message_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_message_decompress(message: *mut Message, max: u64, error: *mut *mut ErrorHandle) -> Status {
+    let Some(message) = (unsafe { message.as_mut() }) else {
+        return unsafe { ErrorHandle::raise(error, Status::Invalid) };
+    };
+
+    match message.decompress(max) {
+        Ok(()) => Status::Ok,
+        Err(failure) => unsafe { ErrorHandle::report(error, &failure) },
+    }
+}
+
 /// Marks the message as travelling over a secure transport, or not.
 ///
 /// This is what the `:scheme` pseudo-header reflects on HTTP/2 and HTTP/3.
@@ -800,6 +951,8 @@ pub struct Limits {
     pub max_message_size: u64,
     /// In bytes, the size of the HTTP message body allowed for reception.
     pub max_message_body_size: u64,
+    /// In bytes, the size a received body may reach once its content coding is undone.
+    pub max_decompressed_body_size: u64,
 
     /// In bytes, the request/status line ceiling.
     pub max_startline_size: u32,
@@ -879,6 +1032,7 @@ impl Limits {
         crate::models::Limits {
             max_message_size: self.max_message_size,
             max_message_body_size: self.max_message_body_size,
+            max_decompressed_body_size: self.max_decompressed_body_size,
             max_startline_size: self.max_startline_size,
             max_headers_size: self.max_headers_size,
             max_header_count: self.max_header_count,
@@ -917,6 +1071,7 @@ impl Limits {
         Self {
             max_message_size: limits.max_message_size,
             max_message_body_size: limits.max_message_body_size,
+            max_decompressed_body_size: limits.max_decompressed_body_size,
             max_startline_size: limits.max_startline_size,
             max_headers_size: limits.max_headers_size,
             max_header_count: limits.max_header_count,

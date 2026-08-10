@@ -11,6 +11,7 @@ use std::str::FromStr;
 use bytes::Bytes;
 
 use crate::errors::Error;
+use crate::helpers::compression::Compression;
 use crate::helpers::fields::HeaderField;
 use crate::helpers::text::Text;
 use crate::tls::Security;
@@ -871,6 +872,17 @@ pub struct Message {
 
     /// The payload, if there is one.
     pub body: Option<Body>,
+    /// The content coding the body is to go out in, if any.
+    ///
+    /// Set this before sending to have the body encoded on the way out, which
+    /// is what [`Message::compress`] does and what every connection calls it
+    /// for. On a message that was received it is stamped by the connection
+    /// with the coding it took off the body, so it reads as what the body
+    /// arrived in rather than what it will leave in.
+    ///
+    /// This is `Content-Encoding` and nothing else. `Transfer-Encoding` frames
+    /// a body rather than codes it, and is left alone.
+    pub compression: Option<Compression>,
 
     /// The field section that precedes the body.
     pub headers: Option<Headers>,
@@ -885,6 +897,14 @@ pub struct Message {
     pub stream_id: Option<StreamID>,
     /// The connection this message arrived on.
     pub connection_id: Option<ConnectionID>,
+    /// The address the request was received from, and its port.
+    ///
+    /// Stamped on by whichever connection received it, alongside
+    /// [`Message::security`], and so set only on a request a server took off a
+    /// connection. A response carries none, and neither does a message the
+    /// caller built. A Unix socket connection carries none either: the address
+    /// of an accepted Unix socket names nothing.
+    pub client: Option<std::net::SocketAddr>,
 
     /// What the transport the message crossed turned out to be.
     ///
@@ -926,12 +946,14 @@ impl Message {
             version,
 
             body: None,
+            compression: None,
 
             headers: Some(Headers::new()),
             trailers: None,
 
             stream_id: None,
             connection_id: None,
+            client: None,
 
             security: Security::default(),
 
@@ -966,6 +988,162 @@ impl Message {
     pub fn is_informational(&self) -> bool {
         matches!(self.status_code, Some(100..=199))
     }
+
+    /// Whether the body is currently carried compressed.
+    ///
+    /// Judged from `Content-Encoding` alone, which is the only thing that says
+    /// so. A body this crate decoded has had the field taken off it, so a
+    /// message that still carries one is still coded — including when the
+    /// coding is one this crate does not implement, which is exactly the case
+    /// a caller needs to be told about.
+    pub fn compressed(&self) -> bool {
+        self.headers.as_ref().is_some_and(|headers| Compression::encoded(headers.get_all("content-encoding")))
+    }
+
+    /// The best coding this message's `Accept-Encoding` permits.
+    ///
+    /// Asked of a request by the connection that received it, so that the
+    /// response it is answered with can be coded in something the peer reads.
+    pub fn accepted(&self) -> Option<Compression> {
+        self.headers.as_ref().and_then(|headers| Compression::accepted(headers.get_all("accept-encoding")))
+    }
+
+    /// Whether the message may carry content at all.
+    ///
+    /// A 1xx, a 204 and a 304 carry none by definition, and a partial response
+    /// carries a range of a representation rather than the representation, so
+    /// coding it afterwards would leave the range naming nothing.
+    pub fn codable(&self) -> bool {
+        let bodyless = matches!(self.status_code, Some(100..=199 | 204 | 304));
+        let partial = self.status_code == Some(206) || self.headers.as_ref().is_some_and(|headers| headers.contains("content-range"));
+
+        !bodyless && !partial && self.method != Some(Method::CONNECT)
+    }
+
+    /// Reads the body into memory, so that it can be coded and framed.
+    ///
+    /// A [`Body::File`] becomes a [`Body::Data`]; anything else is left as it
+    /// is. This is the asynchronous half of sending a body, kept apart from
+    /// [`Message::compress`] because the coding itself has to happen where a
+    /// filesystem read cannot — inside the HTTP/3 worker, which frames its
+    /// messages in QUIC callbacks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::IO`] when the file cannot be read.
+    pub async fn materialize(&mut self) -> Result<(), Error> {
+        if let Some(body) = self.body.take() {
+            self.body = Some(Body::Data(body.into_bytes().await?));
+        }
+
+        Ok(())
+    }
+
+    /// Encodes the body in [`Message::compression`], ready for it to go out.
+    ///
+    /// `accepted` is the coding the exchange permits, which is what
+    /// [`Compression::Auto`] settles on; a client request has no exchange to
+    /// consult and passes `None`, so `Auto` sends such a body as it stands
+    /// rather than guessing at what an origin can read. An explicit coding is
+    /// applied whatever `accepted` says, because the caller asked for it.
+    ///
+    /// Nothing is done to a body that already carries a `Content-Encoding`, to
+    /// an absent or empty body, or to a message [`Message::codable`] refuses.
+    /// `Content-Length` is corrected where the message carries one, and a
+    /// response whose coding was settled from `Accept-Encoding` is given
+    /// `Vary: Accept-Encoding`, without which a shared cache would hand one
+    /// peer's coding to another. [`Message::compression`] ends up as the
+    /// coding that was applied, or `None` when none was.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when the body has not been through
+    /// [`Message::materialize`], and otherwise as [`Compression::encode`].
+    pub fn compress(&mut self, accepted: Option<Compression>) -> Result<(), Error> {
+        let Some(compression) = self.compression else {
+            return Ok(());
+        };
+
+        let settled = match compression {
+            Compression::Auto => accepted,
+            coding => Some(coding),
+        };
+
+        let Some(coding) = settled else {
+            self.compression = None;
+            return Ok(());
+        };
+
+        if self.compressed() || !self.codable() || self.body.as_ref().is_none_or(Body::is_empty) {
+            self.compression = None;
+            return Ok(());
+        }
+
+        let Some(body) = self.body.as_ref().and_then(Body::inline) else {
+            return Err(Error::Protocol("a body that is still a file cannot be coded".into()));
+        };
+
+        let encoded = coding.encode(&body)?;
+        let length = encoded.len();
+        let varying = compression == Compression::Auto && self.is_response();
+
+        self.body = Some(Body::Data(encoded));
+        self.compression = Some(coding);
+
+        let headers = self.headers.get_or_insert_with(Headers::new);
+        headers.append_lowercase("content-encoding", coding.as_str());
+
+        if headers.contains("content-length") {
+            headers.insert("content-length", length.to_string());
+        }
+
+        if varying && !headers.contains("vary") {
+            headers.append_lowercase("vary", "Accept-Encoding");
+        }
+
+        Ok(())
+    }
+
+    /// Decodes a body that arrived coded, and takes the field off it.
+    ///
+    /// The counterpart of [`Message::compress`]: whatever `Content-Encoding`
+    /// names is decoded, the field is removed, `Content-Length` is corrected,
+    /// and [`Message::compression`] is stamped with what came off. A coding
+    /// this crate does not implement, a field naming several, and an absent
+    /// body are each left exactly as they arrived, so [`Message::compressed`]
+    /// keeps answering yes for them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Limit`] once the decoded body passes `max`, and
+    /// otherwise as [`Compression::decode`].
+    pub fn decompress(&mut self, max: u64) -> Result<(), Error> {
+        let Some(headers) = self.headers.as_mut() else {
+            return Ok(());
+        };
+
+        let Some(coding) = Compression::applied(headers.get_all("content-encoding")) else {
+            return Ok(());
+        };
+
+        let Some(body) = self.body.as_ref().and_then(Body::inline) else {
+            return Ok(());
+        };
+
+        let decoded = coding.decode(&body, max)?;
+        let length = decoded.len();
+
+        self.body = Some(Body::Data(decoded));
+        self.compression = Some(coding);
+
+        headers.remove("content-encoding");
+
+        if headers.contains("content-length") {
+            headers.insert("content-length", length.to_string());
+        }
+
+        Ok(())
+    }
 }
 
 /// What one connection is allowed to spend on the peer's behalf.
@@ -981,6 +1159,13 @@ pub struct Limits {
     pub max_message_size:      u64,
     /// In bytes, the size of the HTTP message body allowed for reception.
     pub max_message_body_size: u64,
+    /// In bytes, the size a received body may reach once its content coding is undone.
+    ///
+    /// A compressed body is small on the wire and can be enormous once it is
+    /// decoded, so [`Limits::max_message_body_size`] does not bound it: that
+    /// counts the octets that arrived. Decoding past this produces
+    /// [`Error::Limit`] and the decoded body is never held.
+    pub max_decompressed_body_size: u64,
 
     /// In bytes, the request/status line ceiling.
     pub max_startline_size:    u32,
@@ -1086,6 +1271,7 @@ impl Default for Limits {
         Self {
             max_message_size: 64 * 1024 * 1024,
             max_message_body_size: 64 * 1024 * 1024,
+            max_decompressed_body_size: 256 * 1024 * 1024,
 
             max_startline_size: 8 * 1024,
             max_headers_size: 64 * 1024,

@@ -35,6 +35,8 @@ pub struct H2Limits {
     pub max_message_size: u64,
     /// In bytes, the message body size allowed for reception.
     pub max_message_body_size: u64,
+    /// In bytes, the size a received body may reach once its content coding is undone.
+    pub max_decompressed_body_size: u64,
     /// In bytes, the whole header (or trailer) block.
     pub max_headers_size: u64,
     /// The number of header fields allowed in one block.
@@ -76,6 +78,7 @@ impl From<Limits> for H2Limits {
         Self {
             max_message_size: limits.max_message_size,
             max_message_body_size: limits.max_message_body_size,
+            max_decompressed_body_size: limits.max_decompressed_body_size,
             max_headers_size: limits.max_headers_size,
             max_header_count: limits.max_header_count,
             max_concurrent_streams: limits.max_concurrent_streams,
@@ -98,6 +101,7 @@ pub mod frames;
 
 pub use frames::{Code, Flag, Frame, FrameHeader, FrameType, Settings, PREFACE};
 
+use crate::helpers::compression::Compression;
 use crate::helpers::fields::HeaderField;
 use crate::helpers::hpack::{Decoder as HPACKDecoder, Encoder as HPACKEncoder};
 use crate::models::{Body, ConnectionID, Headers, Limits, Message, Method, Role, StreamID, Version};
@@ -174,6 +178,7 @@ pub struct H2Stream {
     body: BytesMut,
     headers: Option<Message>,
     method: Option<Method>,
+    accepted: Option<Compression>,
 
     pending_reset: Option<u64>,
 }
@@ -191,6 +196,7 @@ impl H2Stream {
             body: BytesMut::new(),
             headers: None,
             method: None,
+            accepted: None,
             pending_reset: None,
         }
     }
@@ -198,6 +204,14 @@ impl H2Stream {
     /// Where the stream is in its lifetime.
     pub fn state(&self) -> StreamState {
         self.state
+    }
+
+    /// The best coding the request on this stream said it would take.
+    ///
+    /// Set when the request arrives, and read when the response goes out, so
+    /// that [`Compression::Auto`] settles on something the peer can read.
+    pub fn accepted(&self) -> Option<Compression> {
+        self.accepted
     }
 
     /// How many octets of message have arrived, compressed head and body alike.
@@ -242,6 +256,7 @@ pub struct H2Connection<T> {
     transport: T,
     role: Role,
     id: ConnectionID,
+    client: Option<std::net::SocketAddr>,
     limits: H2Limits,
     buffer: Buffer,
 
@@ -304,6 +319,7 @@ where
             transport,
             role,
             id,
+            client: None,
             limits,
             buffer,
             streams: common::StreamMap::default(),
@@ -359,6 +375,16 @@ where
     /// this connection receives.
     pub fn with_security(mut self, security: Security) -> Self {
         self.security = security;
+        self
+    }
+
+    /// Attaches the address the peer connected from, to be stamped on every
+    /// request this connection receives.
+    ///
+    /// A client connection is told none, and neither is one over a Unix
+    /// socket, so [`Message::client`] stays absent on both.
+    pub fn with_client(mut self, client: Option<std::net::SocketAddr>) -> Self {
+        self.client = client;
         self
     }
 
@@ -502,11 +528,13 @@ where
     /// is left, and otherwise as [`H2Connection::pump`].
     pub async fn receive_message(&mut self) -> Result<Message, Error> {
         loop {
-            if let Some(message) = self.ready.pop_front() {
-                return Ok(message);
-            }
+            let arrived = match self.ready.pop_front() {
+                Some(message) => Some(message),
+                None => self.pump().await?,
+            };
 
-            if let Some(message) = self.pump().await? {
+            if let Some(mut message) = arrived {
+                message.decompress(self.limits.max_decompressed_body_size)?;
                 return Ok(message);
             }
 
@@ -566,6 +594,9 @@ where
 
         self.streams.entry(stream_id).or_insert_with(|| H2Stream::new(stream_id, window_local, window_remote));
 
+        message.materialize().await?;
+        message.compress(message.is_response().then(|| self.streams.get(&stream_id)?.accepted).flatten())?;
+
         self.fields.clear();
         common::Fields::write(&message, &mut self.fields)?;
 
@@ -573,10 +604,7 @@ where
         block.clear();
         self.hpack_encoder.encode_into(&mut block, &self.fields);
 
-        let body = match message.body.take() {
-            Some(body) => Some(body.into_bytes().await?),
-            None => None,
-        };
+        let body = message.body.take().and_then(|body| body.inline());
 
         let body = body.filter(|body| !body.is_empty());
         let trailers = message.trailers.as_ref().filter(|trailers| !trailers.is_empty());
@@ -1095,6 +1123,7 @@ where
         }
 
         let connection_id = self.id.clone();
+        let client = self.client;
         let security = self.security;
         let stream = self.open_stream(stream_id)?;
 
@@ -1114,10 +1143,12 @@ where
             let mut message = common::Fields::into_message(decoded, Version::V2_0)?;
             message.stream_id = Some(stream_id);
             message.connection_id = Some(connection_id);
+            message.client = client;
             security.apply(&mut message);
 
             if message.is_request() {
                 stream.method = message.method;
+                stream.accepted = message.accepted();
             }
 
             if message.is_informational() {
@@ -1387,6 +1418,10 @@ where
 
     fn security(&self) -> Security {
         self.security
+    }
+
+    fn client(&self) -> Option<std::net::SocketAddr> {
+        self.client
     }
 
     async fn send(&mut self, message: Message) -> Result<(), Error> {

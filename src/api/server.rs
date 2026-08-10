@@ -324,12 +324,14 @@ impl Socket {
             Self::TCP(listener) => {
                 let (transport, address) = listener.accept().await?;
                 let _ = transport.set_nodelay(true);
-                Ok(Incoming::Stream { transport: Box::new(transport), id: ConnectionID(Bytes::from(address.to_string())) })
+                let id = ConnectionID(Bytes::from(address.to_string()));
+                Ok(Incoming::Stream { transport: Box::new(transport), id, client: Some(address) })
             }
 
             Self::UDS(listener) => {
                 let (transport, _) = listener.accept().await?;
-                Ok(Incoming::Stream { transport: Box::new(transport), id: ConnectionID(Bytes::from_static(b"unix")) })
+                let id = ConnectionID(Bytes::from_static(b"unix"));
+                Ok(Incoming::Stream { transport: Box::new(transport), id, client: None })
             }
         }
     }
@@ -663,10 +665,7 @@ impl Server {
                                 break;
                             };
 
-                            let ip = std::str::from_utf8(&connection.id().0)
-                                .ok()
-                                .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
-                                .map(|address| address.ip());
+                            let ip = connection.client().map(|address| address.ip());
 
                             let Some(permit) = gate.admit(ip, std::time::Instant::now()) else {
                                 connection.close().await;

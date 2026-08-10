@@ -1,6 +1,7 @@
 use bytes::BytesMut;
 use tokio::io::AsyncWriteExt;
 
+use soyokaze::helpers::compression::Compression;
 use soyokaze::helpers::fields::HeaderField;
 use soyokaze::models::Limits;
 use soyokaze::hsts::HSTSPolicy;
@@ -334,11 +335,16 @@ fn refuses_to_frame_a_connection_specific_field() {
     assert!(matches!(common::Fields::of(&response), Err(Error::Protocol(_))));
 }
 
+/// The address the loopback fixtures pretend a peer dialled from.
+fn peer() -> std::net::SocketAddr {
+    "203.0.113.7:54321".parse().expect("the fixture address did not parse")
+}
+
 async fn pair() -> (H2Connection<tokio::io::DuplexStream>, H2Connection<tokio::io::DuplexStream>) {
     let (client_pipe, server_pipe) = tokio::io::duplex(256 * 1024);
 
     let mut client = H2Connection::new(client_pipe, Role::UserAgent, id(), limits());
-    let mut server = H2Connection::new(server_pipe, Role::Origin, id(), limits());
+    let mut server = H2Connection::new(server_pipe, Role::Origin, id(), limits()).with_client(Some(peer()));
 
     client.start().await.expect("the client preface did not send");
     server.start().await.expect("the server did not accept the preface");
@@ -854,4 +860,235 @@ fn a_multiplexed_burst_is_answered_in_full() {
 
     cluster.close(Some(1.0));
     assert_eq!(answered, BURST, "part of the burst was left unanswered");
+}
+
+fn payload() -> bytes::Bytes {
+    bytes::Bytes::from(vec![b'a'; 8192])
+}
+
+/// A request with a body and the `Accept-Encoding` the caller chose.
+fn request(accept: Option<&str>) -> Message {
+    let mut request = Message::request(Method::POST, "/submit", Version::V2_0);
+    request.headers = Some(Headers::new());
+
+    if let Some(accept) = accept {
+        request.headers.get_or_insert_with(Headers::new).append("accept-encoding", accept);
+    }
+
+    request
+}
+
+/// Answers `request` with a body coded as `compression` asks, and returns what
+/// the client made of it.
+async fn coded(accept: Option<&str>, compression: Option<Compression>) -> Message {
+    let (mut client, mut server) = pair().await;
+
+    client.send(request(accept)).await.expect("the request did not send");
+    let received = server.receive().await.expect("the request did not arrive");
+
+    let mut response = Message::response(200, Version::V2_0);
+    response.stream_id = received.stream_id;
+    response.body = Some(Body::Data(payload()));
+    response.compression = compression;
+    server.send(response).await.expect("the response did not send");
+
+    client.receive().await.expect("the response did not arrive")
+}
+
+/// RFC 9110 §12.5.3: a server codes a response in something the request said it
+/// would take, and in nothing else.
+#[tokio::test]
+async fn a_server_compresses_a_response_in_the_coding_the_request_accepted() {
+    for (accept, expected) in [("gzip", Compression::Gzip), ("br, gzip", Compression::Brotli), ("*", Compression::Zstd)] {
+        let answer = coded(Some(accept), Some(Compression::Auto)).await;
+
+        assert_eq!(answer.compression, Some(expected), "{accept:?} must be answered with {expected}");
+        assert!(!answer.compressed(), "a decoded body must carry no Content-Encoding");
+        assert_eq!(answer.body, Some(Body::Data(payload())), "the body must survive the round trip");
+    }
+}
+
+#[tokio::test]
+async fn a_server_sends_the_body_as_it_stands_when_the_request_accepted_nothing() {
+    for accept in ["identity", "*;q=0", "gzip;q=0, br;q=0, zstd;q=0, deflate;q=0"] {
+        let answer = coded(Some(accept), Some(Compression::Auto)).await;
+
+        assert_eq!(answer.compression, None, "{accept:?} permits no coding");
+        assert_eq!(answer.body, Some(Body::Data(payload())));
+    }
+}
+
+#[tokio::test]
+async fn an_explicit_coding_is_applied_whatever_the_peer_accepts() {
+    let answer = coded(Some("gzip"), Some(Compression::Brotli)).await;
+    assert_eq!(answer.compression, Some(Compression::Brotli), "a caller that named a coding gets it");
+}
+
+#[tokio::test]
+async fn a_received_body_arrives_decoded_with_no_content_encoding_left() {
+    let answer = coded(Some("zstd"), Some(Compression::Auto)).await;
+
+    assert_eq!(answer.compression, Some(Compression::Zstd));
+    assert!(!answer.compressed());
+    assert!(!answer.headers.as_ref().is_some_and(|headers| headers.contains("content-encoding")));
+    assert_eq!(answer.headers.as_ref().and_then(|headers| headers.get("vary")), Some("Accept-Encoding"));
+}
+
+/// A client cannot know what an origin decodes, so `Auto` on a request sends
+/// the body as it stands; a coding the caller named is applied all the same.
+#[tokio::test]
+async fn auto_never_compresses_a_client_request() {
+    let (mut client, mut server) = pair().await;
+
+    let mut automatic = request(None);
+    automatic.body = Some(Body::Data(payload()));
+    automatic.compression = Some(Compression::Auto);
+    client.send(automatic).await.expect("the request did not send");
+
+    let received = server.receive().await.expect("the request did not arrive");
+    assert_eq!(received.compression, None);
+    assert_eq!(received.body, Some(Body::Data(payload())));
+
+    let mut named = request(None);
+    named.body = Some(Body::Data(payload()));
+    named.compression = Some(Compression::Zstd);
+    client.send(named).await.expect("the request did not send");
+
+    let decoded = server.receive().await.expect("the request did not arrive");
+    assert_eq!(decoded.compression, Some(Compression::Zstd), "a request coding the caller named is applied");
+    assert_eq!(decoded.body, Some(Body::Data(payload())));
+}
+
+/// The ceilings on a received message count the octets that crossed the wire,
+/// so a body that only fits once it is coded proves the coded form is what went
+/// out — and that decoding happens after the connection has stopped counting.
+#[tokio::test]
+async fn the_octets_that_go_out_are_the_coded_ones() {
+    let (client_pipe, server_pipe) = tokio::io::duplex(4 * 1024 * 1024);
+    let narrow = Limits { max_message_size: 128 * 1024, max_message_body_size: 64 * 1024, ..limits() };
+
+    let mut client = H2Connection::new(client_pipe, Role::UserAgent, id(), narrow);
+    let mut server = H2Connection::new(server_pipe, Role::Origin, id(), limits());
+
+    client.start().await.expect("the client preface did not send");
+    server.start().await.expect("the server did not accept the preface");
+
+    client.send(request(Some("gzip"))).await.expect("the request did not send");
+    let received = server.receive().await.expect("the request did not arrive");
+
+    let mut response = Message::response(200, Version::V2_0);
+    response.stream_id = received.stream_id;
+    response.body = Some(Body::Data(bytes::Bytes::from(vec![0u8; 1024 * 1024])));
+    response.compression = Some(Compression::Auto);
+    server.send(response).await.expect("the response did not send");
+
+    let answer = client.receive().await.expect("a body that fits once coded was refused");
+
+    assert_eq!(answer.compression, Some(Compression::Gzip));
+    assert_eq!(answer.body.as_ref().and_then(Body::len), Some(1024 * 1024), "the decoded body is larger than the wire ceiling that admitted it");
+}
+
+#[tokio::test]
+async fn a_received_request_carries_the_address_it_came_from() {
+    let (mut client, mut server) = pair().await;
+
+    client.send(request(None)).await.expect("the request did not send");
+
+    let received = server.receive().await.expect("the request did not arrive");
+    assert_eq!(received.client, Some(peer()), "a server must be told where the request came from");
+    assert_eq!(server.client(), Some(peer()), "the connection must report the same address");
+}
+
+#[tokio::test]
+async fn a_message_a_client_receives_carries_no_client_address() {
+    let answer = coded(None, None).await;
+
+    assert_eq!(answer.client, None, "a response names no access source");
+}
+
+#[tokio::test]
+async fn a_received_body_past_the_decoded_ceiling_is_refused() {
+    let (client_pipe, server_pipe) = tokio::io::duplex(1024 * 1024);
+    let ceiling = Limits { max_decompressed_body_size: 1024, ..limits() };
+
+    let mut client = H2Connection::new(client_pipe, Role::UserAgent, id(), ceiling);
+    let mut server = H2Connection::new(server_pipe, Role::Origin, id(), limits());
+
+    client.start().await.expect("the client preface did not send");
+    server.start().await.expect("the server did not accept the preface");
+
+    client.send(request(Some("gzip"))).await.expect("the request did not send");
+    let received = server.receive().await.expect("the request did not arrive");
+
+    let mut response = Message::response(200, Version::V2_0);
+    response.stream_id = received.stream_id;
+    response.body = Some(Body::Data(bytes::Bytes::from(vec![0u8; 1024 * 1024])));
+    response.compression = Some(Compression::Auto);
+    server.send(response).await.expect("the response did not send");
+
+    let failure = client.receive().await.expect_err("a body past the ceiling was accepted");
+    assert!(matches!(failure, Error::Limit(_)), "a body past the ceiling must be a limit failure, not {failure}");
+}
+
+/// Answers with what the connection was told about its peer, coded as the
+/// request asked.
+#[derive(Clone)]
+struct Reflector;
+
+impl Handler for Reflector {
+    async fn on_connection(&self, connection: AnyConnection) {
+        let mut connection = connection;
+
+        while let Ok(request) = connection.receive().await {
+            let seen = request.client.map_or_else(|| "none".to_owned(), |client| client.to_string());
+
+            let mut response = Message::response(200, connection.version());
+            response.stream_id = request.stream_id;
+            response.body = Some(Body::Data(bytes::Bytes::from(format!("{seen}|{}", "x".repeat(8192)))));
+            response.compression = Some(Compression::Auto);
+
+            if connection.send(response).await.is_err() {
+                break;
+            }
+        }
+
+        connection.close().await;
+    }
+}
+
+/// The whole HTTP/2 path, over a real port: the address the listener accepted
+/// reaches the handler, and the answer crosses coded and comes back decoded.
+#[test]
+fn an_http_2_exchange_is_compressed_and_names_the_peer() {
+    let server = Server::new(ServerConfig { versions: vec![Version::V2_0], ..ServerConfig::default() });
+    let cluster = server.run(Reflector, &[Port::TCP(0)], 1).expect("the TCP port did not open");
+    let port = cluster.address().expect("the cluster has no address").port();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("no runtime");
+
+    runtime.block_on(async move {
+        let client = Client::new(ClientConfig { versions: vec![Version::V2_0], secure: false, ..ClientConfig::default() });
+        let mut connection = client.connect("localhost", Port::TCP(port)).await.expect("the client could not reach the server");
+
+        let request = Message::request(Method::GET, "/index.html", Version::V2_0);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), client.request(&mut connection, request))
+            .await
+            .expect("the server never answered")
+            .expect("the exchange failed");
+
+        assert_eq!(response.compression, Some(Compression::Zstd), "the answer must come back in the coding the request permitted");
+        assert!(!response.compressed());
+        assert_eq!(response.client, None, "a response names no access source");
+
+        let body = response.body.as_ref().and_then(Body::inline).expect("the answer carried no body");
+        let text = String::from_utf8_lossy(&body).into_owned();
+        let (seen, padding) = text.split_once('|').expect("the answer did not name what the handler saw");
+
+        assert_eq!(padding.len(), 8192, "the body must survive the round trip");
+        assert!(seen.parse::<std::net::SocketAddr>().is_ok(), "the handler saw {seen:?} rather than the address the listener accepted");
+
+        connection.close().await;
+    });
+
+    cluster.close(Some(1.0));
 }
