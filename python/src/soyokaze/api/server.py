@@ -83,8 +83,14 @@ class ServerConfig:
     """How a :class:`Server` is configured.
 
     Every field has a working default: every supported version offered, no
-    admission limits, ``SO_REUSEPORT`` on, and no identity, which leaves a
-    TCP port in plaintext and a QUIC port unservable.
+    admission limits, ``SO_REUSEPORT`` on, a Unix socket anyone may connect
+    to, and no identity, which leaves a TCP port in plaintext and a QUIC port
+    unservable.
+
+    ``uds_mode`` is the filesystem mode a Unix socket is bound at, ``0o666``
+    by default, since connecting to one asks for write permission on it and a
+    reverse proxy in front usually runs as another user. Zero leaves the
+    socket the mode the process umask gave it.
 
     ``identity`` is an :class:`Identity`, ``tls`` a :class:`TLSConfig`,
     ``ech`` an :class:`ECHKeys`, and ``hsts`` an :class:`HSTSPolicy`;
@@ -97,7 +103,7 @@ class ServerConfig:
     :class:`HSTSPolicy`: soyokaze.hsts.HSTSPolicy
     """
 
-    def __init__(self, versions=None, limits=None, identity=None, certificate=None, key=None, tls=None, ech=None, hsts=None, reuseport=True):
+    def __init__(self, versions=None, limits=None, identity=None, certificate=None, key=None, tls=None, ech=None, hsts=None, reuseport=True, uds_mode=0o666):
         self.versions = versions
         self.limits = limits
         self.identity = identity
@@ -107,6 +113,7 @@ class ServerConfig:
         self.ech = ech
         self.hsts = hsts
         self.reuseport = reuseport
+        self.uds_mode = uds_mode
 
     def build(self):
         """The ``soyokaze_server_config_t`` this stands for.
@@ -156,6 +163,7 @@ class ServerConfig:
             struct.hsts = ctypes.pointer(hsts)
 
         struct.reuseport = self.reuseport
+        struct.uds_mode = self.uds_mode
         struct.keepalive = keepalive
         return struct
 
@@ -349,6 +357,11 @@ class Server:
     def reuseport(self):
         """Whether each worker's socket is bound with ``SO_REUSEPORT``."""
         return library.soyokaze_server_reuseport(self.handle)
+
+    @property
+    def uds_mode(self):
+        """The mode a Unix socket is bound at, or zero for the umask's own."""
+        return library.soyokaze_server_uds_mode(self.handle)
 
     def open(self, target):
         """Binds one port without starting anything on it.

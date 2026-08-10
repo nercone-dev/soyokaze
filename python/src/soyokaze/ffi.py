@@ -242,6 +242,7 @@ class ServerConfig(Structure):
         ("ech", c_void_p),
         ("hsts", POINTER(HSTSPolicy)),
         ("reuseport", c_bool),
+        ("uds_mode", c_uint32),
     ]
 
 class Field(Structure):
@@ -836,6 +837,7 @@ Library.declare("soyokaze_server_handle_address_at", Buffer, c_void_p, c_size_t)
 Library.declare("soyokaze_server_version_count", c_size_t, c_void_p)
 Library.declare("soyokaze_server_version_at", c_int32, c_void_p, c_size_t)
 Library.declare("soyokaze_server_reuseport", c_bool, c_void_p)
+Library.declare("soyokaze_server_uds_mode", c_uint32, c_void_p)
 Library.declare("soyokaze_server_limits_gate", c_void_p, POINTER(ServerLimits))
 Library.declare("soyokaze_server_open", c_int32, c_void_p, POINTER(Port), POINTER(c_void_p), POINTER(c_void_p))
 Library.declare("soyokaze_raw_socket_free", None, c_void_p)

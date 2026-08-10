@@ -17,6 +17,7 @@
 //! then goes quiet cannot hold up the accept loop.
 
 use std::net::{Ipv6Addr, SocketAddr};
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -36,8 +37,9 @@ use crate::helpers::sync;
 /// How a [`Server`] is configured.
 ///
 /// Every field has a working default: every supported version offered, no
-/// admission limits, `SO_REUSEPORT` on, and no identity, which leaves a TCP
-/// port in plaintext and a QUIC port unservable.
+/// admission limits, `SO_REUSEPORT` on, a Unix socket anyone may connect to,
+/// and no identity, which leaves a TCP port in plaintext and a QUIC port
+/// unservable.
 #[derive(Clone)]
 pub struct ServerConfig {
     /// The versions to offer. Each port narrows this to what it can carry.
@@ -73,6 +75,14 @@ pub struct ServerConfig {
     /// On by default, and needed for [`Server::run`] to give each
     /// worker its own listener. Turning it off makes a QUIC port single-worker.
     pub reuseport: bool,
+
+    /// The filesystem mode a Unix socket is bound at.
+    ///
+    /// `0o666` by default, since connecting to a Unix socket asks for write
+    /// permission on it and a reverse proxy in front usually runs as another
+    /// user. Zero leaves the socket the mode the process umask gave it, which
+    /// is what a server that keeps its socket in a directory of its own wants.
+    pub uds_mode: u32,
 }
 
 impl Default for ServerConfig {
@@ -85,6 +95,7 @@ impl Default for ServerConfig {
             ech: None,
             hsts: None,
             reuseport: true,
+            uds_mode: 0o666,
         }
     }
 }
@@ -122,12 +133,18 @@ impl Server {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::IO`] when the socket cannot be created or bound.
+    /// Returns [`Error::IO`] when the socket cannot be created, bound, or, for
+    /// a Unix socket, given [`ServerConfig::uds_mode`].
     pub fn open(&self, target: &Port) -> Result<RawSocket, Error> {
         Ok(match target {
             Port::UDS(path) => {
                 let listener = std::os::unix::net::UnixListener::bind(path)?;
                 listener.set_nonblocking(true)?;
+
+                if self.config.uds_mode != 0 {
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(self.config.uds_mode))?;
+                }
+
                 RawSocket::UDS(listener)
             }
 

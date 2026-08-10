@@ -240,9 +240,10 @@ pub extern "C" fn soyokaze_server_limits_default() -> ServerLimits {
 /// How a [`Server`] is configured.
 ///
 /// Passing null wherever one of these is asked for takes every default: every
-/// version on offer, no ceilings, `SO_REUSEPORT` on, and no identity, which
-/// leaves a TCP port in plaintext and a QUIC port unservable. A null pointer
-/// inside the struct takes that field's default the same way.
+/// version on offer, no ceilings, `SO_REUSEPORT` on, a Unix socket anyone may
+/// connect to, and no identity, which leaves a TCP port in plaintext and a
+/// QUIC port unservable. A null pointer inside the struct takes that field's
+/// default the same way.
 ///
 /// The identity and ECH handles are borrowed: the server copies what it needs,
 /// so they may be freed once the server is built.
@@ -281,6 +282,10 @@ pub struct ServerConfig {
 
     /// Whether sockets are opened with `SO_REUSEPORT`.
     pub reuseport: bool,
+
+    /// The filesystem mode a Unix socket is bound at. Zero leaves it the mode
+    /// the process umask gave it.
+    pub uds_mode: u32,
 }
 
 impl ServerConfig {
@@ -296,6 +301,7 @@ impl ServerConfig {
         ech: std::ptr::null(),
         hsts: std::ptr::null(),
         reuseport: true,
+        uds_mode: 0o666,
     };
 
     /// The [`Server`] this configures.
@@ -308,7 +314,7 @@ impl ServerConfig {
     /// number of readable elements, themselves valid; `identity` and `ech`
     /// must be handles that have not been freed.
     pub unsafe fn build(&self) -> Option<Server> {
-        let mut config = crate::api::server::ServerConfig { reuseport: self.reuseport, ..Default::default() };
+        let mut config = crate::api::server::ServerConfig { reuseport: self.reuseport, uds_mode: self.uds_mode, ..Default::default() };
 
         let versions = unsafe { Version::parse_all(self.versions, self.version_count) }?;
         if !versions.is_empty() {
@@ -676,6 +682,17 @@ pub unsafe extern "C" fn soyokaze_server_version_at(server: *const Server, index
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_server_reuseport(server: *const Server) -> bool {
     unsafe { server.as_ref() }.is_some_and(|server| server.config.reuseport)
+}
+
+/// The filesystem mode the server binds a Unix socket at, or zero for the one
+/// the process umask gives it.
+///
+/// # Safety
+///
+/// As [`soyokaze_server_version_count`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_server_uds_mode(server: *const Server) -> u32 {
+    unsafe { server.as_ref() }.map_or(0, |server| server.config.uds_mode)
 }
 
 /// Builds the admission gate a [`ServerLimits`] describes.

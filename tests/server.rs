@@ -61,6 +61,17 @@ async fn probe(port: u16) -> String {
     String::from_utf8_lossy(&response).into_owned()
 }
 
+fn socket_path(name: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("soyokaze-{name}-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+fn mode_of(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).expect("the socket was not created").mode() & 0o7777
+}
+
 fn exercise(cluster: &Cluster, requests: usize) {
     let port = cluster.address().expect("the cluster has no address").port();
 
@@ -433,4 +444,50 @@ fn a_unix_socket_connection_reports_no_client_address() {
 
     drop(cluster);
     let _ = std::fs::remove_file(&path);
+}
+
+/// Connecting to a Unix socket asks for write permission on it, and a reverse
+/// proxy in front usually runs as another user, so one is bound at 0o666.
+#[test]
+fn a_unix_socket_is_bound_at_the_default_mode() {
+    let path = socket_path("mode-default");
+    let server = Server::new(ServerConfig::default());
+    let socket = server.open(&Port::UDS(path.to_string_lossy().into_owned())).expect("the unix socket did not open");
+
+    assert_eq!(mode_of(&path), 0o666, "a unix socket must be left reachable by a peer running as another user");
+
+    drop(socket);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The mode is the caller's to pick, for a socket that is nobody else's business.
+#[test]
+fn a_unix_socket_is_bound_at_the_configured_mode() {
+    let path = socket_path("mode-configured");
+    let server = Server::new(ServerConfig { uds_mode: 0o600, ..ServerConfig::default() });
+    let socket = server.open(&Port::UDS(path.to_string_lossy().into_owned())).expect("the unix socket did not open");
+
+    assert_eq!(mode_of(&path), 0o600, "a unix socket must be bound at the mode it was configured with");
+
+    drop(socket);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Zero asks for no mode of its own, so the socket keeps the one the process
+/// umask gave it, exactly as a bare bind leaves it.
+#[test]
+fn a_unix_socket_mode_of_zero_leaves_the_umask_its_say() {
+    let bare = socket_path("mode-bare");
+    let listener = std::os::unix::net::UnixListener::bind(&bare).expect("the reference socket did not bind");
+
+    let path = socket_path("mode-umask");
+    let server = Server::new(ServerConfig { uds_mode: 0, ..ServerConfig::default() });
+    let socket = server.open(&Port::UDS(path.to_string_lossy().into_owned())).expect("the unix socket did not open");
+
+    assert_eq!(mode_of(&path), mode_of(&bare), "a mode of zero must leave the socket as the umask made it");
+
+    drop(socket);
+    drop(listener);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&bare);
 }

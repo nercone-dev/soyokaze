@@ -6,6 +6,11 @@ coroutine and the event loop is the one thing all of them share.
 """
 
 import asyncio
+import os
+import pathlib
+import socket
+import stat
+import tempfile
 
 import pytest
 
@@ -278,3 +283,57 @@ async def test_a_response_a_client_receives_names_no_access_source():
         response = await client.get(f"{origin}/")
 
         assert response.client is None, "a response names no access source"
+
+async def serve_uds(name, config=None):
+    """A server on a Unix socket of its own, and the path it listens at."""
+    path = pathlib.Path(tempfile.gettempdir(), f"soyokaze-{name}-{os.getpid()}.sock")
+    path.unlink(missing_ok=True)
+
+    server = Server(config)
+    handle = await server.serve(echo, [Port.UDS(path)])
+    return server, handle, path
+
+async def test_a_unix_socket_is_bound_at_the_default_mode():
+    server, handle, path = await serve_uds("default")
+    try:
+        assert server.uds_mode == 0o666, "a server must report the mode it binds a unix socket at"
+        assert stat.S_IMODE(path.stat().st_mode) == 0o666, "connecting asks for write permission, which every peer must have by default"
+
+        reader, writer = await asyncio.open_unix_connection(str(path))
+        writer.write(b"GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        await writer.drain()
+
+        response = await asyncio.wait_for(reader.read(), 5)
+        writer.close()
+
+        assert response.startswith(b"HTTP/1.1 200"), f"the socket must serve the request it was dialled with: {response[:32]!r}"
+        assert response.endswith(b"/hello")
+    finally:
+        await handle.close()
+        path.unlink(missing_ok=True)
+
+async def test_a_unix_socket_is_bound_at_the_configured_mode():
+    server, handle, path = await serve_uds("configured", ServerConfig(uds_mode=0o600))
+    try:
+        assert server.uds_mode == 0o600
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600, "a unix socket must be bound at the mode it was configured with"
+    finally:
+        await handle.close()
+        path.unlink(missing_ok=True)
+
+async def test_a_unix_socket_mode_of_zero_leaves_the_umask_its_say():
+    bare = pathlib.Path(tempfile.gettempdir(), f"soyokaze-bare-{os.getpid()}.sock")
+    bare.unlink(missing_ok=True)
+
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(bare))
+
+    server, handle, path = await serve_uds("umask", ServerConfig(uds_mode=0))
+    try:
+        assert server.uds_mode == 0
+        assert stat.S_IMODE(path.stat().st_mode) == stat.S_IMODE(bare.stat().st_mode), "a mode of zero must leave the socket as the umask made it"
+    finally:
+        await handle.close()
+        listener.close()
+        path.unlink(missing_ok=True)
+        bare.unlink(missing_ok=True)

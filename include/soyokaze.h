@@ -1026,6 +1026,7 @@ typedef struct {
     const soyokaze_ech_keys_t *ech;
     const soyokaze_hsts_policy_t *hsts;
     bool reuseport;
+    uint32_t uds_mode;                     /* a unix socket's mode; 0 leaves it to the umask */
 } soyokaze_server_config_t;
 
 soyokaze_server_t *soyokaze_server_new(const soyokaze_server_config_t *config);
@@ -1050,6 +1051,7 @@ soyokaze_buffer_t soyokaze_server_handle_address_at(const soyokaze_server_handle
 size_t soyokaze_server_version_count(const soyokaze_server_t *server);
 int32_t soyokaze_server_version_at(const soyokaze_server_t *server, size_t index);
 bool soyokaze_server_reuseport(const soyokaze_server_t *server);
+uint32_t soyokaze_server_uds_mode(const soyokaze_server_t *server);
 /* The admission gate these limits describe, freed with soyokaze_gate_free. */
 soyokaze_gate_t *soyokaze_server_limits_gate(const soyokaze_server_limits_t *limits);
 

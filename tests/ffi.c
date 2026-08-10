@@ -234,6 +234,28 @@ static void check_compression(void) {
     soyokaze_message_free(message);
 }
 
+/* What a server makes of the config it is built from, which is also what says
+ * the struct the header describes is the one the library reads. */
+static void check_server_config(void) {
+    /* Connecting to a unix socket asks for write permission on it, so one is
+     * left reachable by a peer running as another user unless asked otherwise. */
+    soyokaze_server_t *server = soyokaze_server_new(NULL);
+    assert(server != NULL);
+    assert(soyokaze_server_uds_mode(server) == 0666);
+    assert(soyokaze_server_reuseport(server));
+    soyokaze_server_free(server);
+
+    soyokaze_server_config_t config = {0};
+    config.reuseport = false;
+    config.uds_mode = 0600;
+
+    soyokaze_server_t *restricted = soyokaze_server_new(&config);
+    assert(restricted != NULL);
+    assert(soyokaze_server_uds_mode(restricted) == 0600);
+    assert(!soyokaze_server_reuseport(restricted));
+    soyokaze_server_free(restricted);
+}
+
 int main(void) {
     soyokaze_slice_t crate = soyokaze_version();
     printf("soyokaze %.*s\n", (int)crate.len, crate.data);
@@ -242,6 +264,7 @@ int main(void) {
     check_url();
     check_null_handles();
     check_layouts();
+    check_server_config();
     check_codecs();
     check_compression();
 
