@@ -1,13 +1,11 @@
 # Rust
 target/
-Cargo.lock
 
 # Python
 __pycache__/
 .pytest_cache/
 .venv/
 *.egg-info/
-uv.lock
 
 # macOS
 .DS_Store
