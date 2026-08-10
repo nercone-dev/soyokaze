@@ -214,7 +214,7 @@ jobs:
       security-events: write
 
   update:
-    needs: [test, test-ffi, test-python, test-doc, osv-scanner]
+    needs: [test, test-ffi, test-python, test-doc]
     name: Update
     runs-on: ubuntu-latest
     permissions:
