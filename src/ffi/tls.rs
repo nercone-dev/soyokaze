@@ -625,6 +625,9 @@ pub extern "C" fn soyokaze_ech_maximum_name_length() -> u8 {
 /// A server publishes this in DNS; a client hands it back through
 /// `soyokaze_client_config_t`.
 ///
+/// An empty buffer comes back when the name or the key is longer than its
+/// length prefix can describe, or the name is not UTF-8.
+///
 /// # Safety
 ///
 /// `public_key` must either be null or point to `public_key_len` readable
@@ -636,7 +639,11 @@ pub unsafe extern "C" fn soyokaze_ech_keys_encode(public_name: *const u8, public
     };
 
     let public_key = unsafe { Slice::borrow(public_key, public_key_len) }.unwrap_or_default();
-    Buffer::new(ECHKeys::encode(public_name, config_id, public_key))
+
+    match ECHKeys::encode(public_name, config_id, public_key) {
+        Ok(config) => Buffer::new(config),
+        Err(_) => Buffer::EMPTY,
+    }
 }
 
 /// How many certificates the identity's chain holds, or `-1` when it will not

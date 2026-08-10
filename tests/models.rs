@@ -566,3 +566,92 @@ fn no_role_is_both_ends_of_an_exchange() {
     assert!(Role::Origin.is_server() && Role::Gateway.is_server());
     assert!(!Role::Tunnel.is_client() && !Role::Tunnel.is_server(), "a tunnel reads no messages to pipeline");
 }
+
+// ---------------------------------------------------------------- conformance
+
+#[test]
+fn a_url_refuses_a_target_that_would_write_a_second_request_line() {
+    for text in [
+        "http://good.test/ HTTP/1.1\r\nX-Injected: yes\r\n\r\nGET /admin",
+        "http://good.test/a b",
+        "http://good.test/a\rb",
+        "http://good.test/a\nb",
+    ] {
+        assert!(
+            matches!(URL::parse(text), Err(Error::Protocol(_))),
+            "a URL whose target carries whitespace or a control octet must not parse: {text:?}"
+        );
+    }
+}
+
+#[test]
+fn a_url_refuses_a_host_that_would_break_out_of_the_authority() {
+    for text in ["http://a b/", "http://a\rb/", "http://a\nb/", "http://a\0b/"] {
+        assert!(matches!(URL::parse(text), Err(Error::Protocol(_))), "a malformed host must not parse: {text:?}");
+    }
+}
+
+#[test]
+fn an_ipv6_authority_must_be_bracketed() {
+    let url = URL::parse("http://[::1]:8080/").expect("a bracketed IPv6 authority did not parse");
+    assert_eq!(url.host, "::1");
+    assert_eq!(url.port, 8080);
+
+    assert!(
+        matches!(URL::parse("http://::1/"), Err(Error::Protocol(_))),
+        "an unbracketed IPv6 literal is not an authority, and must not be read as a host and a port"
+    );
+
+    assert!(
+        matches!(URL::parse("http://[not hex]/"), Err(Error::Protocol(_))),
+        "a bracketed authority that is not an IPv6 literal must not parse"
+    );
+}
+
+#[test]
+fn target_and_authority_are_told_apart_by_what_they_admit() {
+    assert!(URL::is_target("/a?b#c"));
+    assert!(!URL::is_target(""), "a target is never empty");
+    assert!(!URL::is_target("/a b"));
+
+    assert!(URL::is_authority("[::1]:8443"), "an authority wears its brackets and its port");
+    assert!(!URL::is_authority("a b"));
+    assert!(!URL::is_host("[::1]"), "a host is the literal without them");
+}
+
+#[test]
+fn a_field_section_keeps_its_lookups_honest_whatever_case_a_name_arrived_in() {
+    let fields = vec![
+        soyokaze::helpers::fields::HeaderField::new("Content-Length", "10"),
+        soyokaze::helpers::fields::HeaderField::new("X-Custom", "v"),
+    ];
+
+    let headers = Headers::from_fields(fields);
+
+    assert!(headers.contains("content-length"), "a field the section holds must be found");
+    assert_eq!(headers.get("content-length"), Some("10"));
+    assert_eq!(headers.get_all("content-length").collect::<Vec<_>>(), vec!["10"]);
+    assert_eq!(headers.iter().collect::<Vec<_>>(), vec![("content-length", "10"), ("x-custom", "v")]);
+}
+
+#[test]
+fn a_message_that_ends_at_its_field_section_says_so() {
+    for status_code in [100u16, 199, 204, 304] {
+        assert!(Message::response(status_code, Version::V1_1).bodyless(None), "a {status_code} carries no content");
+    }
+
+    assert!(
+        Message::response(200, Version::V1_1).bodyless(Some(Method::HEAD)),
+        "RFC 9112 6.3: a response to HEAD carries none either, however it is labelled"
+    );
+
+    assert!(!Message::response(200, Version::V1_1).bodyless(Some(Method::GET)));
+    assert!(!Message::request(Method::POST, "/", Version::V1_1).bodyless(None), "a request is never bodyless this way");
+}
+
+#[test]
+fn asking_for_more_room_than_a_section_could_hold_is_not_an_allocation() {
+    let headers = Headers::with_capacity(usize::MAX);
+
+    assert!(headers.is_empty(), "room is an optimisation, so an outsized ask is taken as the ceiling");
+}

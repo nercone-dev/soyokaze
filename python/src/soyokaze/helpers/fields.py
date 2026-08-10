@@ -118,6 +118,16 @@ class StringLiteral:
         return library.soyokaze_string_prefers_huffman(value, len(value))
 
     @classmethod
+    def max_prefix_bits(cls):
+        """The widest prefix a string literal can be written with.
+
+        The bit just above the prefix carries the Huffman mark, so an
+        eight-bit prefix would leave no room for it. Anything wider names no
+        representation, and the calls below refuse it.
+        """
+        return library.soyokaze_string_max_prefix_bits()
+
+    @classmethod
     def encode(cls, value, prefix_bits, flags=0, huffman=False):
         """Encodes a string literal with the coding ``huffman`` picks."""
         value = ffi.Library.encoded(value)

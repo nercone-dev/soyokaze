@@ -40,7 +40,7 @@ pub extern "C" fn soyokaze_read_buffer_new() -> *mut Buffer {
 /// octets at a time.
 #[unsafe(no_mangle)]
 pub extern "C" fn soyokaze_read_buffer_with_chunk_size(chunk_size: usize) -> *mut Buffer {
-    Box::into_raw(Box::new(Buffer::with_chunk_size(chunk_size)))
+    Box::into_raw(Box::new(Buffer::with_chunk_size(chunk_size.min(Buffer::MAXIMUM_CHUNK_SIZE))))
 }
 
 /// Releases a read buffer.
@@ -289,7 +289,9 @@ pub unsafe extern "C" fn soyokaze_fields_of_message(message: *const Message, out
 /// `fields` must either be null or be a handle that has not been freed, and
 /// `out` must either be null or be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_fields_to_message(fields: *const FieldSection, version: Version, out: *mut *mut Message, error: *mut *mut ErrorHandle) -> Status {
+pub unsafe extern "C" fn soyokaze_fields_to_message(fields: *const FieldSection, version: i32, out: *mut *mut Message, error: *mut *mut ErrorHandle) -> Status {
+    let version = Version::of(version);
+
     let Some(fields) = (unsafe { fields.as_ref() }) else {
         return unsafe { ErrorHandle::raise(error, Status::Invalid) };
     };

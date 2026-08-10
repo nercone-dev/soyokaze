@@ -17,7 +17,7 @@ use crate::helpers::fields::HeaderField;
 use crate::helpers::sync::Timeout;
 use crate::helpers::text::Text;
 use crate::helpers::{hpack, qpack};
-use crate::models::{Headers, Message, Method, Version};
+use crate::models::{Headers, Message, Method, URL, Version};
 
 pub use crate::errors::Error;
 
@@ -93,6 +93,13 @@ impl Buffer {
     pub const DEFAULT_CHUNK_SIZE: usize = 16 * 1024;
     /// How much smaller the first read is than a fully ramped-up one.
     pub const CHUNK_RAMP: usize = 8;
+    /// The most room one read is ever given.
+    ///
+    /// A read is sized rather than capped by this, so asking for more than the
+    /// machine could hand out is asking for an allocation it will refuse — and
+    /// a refused allocation ends the process rather than the read. Above this
+    /// the ask is taken as this.
+    pub const MAXIMUM_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 
     /// Whether a buffer has grown past `idle_capacity` and since emptied out
     /// enough to be worth rebuilding.
@@ -145,9 +152,9 @@ impl Buffer {
     /// over from a [`Buffer::CHUNK_RAMP`]th of it.
     ///
     /// A `chunk_size` of zero would ask for nothing at all, so one octet is the
-    /// floor.
+    /// floor, and [`Buffer::MAXIMUM_CHUNK_SIZE`] is the ceiling.
     pub fn set_chunk_size(&mut self, chunk_size: usize) {
-        self.chunk_size = chunk_size.max(1);
+        self.chunk_size = chunk_size.clamp(1, Self::MAXIMUM_CHUNK_SIZE);
         self.chunk = (self.chunk_size / Self::CHUNK_RAMP).max(1);
     }
 
@@ -288,9 +295,77 @@ impl Fields {
     /// connection itself is read.
     pub const CONNECTION_SPECIFIC: &[&str] = &["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"];
 
+    /// Fields that must never appear in a trailer section.
+    ///
+    /// RFC 9110 §6.5.1: a trailer arrives after the body, so a recipient has
+    /// already framed and routed the message by the time it is read. One that
+    /// changed either would let the two ends disagree about where the message
+    /// ended or where it was going, which is what a receiver merging trailers
+    /// into the field section would hand on.
+    pub const FORBIDDEN_TRAILERS: &[&str] = &["content-length", "expect", "host", "te", "trailer"];
+
     /// Whether a field name is one of [`Fields::CONNECTION_SPECIFIC`].
     pub fn connection_specific(name: &str) -> bool {
         matches!(name.len(), 7 | 10 | 16 | 17) && Self::CONNECTION_SPECIFIC.contains(&name)
+    }
+
+    /// Whether a field name may not appear in a trailer section.
+    ///
+    /// The [`Fields::FORBIDDEN_TRAILERS`] and the
+    /// [`Fields::CONNECTION_SPECIFIC`] ones alike, since neither belongs after
+    /// a body.
+    pub fn forbidden_trailer(name: &str) -> bool {
+        Self::connection_specific(name) || (matches!(name.len(), 2 | 4 | 6 | 7 | 14) && Self::FORBIDDEN_TRAILERS.contains(&name))
+    }
+
+    /// Checks one field of a section HTTP/2 or HTTP/3 delivered.
+    ///
+    /// RFC 9113 §8.2.1 and RFC 9114 §4.2: a name is a lowercase token and a
+    /// value carries no control octet and no surrounding whitespace. Both are
+    /// enforced here rather than left to whatever reads the section, because a
+    /// message framed over a binary version may be forwarded over HTTP/1.1,
+    /// where a CRLF in either would write a field of its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] naming which of the two was broken.
+    pub fn check(field: &HeaderField) -> Result<(), Error> {
+        if !HeaderField::is_lowercase_name(&field.name) {
+            return Err(Error::Protocol(format!("field name {:?} is not a lowercase token", field.name)));
+        }
+
+        if !HeaderField::is_value(&field.value) {
+            return Err(Error::Protocol(format!("field value of {:?} is not a field value", field.name)));
+        }
+
+        Ok(())
+    }
+
+    /// Turns a decoded trailer section into the [`Headers`] a message carries.
+    ///
+    /// The counterpart of [`Fields::into_message`] for the fields that follow
+    /// a body: the same octet rules apply, no pseudo-header may appear, and
+    /// nothing that frames or routes the message may either.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] as [`Fields::check`] does, when a
+    /// pseudo-header appears, and when the section carries a
+    /// [`Fields::forbidden_trailer`].
+    pub fn into_trailers(fields: Vec<HeaderField>) -> Result<Headers, Error> {
+        for field in &fields {
+            if field.name.starts_with(':') {
+                return Err(Error::Protocol("trailer section carries a pseudo-header".into()));
+            }
+
+            Self::check(field)?;
+
+            if Self::forbidden_trailer(&field.name) {
+                return Err(Error::Protocol(format!("field {:?} cannot appear in a trailer section", field.name)));
+            }
+        }
+
+        Ok(Headers::from_fields(fields))
     }
 
     /// A status code as the three digits `:status` carries.
@@ -308,7 +383,8 @@ impl Fields {
             b'0' + (status_code % 10) as u8,
         ];
 
-        Text::from_verified_ascii(&digits)
+        // SAFETY: three ASCII digits, since the status is in 100..1000.
+        unsafe { Text::from_verified_ascii(&digits) }
     }
 
     /// Turns a [`Message`] into the field list HTTP/2 and HTTP/3 frame.
@@ -351,11 +427,23 @@ impl Fields {
 
             let protocol = headers.and_then(|headers| headers.get(":protocol"));
             if method == Method::CONNECT && protocol.is_none() {
+                if !URL::is_authority(target) {
+                    return Err(Error::Protocol(format!("authority {target:?} is malformed")));
+                }
+
                 fields.push(HeaderField::new(":authority", target));
             } else {
+                if !URL::is_target(target) {
+                    return Err(Error::Protocol(format!("request target {target:?} is malformed")));
+                }
+
                 fields.push(HeaderField::new(":scheme", if message.security.secure { "https" } else { "http" }));
 
                 if let Some(authority) = headers.and_then(|headers| headers.get("host")) {
+                    if !URL::is_authority(authority) {
+                        return Err(Error::Protocol(format!("authority {authority:?} is malformed")));
+                    }
+
                     fields.push(HeaderField::new(":authority", authority));
                 }
 
@@ -376,6 +464,8 @@ impl Fields {
                 if field.name.starts_with(':') || field.name == "host" {
                     continue;
                 }
+
+                Self::check(field)?;
 
                 if Self::connection_specific(&field.name) {
                     return Err(Error::Protocol(format!("connection-specific field {:?} cannot be framed", field.name)));
@@ -408,13 +498,14 @@ impl Fields {
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] when the field list breaks any of the rules
-    /// both versions impose: an uppercase field name; a [`Fields::CONNECTION_SPECIFIC`]
-    /// field; a `TE` asking for anything but trailers; a pseudo-header after a
-    /// regular field, undefined, repeated, or belonging to the other kind of
-    /// message; a `:method` that is not recognised; a `:status` that is not
-    /// three digits; neither `:method` nor `:status`; a request without both a
-    /// scheme and a non-empty path; or a `CONNECT` carrying more than an
-    /// authority.
+    /// both versions impose: a field name or value [`Fields::check`] refuses; a
+    /// [`Fields::CONNECTION_SPECIFIC`] field; a `TE` asking for anything but
+    /// trailers; a pseudo-header after a regular field, undefined, repeated, or
+    /// belonging to the other kind of message; a `:method` that is not
+    /// recognised; a `:status` that is not three digits; a `:path` or
+    /// `:authority` that is malformed; neither `:method` nor `:status`; a
+    /// request without both a scheme and a non-empty path; or a `CONNECT`
+    /// carrying more than an authority.
     pub fn into_message(fields: Vec<HeaderField>, version: Version) -> Result<Message, Error> {
         // Seen-bits for each pseudo-header, so a repeat can be caught.
         const PSEUDO_METHOD: u8 = 1 << 0;
@@ -435,11 +526,9 @@ impl Fields {
         // as it stands: a decoded block already is what a section holds, so
         // rebuilding one field at a time would copy every field to no end.
         for field in &fields {
-            if field.name.bytes().any(|byte| byte.is_ascii_uppercase()) {
-                return Err(Error::Protocol(format!("field name {:?} is not lowercase", field.name)));
-            }
-
             if !field.name.starts_with(':') {
+                Self::check(field)?;
+
                 if Self::connection_specific(&field.name) {
                     return Err(Error::Protocol(format!("connection-specific field {:?} cannot be framed", field.name)));
                 }
@@ -454,6 +543,13 @@ impl Fields {
 
             if regular {
                 return Err(Error::Protocol(format!("pseudo-header {:?} follows a regular field", field.name)));
+            }
+
+            // A pseudo-header's name is matched exhaustively below, so only its
+            // value is left to hold to the same octet rules a regular field's
+            // is held to.
+            if !HeaderField::is_value(&field.value) {
+                return Err(Error::Protocol(format!("pseudo-header {:?} carries a malformed value", field.name)));
             }
 
             let pseudo = match field.name.as_str() {
@@ -484,8 +580,21 @@ impl Fields {
                     message.status_code = Some(status_code);
                 }
                 PSEUDO_SCHEME => message.security.secure = field.value == "https",
-                PSEUDO_AUTHORITY => authority = Some(field.value.clone()),
-                PSEUDO_PATH => path = Some(field.value.clone()),
+                PSEUDO_AUTHORITY => {
+                    if !URL::is_authority(&field.value) {
+                        return Err(Error::Protocol(format!("authority {:?} is malformed", field.value)));
+                    }
+                    authority = Some(field.value.clone());
+                }
+                PSEUDO_PATH => {
+                    // A path carrying a space or a CRLF would write a second
+                    // request line if this message were forwarded over
+                    // HTTP/1.1, so it is refused here rather than there.
+                    if !URL::is_target(&field.value) {
+                        return Err(Error::Protocol(format!("path {:?} is malformed", field.value)));
+                    }
+                    path = Some(field.value.clone());
+                }
                 _ => {}
             }
         }

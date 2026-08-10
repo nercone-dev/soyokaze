@@ -112,7 +112,7 @@ pub use frames::{Code, Frame, FrameType, Settings, StreamKind};
 use crate::helpers::compression::Compression;
 use crate::helpers::fields::HeaderField;
 use crate::helpers::qpack::{self, Decoder, Encoder, EncoderInstruction};
-use crate::models::{Body, ConnectionID, Headers, Limits, Message, Method, Role, StreamID, Version};
+use crate::models::{Body, ConnectionID, Limits, Message, Method, Role, StreamID, Version};
 use crate::tls::Security;
 use crate::protocol::base::{Connection, Stream};
 use crate::protocol::common::{self, Error};
@@ -417,10 +417,15 @@ impl H3Session {
         let accepted = message.is_response().then(|| self.streams.get(&stream_id)?.accepted).flatten();
         message.compress(accepted)?;
 
+        // A message that ends at its field section carries neither DATA nor a
+        // trailer section, whatever the caller attached: RFC 9112 §6.3 for the
+        // `HEAD` case, and the status itself for the rest.
+        let framed = !message.bodyless(self.streams.get(&stream_id).and_then(|state| state.method));
+
         let message = &*message;
         self.write_block(stream_id, FrameType::Headers, out, |fields| common::Fields::write(message, fields))?;
 
-        if let Some(body) = &message.body {
+        if let Some(body) = message.body.as_ref().filter(|_| framed) {
             let body = body
                 .inline()
                 .ok_or_else(|| Error::Protocol("a file body must be materialised before HTTP/3 encoding".into()))?;
@@ -429,7 +434,7 @@ impl H3Session {
             }
         }
 
-        if let Some(trailers) = message.trailers.as_ref().filter(|trailers| !trailers.is_empty()) {
+        if let Some(trailers) = message.trailers.as_ref().filter(|trailers| framed && !trailers.is_empty()) {
             self.write_block(stream_id, FrameType::Headers, out, |fields| {
                 fields.extend_from_slice(trailers.fields());
                 Ok(())
@@ -766,15 +771,14 @@ impl H3Session {
         let client = self.client;
         let state = self.streams.get_mut(&stream_id).ok_or(Error::Closed)?;
 
-        if let Some(message) = state.message.as_mut() {
-            let mut trailers = Headers::with_capacity(fields.len());
-            for field in fields {
-                if field.name.starts_with(':') {
-                    return Err(Error::stream(stream_id, Code::MESSAGE_ERROR, "trailer section carries a pseudo-header"));
-                }
-                trailers.append(field.name, field.value);
+        if state.message.is_some() {
+            let trailers = common::Fields::into_trailers(fields).map_err(|err| err.on_stream(stream_id, Code::MESSAGE_ERROR))?;
+            let state = self.streams.get_mut(&stream_id).ok_or(Error::Closed)?;
+
+            if let Some(message) = state.message.as_mut() {
+                message.trailers = Some(trailers);
             }
-            message.trailers = Some(trailers);
+
             return Ok(());
         }
 
@@ -840,6 +844,25 @@ pub enum H3Command {
     Reset(StreamID, u64),
     /// Close the QUIC connection.
     Close,
+}
+
+impl H3Command {
+    /// Whether carrying this command out adds to what is waiting to be sent.
+    ///
+    /// A worker runs inside QUIC callbacks and cannot await the credit to send
+    /// with, the way [`H2Connection::write_data`] does, so what it frames has
+    /// to wait in [`H3Worker::outbound`] until the peer grants some. That is
+    /// what [`H3Worker::accepting_writes`] bounds — and it can only bound it by
+    /// holding these back, since running them is what makes the buffer grow.
+    ///
+    /// Everything else is run whatever the buffer holds: a reset and a close
+    /// are how a connection whose peer has stopped reading is wound down, and
+    /// holding those back would leave it with no way out.
+    ///
+    /// [`H2Connection::write_data`]: crate::protocol::h2::H2Connection::write_data
+    pub fn buffers(&self) -> bool {
+        matches!(self, Self::Send(_) | Self::WriteEncoder(_))
+    }
 }
 
 /// What an [`H3Worker`] reports back to its [`H3Connection`].
@@ -1931,7 +1954,7 @@ impl QUICApplication for H3Worker {
         let deadline = self.block_deadline();
 
         tokio::select! {
-            command = self.commands.recv(), if !self.orphaned => match command {
+            command = self.commands.recv(), if !self.orphaned && self.pending.is_none() => match command {
                 Some(command) => {
                     self.pending = Some(command);
                     Ok(())
@@ -1990,13 +2013,31 @@ impl QUICApplication for H3Worker {
             return Err(self.fail(error));
         }
 
-        if let Some(command) = self.pending.take()
-            && let Err(error) = self.execute(qconn, command)
-        {
-            return Err(self.fail(error));
+        // A command that frames octets is held until there is room for them,
+        // so that a peer granting no flow control credit cannot have every
+        // response it asked for buffered here. One that frees room is run
+        // whatever is waiting; see [`H3Command::buffers`].
+        if let Some(command) = self.pending.take() {
+            match command.buffers() && !self.accepting_writes() {
+                true => self.pending = Some(command),
+                false => {
+                    if let Err(error) = self.execute(qconn, command) {
+                        return Err(self.fail(error));
+                    }
+                }
+            }
         }
 
-        while let Ok(command) = self.commands.try_recv() {
+        while self.pending.is_none() {
+            let Ok(command) = self.commands.try_recv() else {
+                break;
+            };
+
+            if command.buffers() && !self.accepting_writes() {
+                self.pending = Some(command);
+                break;
+            }
+
             if let Err(error) = self.execute(qconn, command) {
                 return Err(self.fail(error));
             }

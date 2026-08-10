@@ -1129,13 +1129,30 @@ where
         Ok(())
     }
 
+    /// As much of a close reason as fits alongside its code.
+    ///
+    /// A close frame is a control frame, so the whole payload is held to
+    /// [`MAXIMUM_CONTROL_PAYLOAD`] and the code takes the first two octets of
+    /// it. The cut is made on a character boundary: RFC 6455 §5.5.1 requires
+    /// the reason to be valid UTF-8, and half a character is not.
+    pub fn reason(reason: &str) -> &str {
+        let room = MAXIMUM_CONTROL_PAYLOAD - size_of::<u16>();
+
+        let mut end = reason.len().min(room);
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+
+        &reason[..end]
+    }
+
     /// Closes the connection, running the closing handshake.
     ///
     /// Sends a close frame and then waits, for up to
     /// [`WebSocketLimits::ws_linger_timeout`], for the peer to echo one back,
     /// so both ends agree the exchange ended rather than the transport simply
-    /// vanishing. The reason is truncated to fit
-    /// [`MAXIMUM_CONTROL_PAYLOAD`].
+    /// vanishing. The reason is cut to what fits, per
+    /// [`WebSocketConnection::reason`].
     ///
     /// The transport is shut down either way, and failures are swallowed:
     /// there is nothing left to report them to.
@@ -1144,8 +1161,7 @@ where
             self.closing = true;
 
             let mut payload = code.code().to_be_bytes().to_vec();
-            payload.extend_from_slice(reason.as_bytes());
-            payload.truncate(MAXIMUM_CONTROL_PAYLOAD);
+            payload.extend_from_slice(Self::reason(reason).as_bytes());
 
             if self.send(Frame::new(Opcode::Close, payload)).await.is_err() {
                 let _ = self.transport.shutdown().await;

@@ -145,11 +145,23 @@ impl Gate {
     ///
     /// Without this, a flood from many addresses would grow the history
     /// without bound — the rate limiter itself becoming the way in.
+    ///
+    /// Whichever address connected longest ago goes first, so what is dropped
+    /// is what the rate limit had least left to say about. Taking whatever the
+    /// map happened to yield would let a flood evict the very addresses being
+    /// limited.
     pub fn bound_history(&self, state: &mut GateState, keep: std::net::IpAddr) {
         let cap = self.max_connection_history.max(self.max_connections as usize);
 
         while state.history.len() > cap {
-            let Some(victim) = state.history.keys().find(|address| **address != keep).copied() else {
+            let victim = state
+                .history
+                .iter()
+                .filter(|(address, _)| **address != keep)
+                .min_by_key(|(_, record)| record.front().copied())
+                .map(|(address, _)| *address);
+
+            let Some(victim) = victim else {
                 break;
             };
             state.history.remove(&victim);

@@ -1245,3 +1245,188 @@ async fn a_received_body_past_the_decoded_ceiling_is_refused() {
     let failure = client.receive().await.expect_err("a body past the ceiling was accepted");
     assert!(matches!(failure, Error::Limit(_)), "a body past the ceiling must be a limit failure, not {failure}");
 }
+
+// ---------------------------------------------------------------- conformance
+
+async fn answered(request: &str, mut response: Message) -> String {
+    let (mut client, server_pipe) = tokio::io::duplex(64 * 1024);
+    let mut server = H1Connection::new(server_pipe, Role::Origin, id(), limits());
+
+    client.write_all(request.as_bytes()).await.expect("the request did not send");
+    let _ = server.receive().await.expect("the request did not parse");
+
+    response.version = Version::V1_1;
+    server.send(response).await.expect("the response did not send");
+
+    let mut out = vec![0u8; 8192];
+    let read = tokio::time::timeout(std::time::Duration::from_millis(300), client.read(&mut out))
+        .await
+        .map(|read| read.expect("the response could not be read"))
+        .unwrap_or(0);
+
+    String::from_utf8_lossy(&out[..read]).into_owned()
+}
+
+#[tokio::test]
+async fn a_response_to_head_carries_no_body() {
+    let mut response = Message::response(200, Version::V1_1);
+    response.body = Some(Body::Text("BODY".repeat(8)));
+
+    let wire = answered("HEAD / HTTP/1.1\r\nHost: a\r\n\r\n", response).await;
+
+    assert!(!wire.contains("BODYBODY"), "RFC 9112 6.3: a response to HEAD ends at its field section");
+    assert!(wire.contains("Content-Length: 32"), "RFC 9110 9.3.2: it still carries the fields GET would have");
+}
+
+#[tokio::test]
+async fn a_bodyless_status_carries_no_body() {
+    for status_code in [204u16, 304] {
+        let mut response = Message::response(status_code, Version::V1_1);
+        response.body = Some(Body::Text("BODY".repeat(8)));
+
+        let wire = answered("GET / HTTP/1.1\r\nHost: a\r\n\r\n", response).await;
+
+        assert!(!wire.contains("BODYBODY"), "a {status_code} carries no content, so nothing may follow the blank line");
+        assert!(!wire.contains("Content-Length"), "a {status_code} frames no content either");
+    }
+}
+
+#[tokio::test]
+async fn a_bodyless_response_writes_no_chunks_either() {
+    let mut response = Message::response(204, Version::V1_1);
+    response.headers.get_or_insert_with(Headers::new).append("transfer-encoding", "chunked");
+    response.body = Some(Body::Text("BODY".repeat(8)));
+
+    let wire = answered("GET / HTTP/1.1\r\nHost: a\r\n\r\n", response).await;
+
+    assert!(!wire.contains("BODYBODY"), "a 204 carries no chunks");
+    assert!(!wire.contains("0\r\n\r\n"), "and no terminating chunk to end them with");
+}
+
+#[test]
+fn a_chunk_size_is_hexadecimal_digits_and_nothing_else() {
+    assert_eq!(h1::Chunk::size(b"a").expect("a hexadecimal size did not parse"), 10);
+    assert_eq!(h1::Chunk::size(b"00F").expect("a padded size did not parse"), 15);
+
+    for probe in [&b"+5"[..], b"-5", b" 5", b"5 ", b"5\t", b"0x5", b"", b"5;"] {
+        assert!(
+            h1::Chunk::size(probe).is_err(),
+            "RFC 9112 7.1: a chunk size is 1*HEXDIG, so {:?} names none",
+            String::from_utf8_lossy(probe)
+        );
+    }
+}
+
+#[test]
+fn a_chunk_size_line_refuses_a_signed_size() {
+    assert!(
+        h1::Chunk::parse_size(b"+5\r\nhello\r\n").is_err(),
+        "a size the next hop would refuse must be refused here, or one stream reads as two messages"
+    );
+
+    let (start, size) = h1::Chunk::parse_size(b"5;ext=1\r\nhello\r\n")
+        .expect("a chunk extension did not parse")
+        .expect("the size line had not arrived");
+
+    assert_eq!((start, size), (9, 5), "an extension is read past and discarded");
+}
+
+#[test]
+fn a_start_line_refuses_a_target_that_would_write_a_second_one() {
+    for target in ["/ HTTP/1.1\r\nX-Injected: yes\r\n\r\nGET /admin", "/a b", "/a\rb", "/a\nb", "/a\0b", ""] {
+        let message = Message::request(Method::GET, target, Version::V1_1);
+
+        assert!(
+            h1::StartLine::encode(&message).is_err(),
+            "a target of {target:?} must not reach the wire — a space or a CRLF in one frames a request of its own"
+        );
+    }
+}
+
+#[test]
+fn the_chunked_coding_may_not_be_applied_twice() {
+    let mut message = Message::request(Method::POST, "/", Version::V1_1);
+    let headers = message.headers.get_or_insert_with(Headers::new);
+    headers.append("transfer-encoding", "chunked");
+    headers.append("transfer-encoding", "chunked");
+
+    assert!(
+        matches!(BodyLength::of(&message, None), Err(Error::Protocol(_))),
+        "RFC 9112 6.1: a sender must not apply the chunked coding more than once"
+    );
+}
+
+#[test]
+fn a_coding_after_chunked_is_refused_on_a_response_too() {
+    let mut message = Message::response(200, Version::V1_1);
+    message.headers.get_or_insert_with(Headers::new).append("transfer-encoding", "chunked, gzip");
+
+    assert!(
+        matches!(BodyLength::of(&message, None), Err(Error::Protocol(_))),
+        "a body chunked and then coded again is framed by something this end cannot read"
+    );
+}
+
+#[tokio::test]
+async fn one_empty_line_before_a_request_line_is_ignored() {
+    let (mut client, server_pipe) = tokio::io::duplex(64 * 1024);
+    let mut server = H1Connection::new(server_pipe, Role::Origin, id(), limits());
+
+    client.write_all(b"\r\nGET /after HTTP/1.1\r\nHost: a\r\n\r\n").await.expect("the request did not send");
+
+    let request = server.receive().await.expect("RFC 9112 2.2: a server ignores an empty line before a request line");
+    assert_eq!(request.target.as_deref(), Some("/after"));
+}
+
+#[tokio::test]
+async fn a_continue_expectation_is_answered_before_the_content_is_read() {
+    let (mut client, server_pipe) = tokio::io::duplex(64 * 1024);
+    let mut server = H1Connection::new(server_pipe, Role::Origin, id(), limits());
+
+    // The head alone: the client is waiting to be told to go ahead.
+    client
+        .write_all(b"POST / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n")
+        .await
+        .expect("the head did not send");
+
+    let receiving = tokio::spawn(async move {
+        let request = server.receive().await.expect("the request did not arrive");
+        (request, server)
+    });
+
+    let mut out = vec![0u8; 128];
+    let read = tokio::time::timeout(std::time::Duration::from_millis(500), client.read(&mut out))
+        .await
+        .expect("RFC 9110 10.1.1: the expectation must be answered before the content arrives")
+        .expect("the interim response could not be read");
+
+    let interim = String::from_utf8_lossy(&out[..read]).into_owned();
+    assert!(interim.starts_with("HTTP/1.1 100 Continue\r\n"), "the answer is the interim status: {interim:?}");
+    assert!(interim.ends_with("\r\n\r\n"), "and carries nothing after its blank line: {interim:?}");
+
+    client.write_all(b"hello").await.expect("the content did not send");
+
+    let (request, _server) = receiving.await.expect("the receive task failed");
+    assert_eq!(request.body.and_then(|body| body.len()), Some(5));
+}
+
+#[test]
+fn an_expectation_is_read_across_repeats_and_lists() {
+    let mut headers = Headers::new();
+    headers.append("expect", "100-Continue");
+
+    assert!(h1::Expectation::requested(Some(&headers), Version::V1_1), "the token is matched ignoring case");
+    assert!(
+        !h1::Expectation::requested(Some(&headers), Version::V1_0),
+        "HTTP/1.0 has no interim response to build on, so the field is ignored there"
+    );
+
+    let mut listed = Headers::new();
+    listed.append("expect", "other, 100-continue");
+    assert!(h1::Expectation::requested(Some(&listed), Version::V1_1));
+
+    let mut unrelated = Headers::new();
+    unrelated.append("expect", "something-else");
+    assert!(!h1::Expectation::requested(Some(&unrelated), Version::V1_1));
+    assert!(!h1::Expectation::requested(None, Version::V1_1));
+}

@@ -622,16 +622,29 @@ async fn a_field_block_and_its_data_leave_in_one_write() {
     let (mut client_pipe, server_pipe) = tokio::io::duplex(256 * 1024);
     let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    client_pipe.write_all(h2::PREFACE).await.expect("the preface did not send");
+    // Only a client opens a stream, so the response below answers a request
+    // rather than originating one: RFC 9113 §5.1 leaves a server nothing to
+    // send HEADERS on until one has arrived.
+    let block = soyokaze::helpers::hpack::Encoder::new().encode(&[
+        HeaderField::new(":method", "GET"),
+        HeaderField::new(":scheme", "http"),
+        HeaderField::new(":path", "/"),
+    ]);
+
+    let mut opening = BytesMut::new();
+    opening.extend_from_slice(h2::PREFACE);
+    Frame::Settings { ack: false, params: Vec::new() }.encode_into(&mut opening);
+    Frame::Headers { stream_id: StreamID(1), end_stream: true, end_headers: true, block: block.into() }.encode_into(&mut opening);
+    client_pipe.write_all(&opening).await.expect("the request did not send");
 
     let transport = Counting { inner: server_pipe, writes: writes.clone() };
     let mut server = H2Connection::new(transport, Role::Origin, id(), limits());
 
-    server.start().await.expect("the opening settings did not send");
+    let request = server.receive().await.expect("the request did not arrive");
     writes.store(0, std::sync::atomic::Ordering::Relaxed);
 
     let mut response = Message::response(200, Version::V2_0);
-    response.stream_id = Some(StreamID(2));
+    response.stream_id = request.stream_id;
     response.body = Some(Body::Data(bytes::Bytes::from_static(b"hello")));
 
     server.send_message(response).await.expect("the response did not send");
@@ -643,6 +656,59 @@ async fn a_field_block_and_its_data_leave_in_one_write() {
     );
 
     drop(client_pipe);
+}
+
+#[tokio::test]
+async fn a_response_to_a_stream_the_peer_reset_does_not_resurrect_it() {
+    let (mut client_pipe, server_pipe) = tokio::io::duplex(256 * 1024);
+    let mut server = H2Connection::new(server_pipe, Role::Origin, id(), limits());
+
+    let mut encoder = soyokaze::helpers::hpack::Encoder::new();
+    let block = encoder.encode(&[
+        HeaderField::new(":method", "GET"),
+        HeaderField::new(":scheme", "http"),
+        HeaderField::new(":path", "/"),
+    ]);
+
+    let mut opening = BytesMut::new();
+    opening.extend_from_slice(h2::PREFACE);
+    Frame::Settings { ack: false, params: Vec::new() }.encode_into(&mut opening);
+
+    let rounds = 8u64;
+    for round in 0..rounds {
+        let stream_id = StreamID(round * 2 + 1);
+        Frame::Headers { stream_id, end_stream: true, end_headers: true, block: block.clone().into() }.encode_into(&mut opening);
+    }
+    for round in 0..rounds {
+        Frame::RstStream { stream_id: StreamID(round * 2 + 1), error_code: h2::Code::CANCEL }.encode_into(&mut opening);
+    }
+    client_pipe.write_all(&opening).await.expect("the requests did not send");
+
+    let mut requests = Vec::new();
+    for _ in 0..rounds {
+        requests.push(server.receive().await.expect("a request did not arrive"));
+    }
+
+    // Drain the resets, which is what a server that queues its work sees
+    // before it gets round to answering.
+    for _ in 0..rounds {
+        let _ = server.pump().await;
+    }
+
+    for request in requests {
+        let mut response = Message::response(200, Version::V2_0);
+        response.stream_id = request.stream_id;
+
+        let refused = server.send_message(response).await;
+        assert!(matches!(refused, Err(Error::Stream { .. })), "answering a reset stream must fail on that stream alone");
+    }
+
+    for round in 0..rounds {
+        assert!(
+            server.stream(StreamID(round * 2 + 1)).is_none(),
+            "a stream the peer reset must not come back when the answer to it does"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1091,4 +1157,185 @@ fn an_http_2_exchange_is_compressed_and_names_the_peer() {
     });
 
     cluster.close(Some(1.0));
+}
+
+// ---------------------------------------------------------------- conformance
+
+async fn h2_answered(method: &str, status_code: u16, attach: impl FnOnce(&mut Message)) -> Vec<u8> {
+    let (mut client_pipe, server_pipe) = tokio::io::duplex(256 * 1024);
+    let mut server = H2Connection::new(server_pipe, Role::Origin, id(), limits());
+
+    let block = soyokaze::helpers::hpack::Encoder::new().encode(&[
+        HeaderField::new(":method", method),
+        HeaderField::new(":scheme", "http"),
+        HeaderField::new(":path", "/"),
+    ]);
+
+    let mut opening = BytesMut::new();
+    opening.extend_from_slice(h2::PREFACE);
+    Frame::Settings { ack: false, params: Vec::new() }.encode_into(&mut opening);
+    Frame::Headers { stream_id: StreamID(1), end_stream: true, end_headers: true, block: block.into() }.encode_into(&mut opening);
+    client_pipe.write_all(&opening).await.expect("the request did not send");
+
+    let request = server.receive().await.expect("the request did not arrive");
+
+    let mut response = Message::response(status_code, Version::V2_0);
+    response.stream_id = request.stream_id;
+    attach(&mut response);
+    server.send(response).await.expect("the response did not send");
+
+    let mut out = vec![0u8; 65536];
+    let read = tokio::time::timeout(std::time::Duration::from_millis(300), tokio::io::AsyncReadExt::read(&mut client_pipe, &mut out))
+        .await
+        .map(|read| read.expect("the response could not be read"))
+        .unwrap_or(0);
+
+    out.truncate(read);
+    out
+}
+
+#[tokio::test]
+async fn a_message_that_ends_at_its_field_section_frames_no_data() {
+    for (method, status_code) in [("GET", 204u16), ("GET", 304), ("HEAD", 200)] {
+        let wire = h2_answered(method, status_code, |response| {
+            response.body = Some(Body::Data(bytes::Bytes::from_static(b"UNFRAMED-CONTENT")));
+        })
+        .await;
+
+        assert!(
+            !wire.windows(16).any(|window| window == b"UNFRAMED-CONTENT"),
+            "a {status_code} answering {method} carries no content, so no DATA frame may go out"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_message_that_ends_at_its_field_section_frames_no_trailers() {
+    let wire = h2_answered("HEAD", 200, |response| {
+        let mut trailers = Headers::new();
+        trailers.append("x-trailer", "UNFRAMED-TRAILER");
+        response.trailers = Some(trailers);
+    })
+    .await;
+
+    assert!(
+        !wire.windows(16).any(|window| window == b"UNFRAMED-TRAILER"),
+        "RFC 9112 6.3: a response to HEAD carries no trailer section either"
+    );
+}
+
+#[tokio::test]
+async fn nothing_may_come_between_a_field_block_and_its_continuation() {
+    let (mut client_pipe, server_pipe) = tokio::io::duplex(256 * 1024);
+    let mut server = H2Connection::new(server_pipe, Role::Origin, id(), limits());
+
+    let block = soyokaze::helpers::hpack::Encoder::new().encode(&[
+        HeaderField::new(":method", "GET"),
+        HeaderField::new(":scheme", "http"),
+        HeaderField::new(":path", "/"),
+    ]);
+    let (first, rest) = block.split_at(2);
+
+    let mut opening = BytesMut::new();
+    opening.extend_from_slice(h2::PREFACE);
+    Frame::Settings { ack: false, params: Vec::new() }.encode_into(&mut opening);
+    Frame::Headers { stream_id: StreamID(1), end_stream: true, end_headers: false, block: bytes::Bytes::copy_from_slice(first) }
+        .encode_into(&mut opening);
+
+    // A frame of a type this end does not know, slipped in mid-block.
+    opening.extend_from_slice(&[0, 0, 0, 0xfe, 0, 0, 0, 0, 0]);
+
+    Frame::Continuation { stream_id: StreamID(1), end_headers: true, block: bytes::Bytes::copy_from_slice(rest) }
+        .encode_into(&mut opening);
+    client_pipe.write_all(&opening).await.expect("the probe did not send");
+
+    assert!(
+        matches!(server.receive().await, Err(Error::Protocol(_))),
+        "RFC 9113 6.10: a frame of any other type between HEADERS and CONTINUATION is a connection error"
+    );
+}
+
+#[tokio::test]
+async fn a_trailer_section_may_not_frame_or_route_the_message() {
+    for (name, value) in [("content-length", "0"), ("transfer-encoding", "chunked"), ("host", "elsewhere.test"), ("te", "trailers")] {
+        let (mut client_pipe, server_pipe) = tokio::io::duplex(256 * 1024);
+        let mut server = H2Connection::new(server_pipe, Role::Origin, id(), limits());
+
+        let mut encoder = soyokaze::helpers::hpack::Encoder::new();
+        let head = encoder.encode(&[
+            HeaderField::new(":method", "POST"),
+            HeaderField::new(":scheme", "http"),
+            HeaderField::new(":path", "/"),
+        ]);
+        let trailers = encoder.encode(&[HeaderField::new(name, value)]);
+
+        let mut opening = BytesMut::new();
+        opening.extend_from_slice(h2::PREFACE);
+        Frame::Settings { ack: false, params: Vec::new() }.encode_into(&mut opening);
+        Frame::Headers { stream_id: StreamID(1), end_stream: false, end_headers: true, block: head.into() }.encode_into(&mut opening);
+        Frame::Data { stream_id: StreamID(1), end_stream: false, data: bytes::Bytes::from_static(b"x") }.encode_into(&mut opening);
+        Frame::Headers { stream_id: StreamID(1), end_stream: true, end_headers: true, block: trailers.into() }.encode_into(&mut opening);
+        client_pipe.write_all(&opening).await.expect("the probe did not send");
+
+        assert!(
+            server.receive().await.is_err(),
+            "RFC 9110 6.5.1: {name:?} arrives after the message has been framed and routed, so it may not appear in a trailer"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_field_a_binary_version_may_not_carry_is_refused() {
+    for (name, value) in [
+        ("x-evil", "a\r\nInjected: yes"),
+        ("bad name", "v"),
+        ("", "v"),
+        ("x", "\0nul"),
+        ("x", " leading"),
+        ("x", "trailing "),
+    ] {
+        let (mut client_pipe, server_pipe) = tokio::io::duplex(256 * 1024);
+        let mut server = H2Connection::new(server_pipe, Role::Origin, id(), limits());
+
+        let block = soyokaze::helpers::hpack::Encoder::new().encode(&[
+            HeaderField::new(":method", "GET"),
+            HeaderField::new(":scheme", "http"),
+            HeaderField::new(":path", "/"),
+            HeaderField::new(name, value),
+        ]);
+
+        let mut opening = BytesMut::new();
+        opening.extend_from_slice(h2::PREFACE);
+        Frame::Settings { ack: false, params: Vec::new() }.encode_into(&mut opening);
+        Frame::Headers { stream_id: StreamID(1), end_stream: true, end_headers: true, block: block.into() }.encode_into(&mut opening);
+        client_pipe.write_all(&opening).await.expect("the probe did not send");
+
+        assert!(
+            server.receive().await.is_err(),
+            "RFC 9113 8.2.1: a field of {name:?}: {value:?} is malformed and must be refused"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_path_that_would_write_a_second_request_line_is_refused() {
+    let (mut client_pipe, server_pipe) = tokio::io::duplex(256 * 1024);
+    let mut server = H2Connection::new(server_pipe, Role::Origin, id(), limits());
+
+    let block = soyokaze::helpers::hpack::Encoder::new().encode(&[
+        HeaderField::new(":method", "GET"),
+        HeaderField::new(":scheme", "http"),
+        HeaderField::new(":path", "/x HTTP/1.1\r\nX-Smuggled: 1\r\n\r\nGET /admin"),
+    ]);
+
+    let mut opening = BytesMut::new();
+    opening.extend_from_slice(h2::PREFACE);
+    Frame::Settings { ack: false, params: Vec::new() }.encode_into(&mut opening);
+    Frame::Headers { stream_id: StreamID(1), end_stream: true, end_headers: true, block: block.into() }.encode_into(&mut opening);
+    client_pipe.write_all(&opening).await.expect("the probe did not send");
+
+    assert!(
+        server.receive().await.is_err(),
+        "a path carrying a space or a CRLF would frame a request of its own if this message were forwarded over HTTP/1.1"
+    );
 }

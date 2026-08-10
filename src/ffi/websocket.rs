@@ -490,12 +490,12 @@ pub extern "C" fn soyokaze_websocket_nonce() -> Buffer {
 /// `host`, `target` and `key` must point to their stated number of readable
 /// octets.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_websocket_upgrade_request(host: *const u8, host_len: usize, target: *const u8, target_len: usize, key: *const u8, key_len: usize, version: crate::models::Version) -> *mut crate::models::Message {
+pub unsafe extern "C" fn soyokaze_websocket_upgrade_request(host: *const u8, host_len: usize, target: *const u8, target_len: usize, key: *const u8, key_len: usize, version: i32) -> *mut crate::models::Message {
     let (Some(host), Some(target), Some(key)) = (unsafe { Slice::borrow_text(host, host_len) }, unsafe { Slice::borrow_text(target, target_len) }, unsafe { Slice::borrow_text(key, key_len) }) else {
         return std::ptr::null_mut();
     };
 
-    Box::into_raw(Box::new(crate::websocket::Upgrade::request(host, target, key, version)))
+    Box::into_raw(Box::new(crate::websocket::Upgrade::request(host, target, key, crate::models::Version::of(version))))
 }
 
 /// The `101 Switching Protocols` that accepts an upgrade.
@@ -504,12 +504,12 @@ pub unsafe extern "C" fn soyokaze_websocket_upgrade_request(host: *const u8, hos
 ///
 /// `key` must point to `key_len` readable octets.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_websocket_upgrade_response(key: *const u8, key_len: usize, version: crate::models::Version) -> *mut crate::models::Message {
+pub unsafe extern "C" fn soyokaze_websocket_upgrade_response(key: *const u8, key_len: usize, version: i32) -> *mut crate::models::Message {
     let Some(key) = (unsafe { Slice::borrow_text(key, key_len) }) else {
         return std::ptr::null_mut();
     };
 
-    Box::into_raw(Box::new(crate::websocket::Upgrade::response(key, version)))
+    Box::into_raw(Box::new(crate::websocket::Upgrade::response(key, crate::models::Version::of(version))))
 }
 
 /// Checks an upgrade request, handing back the key it carried.
@@ -563,18 +563,18 @@ pub unsafe extern "C" fn soyokaze_websocket_verify_upgrade_response(response: *c
 /// `authority` and `target` must point to their stated number of readable
 /// octets.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_websocket_connect_request(authority: *const u8, authority_len: usize, target: *const u8, target_len: usize, version: crate::models::Version) -> *mut crate::models::Message {
+pub unsafe extern "C" fn soyokaze_websocket_connect_request(authority: *const u8, authority_len: usize, target: *const u8, target_len: usize, version: i32) -> *mut crate::models::Message {
     let (Some(authority), Some(target)) = (unsafe { Slice::borrow_text(authority, authority_len) }, unsafe { Slice::borrow_text(target, target_len) }) else {
         return std::ptr::null_mut();
     };
 
-    Box::into_raw(Box::new(crate::websocket::Connect::request(authority, target, version)))
+    Box::into_raw(Box::new(crate::websocket::Connect::request(authority, target, crate::models::Version::of(version))))
 }
 
 /// The `200 OK` that accepts an extended CONNECT.
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_websocket_connect_response(version: crate::models::Version) -> *mut crate::models::Message {
-    Box::into_raw(Box::new(crate::websocket::Connect::response(version)))
+pub extern "C" fn soyokaze_websocket_connect_response(version: i32) -> *mut crate::models::Message {
+    Box::into_raw(Box::new(crate::websocket::Connect::response(crate::models::Version::of(version))))
 }
 
 /// Checks an extended CONNECT request.
@@ -647,12 +647,12 @@ pub unsafe extern "C" fn soyokaze_websocket_verify(request: *const crate::models
 ///
 /// As [`soyokaze_websocket_requested`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_websocket_refusal(request: *const crate::models::Message, version: crate::models::Version) -> *mut crate::models::Message {
+pub unsafe extern "C" fn soyokaze_websocket_refusal(request: *const crate::models::Message, version: i32) -> *mut crate::models::Message {
     let Some(request) = (unsafe { request.as_ref() }) else {
         return std::ptr::null_mut();
     };
 
-    Box::into_raw(Box::new(crate::websocket::Handshake::refusal(request, version)))
+    Box::into_raw(Box::new(crate::websocket::Handshake::refusal(request, crate::models::Version::of(version))))
 }
 
 /// Whether a comma-separated field carries a token, matched

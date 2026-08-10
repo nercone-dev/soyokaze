@@ -123,3 +123,61 @@ fn errors_describe_themselves() {
     assert_eq!(Error::IntegerOverflow.to_string(), "integer representation overflowed");
     assert_eq!(Error::Incomplete.to_string(), "representation ends before the input does");
 }
+
+// ---------------------------------------------------------------- conformance
+
+#[test]
+fn a_field_name_is_a_non_empty_token() {
+    for name in ["content-length", "x-custom", "a!#$%&'*+-.^_`|~9"] {
+        assert!(HeaderField::is_name(name), "{name:?} is a token");
+    }
+
+    for name in ["", "bad name", "a:b", "a\r\nb", "a\0b", "a(b", "a@b", "a\u{7f}b"] {
+        assert!(!HeaderField::is_name(name), "RFC 9110 5.6.2: {name:?} is not a token, so it is not a field name");
+    }
+
+    assert!(HeaderField::is_lowercase_name("x-custom"));
+    assert!(!HeaderField::is_lowercase_name("X-Custom"), "RFC 9113 8.2.1 and RFC 9114 4.2 want a lowercase name");
+}
+
+#[test]
+fn a_field_value_carries_no_control_octet_and_no_surrounding_space() {
+    for value in ["", "plain", "a\tb", "a b", "caf\u{e9}"] {
+        assert!(HeaderField::is_value(value), "{value:?} is a field value");
+    }
+
+    for value in ["a\r\nb", "a\rb", "a\nb", "a\0b", "a\u{7f}b", " leading", "trailing ", "\ttab", "tab\t"] {
+        assert!(!HeaderField::is_value(value), "RFC 9110 5.5: {value:?} is not a field value");
+    }
+}
+
+#[test]
+fn a_string_literal_leaves_room_for_its_huffman_mark() {
+    let max = StringLiteral::MAX_PREFIX_BITS;
+    assert_eq!(max, 7, "the mark sits just above the prefix, so eight bits would push it out of the octet");
+
+    for prefix_bits in [0u8, 1, 7] {
+        assert_eq!(StringLiteral::huffman_mark(prefix_bits), 1 << prefix_bits);
+    }
+
+    for prefix_bits in [8u8, 63, 200, 255] {
+        assert_eq!(
+            StringLiteral::huffman_mark(prefix_bits),
+            1 << max,
+            "a prefix wider than {max} is read as {max} rather than shifting the mark out of the octet"
+        );
+    }
+}
+
+#[test]
+fn a_prefix_no_representation_uses_never_takes_the_process_with_it() {
+    let mut out = Vec::new();
+    StringLiteral::encode(&mut out, b"hello", 8, 0x00, true);
+    assert!(!out.is_empty(), "an over-wide prefix must be read as the widest one, not overflow a shift");
+
+    let mut scratch = Vec::new();
+    for prefix_bits in [8u8, 64, 255] {
+        let _ = StringLiteral::decode_into_ascii(&out, prefix_bits, &mut scratch);
+        let _ = StringLiteral::decode_into_ascii(&[0x05, b'a'], prefix_bits, &mut scratch);
+    }
+}

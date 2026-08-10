@@ -115,7 +115,7 @@ pub unsafe extern "C" fn soyokaze_text_copy_inline(data: *const u8, data_len: us
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_text_from_verified_ascii(data: *const u8, data_len: usize) -> *mut Text {
     let data = unsafe { Slice::borrow(data, data_len) }.unwrap_or_default();
-    Box::into_raw(Box::new(Text::from_verified_ascii(data)))
+    Box::into_raw(Box::new(unsafe { Text::from_verified_ascii(data) }))
 }
 
 /// As [`soyokaze_text_from_verified_ascii`], lowercasing as it goes.
@@ -126,7 +126,7 @@ pub unsafe extern "C" fn soyokaze_text_from_verified_ascii(data: *const u8, data
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_text_from_verified_ascii_lowercase(data: *const u8, data_len: usize) -> *mut Text {
     let data = unsafe { Slice::borrow(data, data_len) }.unwrap_or_default();
-    Box::into_raw(Box::new(Text::from_verified_ascii_lowercase(data)))
+    Box::into_raw(Box::new(unsafe { Text::from_verified_ascii_lowercase(data) }))
 }
 
 /// Releases a [`Text`].

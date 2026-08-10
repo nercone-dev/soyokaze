@@ -62,6 +62,35 @@ pub struct CallbackHandler {
 unsafe impl Send for CallbackHandler {}
 unsafe impl Sync for CallbackHandler {}
 
+/// A [`Message`] handle a callback handed back, owned until it is taken.
+///
+/// The callback runs on a blocking thread, which nothing can cancel, so the
+/// task that waits for it may be dropped while it is still running — when a
+/// server is wound down under a deadline, most of all. What the callback
+/// returned would then be a pointer nobody holds; wrapping it in something
+/// that frees on drop is what makes the response go with the wait.
+pub struct Answered(pub *mut Message);
+
+unsafe impl Send for Answered {}
+
+impl Answered {
+    /// Takes the message out, leaving nothing to free.
+    pub fn take(mut self) -> Option<Message> {
+        let handle = std::ptr::NonNull::new(self.0)?;
+        self.0 = std::ptr::null_mut();
+
+        Some(*unsafe { Box::from_raw(handle.as_ptr()) })
+    }
+}
+
+impl Drop for Answered {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            drop(unsafe { Box::from_raw(self.0) });
+        }
+    }
+}
+
 impl CallbackHandler {
     pub async fn answer(&self, request: Message, version: Version) -> Message {
         let stream_id = request.stream_id;
@@ -71,12 +100,12 @@ impl CallbackHandler {
 
         let answered = tokio::task::spawn_blocking(move || {
             let (context, request) = (context, request);
-            SendPtr(callback(context.0, request.0))
+            Answered(callback(context.0, request.0))
         })
         .await;
 
-        let mut response = match answered.ok().and_then(|response| std::ptr::NonNull::new(response.0)) {
-            Some(response) => *unsafe { Box::from_raw(response.as_ptr()) },
+        let mut response = match answered.ok().and_then(Answered::take) {
+            Some(response) => response,
             None => Message::response(500, version),
         };
 

@@ -221,6 +221,47 @@ impl DynamicTable {
         field.size() <= self.capacity
     }
 
+    /// The absolute index of the oldest entry still held.
+    ///
+    /// Entries are evicted from the far end, so this is what the next eviction
+    /// would take.
+    pub fn oldest(&self) -> u64 {
+        self.inserted_count - self.entries.len() as u64
+    }
+
+    /// Whether a field can be inserted without evicting anything at or above
+    /// `floor`.
+    ///
+    /// RFC 9204 §2.1.1.1: an encoder must not evict an entry a field block it
+    /// has already sent still references, since the peer's decoder evicts on
+    /// the same schedule and would be left unable to resolve it. `floor` is
+    /// the lowest absolute index any unacknowledged section names; pass
+    /// [`u64::MAX`] where none does.
+    pub fn admits(&self, field: &HeaderField, floor: u64) -> bool {
+        if !self.fits(field) {
+            return false;
+        }
+
+        let size = field.size();
+        let mut held = self.size;
+
+        // The entries are walked from the far end, which is the order they
+        // would be evicted in, so the absolute index climbs from the oldest.
+        for (absolute, entry) in (self.oldest()..).zip(self.entries.iter().rev()) {
+            if held + size <= self.capacity {
+                break;
+            }
+
+            if absolute >= floor {
+                return false;
+            }
+
+            held -= entry.size();
+        }
+
+        held + size <= self.capacity
+    }
+
     /// The entry at an absolute index, or `None` when it has been evicted or
     /// was never inserted.
     pub fn get(&self, absolute_index: u64) -> Option<&HeaderField> {
@@ -670,6 +711,23 @@ impl Prefix {
     }
 }
 
+/// One field section an [`Encoder`] has sent and is still waiting on.
+///
+/// What is kept is what the table may not forget while the section is in
+/// flight: the entries it names run from [`Section::floor`] up to, but not
+/// including, [`Section::required`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Section {
+    /// The stream the section went out on, which is what acknowledges it.
+    pub stream_id: u64,
+    /// The insert count the peer's decoder needs before it can read the
+    /// section.
+    pub required: u64,
+    /// The lowest absolute index the section names, or [`u64::MAX`] when it
+    /// names no dynamic entry.
+    pub floor: u64,
+}
+
 /// The sending half of one direction of a connection.
 ///
 /// The encoder only references dynamic entries the peer has acknowledged, so
@@ -684,7 +742,8 @@ pub struct Encoder {
     capacity_limit: usize,
     max_outstanding_sections: usize,
     max_instruction_size: usize,
-    sections: VecDeque<(u64, u64)>,
+    sections: VecDeque<Section>,
+    section_floor: u64,
     idle_capacity: usize,
     stream_out: Vec<u8>,
     stream_recv: BytesMut,
@@ -717,6 +776,7 @@ impl Encoder {
             idle_capacity: Self::DEFAULT_IDLE_CAPACITY,
             max_instruction_size: Self::DEFAULT_MAX_INSTRUCTION_SIZE,
             sections: VecDeque::new(),
+            section_floor: u64::MAX,
             stream_out: Vec::new(),
             stream_recv: BytesMut::new(),
             matches: Vec::new(),
@@ -835,6 +895,12 @@ impl Encoder {
         let mut required = 0;
         let tracked = self.sections.len() < self.max_outstanding_sections;
 
+        // The block being built is not yet a section the peer knows about, so
+        // it is tracked here for the length of the loop: an insertion made
+        // further down it must not evict an entry a field further up already
+        // referenced.
+        self.section_floor = u64::MAX;
+
         for field in headers {
             let in_static = StaticTable::find(field);
 
@@ -855,12 +921,16 @@ impl Encoder {
                 }
             };
 
-            if tracked && !indexed && !field.sensitive() {
-                self.insert(field, matched);
-            }
-
+            // The reference is recorded before anything is inserted, so that
+            // the insertion below sees this field's entry as one it may not
+            // evict.
             if let Some((false, absolute, _)) = matched {
                 required = required.max(absolute.saturating_add(1));
+                self.section_floor = self.section_floor.min(absolute);
+            }
+
+            if tracked && !indexed && !field.sensitive() {
+                self.insert(field, matched);
             }
 
             matches.push(matched);
@@ -875,10 +945,20 @@ impl Encoder {
         }
 
         if required > 0 {
-            self.sections.push_back((stream_id, required));
+            self.sections.push_back(Section { stream_id, required, floor: self.section_floor });
         }
 
+        self.section_floor = u64::MAX;
         self.matches = matches;
+    }
+
+    /// The lowest absolute index any section still in flight names.
+    ///
+    /// [`u64::MAX`] when none does, which is what leaves the table free to
+    /// evict whatever it needs to. Entries at or above this may not be
+    /// evicted; see [`DynamicTable::admits`].
+    pub fn referenced(&self) -> u64 {
+        self.sections.iter().map(|section| section.floor).min().unwrap_or(u64::MAX).min(self.section_floor)
     }
 
     /// Picks the reference to use for a field.
@@ -909,9 +989,11 @@ impl Encoder {
     /// peer to do the same, straight onto the encoder stream.
     ///
     /// `false` when the field could never fit in the table as it is sized now,
-    /// in which case nothing is queued.
+    /// or when making room for it would evict an entry a section still in
+    /// flight names — see [`Encoder::referenced`]. Nothing is queued either
+    /// way, and the field goes out as a literal instead.
     pub fn insert(&mut self, field: &HeaderField, matched: Option<(bool, u64, bool)>) -> bool {
-        if !self.dynamic_table.fits(field) {
+        if !self.dynamic_table.admits(field, self.referenced()) {
             return false;
         }
 
@@ -973,10 +1055,10 @@ impl Encoder {
     pub fn on_decoder_instruction(&mut self, instruction: DecoderInstruction) {
         match instruction {
             DecoderInstruction::SectionAcknowledgment { stream_id } => {
-                if let Some(offset) = self.sections.iter().position(|(id, _)| *id == stream_id)
-                    && let Some((_, required)) = self.sections.remove(offset)
+                if let Some(offset) = self.sections.iter().position(|section| section.stream_id == stream_id)
+                    && let Some(section) = self.sections.remove(offset)
                 {
-                    self.known_received_count = self.known_received_count.max(required);
+                    self.known_received_count = self.known_received_count.max(section.required);
                 }
             }
 
@@ -990,7 +1072,7 @@ impl Encoder {
 
     /// Forgets the sections on a stream that will never be acknowledged.
     pub fn cancel(&mut self, stream_id: u64) {
-        self.sections.retain(|(id, _)| *id != stream_id);
+        self.sections.retain(|section| section.stream_id != stream_id);
     }
 
     /// How many sections are still waiting to be acknowledged.

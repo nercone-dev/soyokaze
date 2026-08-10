@@ -85,6 +85,70 @@ impl HeaderField {
     pub fn sensitive(&self) -> bool {
         matches!(self.name.len(), 6 | 10 | 13 | 19) && Self::SENSITIVE.contains(&self.name.as_str())
     }
+
+    /// [`HeaderField::TOKENS`]: the octet may appear in a token, and so in a
+    /// field name.
+    pub const TOKEN: u8 = 1 << 0;
+
+    /// Which octets may appear in a field name.
+    ///
+    /// `token` of RFC 9110 §5.6.2, which is the same set every version admits.
+    /// This is the field vocabulary's own table; [`h1::Octets::TABLE`] is the
+    /// HTTP/1 line scanner's, which carries the classes a start line needs as
+    /// well.
+    ///
+    /// [`h1::Octets::TABLE`]: crate::protocol::h1::Octets::TABLE
+    pub const TOKENS: &'static [u8; 256] = &{
+        let mut octets = [0u8; 256];
+        let mut value = 0usize;
+
+        while value < 256 {
+            let byte = value as u8;
+
+            let token = byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+                );
+
+            octets[value] = token as u8;
+            value += 1;
+        }
+
+        octets
+    };
+
+    /// Whether a field name may be sent or accepted.
+    ///
+    /// A name is a non-empty token. RFC 9113 §8.2.1 and RFC 9114 §4.2 add that
+    /// it must be lowercase, which [`HeaderField::is_lowercase_name`] asks;
+    /// this is the part every version shares.
+    #[inline]
+    pub fn is_name(name: &str) -> bool {
+        !name.is_empty() && crate::helpers::scan::all_in_class(name.as_bytes(), Self::TOKENS, Self::TOKEN)
+    }
+
+    /// [`HeaderField::is_name`], and lowercase as the binary versions require.
+    #[inline]
+    pub fn is_lowercase_name(name: &str) -> bool {
+        Self::is_name(name) && !name.bytes().any(|byte| byte.is_ascii_uppercase())
+    }
+
+    /// Whether a field value may be sent or accepted.
+    ///
+    /// `field-value` of RFC 9110 §5.5: no control octet other than a tab, and
+    /// no leading or trailing whitespace, which a receiver would strip and so
+    /// could read two ways.
+    #[inline]
+    pub fn is_value(value: &str) -> bool {
+        let octets = value.as_bytes();
+
+        if matches!(octets.first(), Some(b' ' | b'\t')) || matches!(octets.last(), Some(b' ' | b'\t')) {
+            return false;
+        }
+
+        crate::helpers::scan::is_field_value(octets)
+    }
 }
 
 /// An FNV-1a hasher for the short keys a field index is built on.
@@ -281,14 +345,34 @@ impl Integer {
 pub struct StringLiteral;
 
 impl StringLiteral {
+    /// The widest prefix a string literal can be written with.
+    ///
+    /// The bit just above the prefix carries the Huffman mark, so an eight-bit
+    /// prefix would leave no room for it. Both formats stay at or under this;
+    /// a wider `prefix_bits` is read as this one rather than shifting the mark
+    /// out of the octet.
+    pub const MAX_PREFIX_BITS: u8 = 7;
+
+    /// The mark that says a string is Huffman coded, for a prefix of
+    /// `prefix_bits`.
+    ///
+    /// Held to [`StringLiteral::MAX_PREFIX_BITS`], so this is always a bit of
+    /// the octet rather than an overflowing shift.
+    #[inline]
+    pub fn huffman_mark(prefix_bits: u8) -> u8 {
+        1u8 << prefix_bits.min(Self::MAX_PREFIX_BITS)
+    }
+
     /// Writes a string, Huffman coded or not as asked.
     ///
     /// Use [`StringLiteral::encode_shorter`] to have the shorter of the two
     /// chosen for you.
     pub fn encode(out: &mut Vec<u8>, value: &[u8], prefix_bits: u8, flags: u8, huffman: bool) {
+        let prefix_bits = prefix_bits.min(Self::MAX_PREFIX_BITS);
+
         if huffman {
             let encoded = huffman::encoded_len(value);
-            Integer::encode(out, encoded as u64, prefix_bits, flags | 1 << prefix_bits);
+            Integer::encode(out, encoded as u64, prefix_bits, flags | Self::huffman_mark(prefix_bits));
             huffman::encode_sized(value, encoded, out);
         } else {
             Integer::encode(out, value.len() as u64, prefix_bits, flags);
@@ -302,10 +386,11 @@ impl StringLiteral {
     /// again through [`StringLiteral::prefers_huffman`], since this is on the
     /// path every field goes down.
     pub fn encode_shorter(out: &mut Vec<u8>, value: &[u8], prefix_bits: u8, flags: u8) {
+        let prefix_bits = prefix_bits.min(Self::MAX_PREFIX_BITS);
         let encoded = huffman::encoded_len(value);
 
         if encoded < value.len() {
-            Integer::encode(out, encoded as u64, prefix_bits, flags | 1 << prefix_bits);
+            Integer::encode(out, encoded as u64, prefix_bits, flags | Self::huffman_mark(prefix_bits));
             huffman::encode_sized(value, encoded, out);
         } else {
             Integer::encode(out, value.len() as u64, prefix_bits, flags);
@@ -349,7 +434,8 @@ impl StringLiteral {
     /// input, [`Error::Huffman`] when a Huffman coded string will not decode,
     /// and otherwise as [`Integer::decode`].
     pub fn decode_into_ascii(input: &[u8], prefix_bits: u8, scratch: &mut Vec<u8>) -> Result<(usize, bool), Error> {
-        let huffman = input.first().ok_or(Error::Incomplete)? & 1 << prefix_bits != 0;
+        let prefix_bits = prefix_bits.min(Self::MAX_PREFIX_BITS);
+        let huffman = input.first().ok_or(Error::Incomplete)? & Self::huffman_mark(prefix_bits) != 0;
         let (prefix, length) = Integer::decode(input, prefix_bits)?;
 
         let length = length as usize;
@@ -390,10 +476,15 @@ impl StringLiteral {
 
     /// Builds a [`Text`] from decoded octets, skipping validation when the
     /// decoder already established they are ASCII.
+    ///
+    /// `ascii` comes from [`StringLiteral::decode_into_ascii`], which classifies
+    /// the octets as it decodes them, so a caller passing what that returned is
+    /// always right about them.
     #[inline]
     pub fn text(octets: &[u8], ascii: bool) -> Text {
         match ascii {
-            true => Text::from_verified_ascii(octets),
+            // SAFETY: `ascii` says the decoder saw no octet at or above 0x80.
+            true => unsafe { Text::from_verified_ascii(octets) },
             false => Text::from_utf8_lossy(octets),
         }
     }

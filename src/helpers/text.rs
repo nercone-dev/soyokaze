@@ -151,17 +151,19 @@ impl Text {
     /// This is the constructor the parsers use after
     /// [`scan::classify_field_value`] has already established that a field
     /// value carries no octet at or above `0x80`, so paying for a second pass
-    /// would be waste.
+    /// would be waste. Use [`Text::from_ascii`] wherever the input has not
+    /// already been classified — it costs one pass and cannot be misused.
     ///
-    /// The caller must have established that `octets` is ASCII. Passing
-    /// anything else produces a [`Text`] that is not valid UTF-8, and reading
-    /// it back through [`Text::as_str`] is undefined behaviour. Debug builds
-    /// assert; release builds do not check. Use [`Text::from_ascii`] wherever
-    /// the input has not already been classified.
+    /// # Safety
+    ///
+    /// Every octet of `octets` must be ASCII. Anything else produces a
+    /// [`Text`] that is not valid UTF-8, and reading it back through
+    /// [`Text::as_str`] is undefined behaviour. Debug builds assert; release
+    /// builds do not check.
     ///
     /// [`scan::classify_field_value`]: crate::helpers::scan::classify_field_value
     #[inline]
-    pub fn from_verified_ascii(octets: &[u8]) -> Self {
+    pub unsafe fn from_verified_ascii(octets: &[u8]) -> Self {
         debug_assert!(octets.is_ascii(), "{:?} is not ASCII", String::from_utf8_lossy(octets));
 
         if octets.len() <= INLINE {
@@ -176,10 +178,11 @@ impl Text {
     /// This is what field names go through, since a name is a token and so is
     /// ASCII by the time it has been parsed.
     ///
-    /// The same precondition applies: the caller must have established that
-    /// `octets` is ASCII, and passing anything else is undefined behaviour.
+    /// # Safety
+    ///
+    /// As [`Text::from_verified_ascii`].
     #[inline]
-    pub fn from_verified_ascii_lowercase(octets: &[u8]) -> Self {
+    pub unsafe fn from_verified_ascii_lowercase(octets: &[u8]) -> Self {
         debug_assert!(octets.is_ascii(), "{:?} is not ASCII", String::from_utf8_lossy(octets));
 
         if octets.len() <= INLINE {

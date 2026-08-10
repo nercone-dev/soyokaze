@@ -731,3 +731,89 @@ fn an_unacknowledged_entry_is_not_inserted_again() {
     let (decoded, _) = decoder.decode(4, &second).expect("the second section did not decode");
     assert_eq!(decoded, fields);
 }
+
+// ---------------------------------------------------------------- conformance
+
+#[test]
+fn a_table_will_not_evict_an_entry_a_section_still_names() {
+    let mut table = DynamicTable::new(2 * (HeaderField::OVERHEAD + 2));
+    table.insert(field("a", "1"));
+    table.insert(field("b", "2"));
+
+    assert_eq!(table.oldest(), 0, "the oldest entry is the one the next eviction would take");
+
+    assert!(table.admits(&field("c", "3"), u64::MAX), "with nothing in flight the table may make room as it likes");
+    assert!(
+        !table.admits(&field("c", "3"), 0),
+        "RFC 9204 2.1.1.1: an entry a field block still names may not be evicted to make room"
+    );
+    assert!(table.admits(&field("c", "3"), 1), "an entry nothing names any longer may be");
+}
+
+#[test]
+fn an_encoder_never_evicts_what_its_unacknowledged_sections_name() {
+    // Room for two entries and no more, so every insertion past the second
+    // has to evict one.
+    let capacity = 2 * (HeaderField::OVERHEAD + 8);
+
+    let mut encoder = Encoder::new();
+    encoder.set_max_capacity(capacity);
+    encoder.set_capacity_limit(capacity);
+
+    let mut decoder = Decoder::new();
+    decoder.set_max_capacity(capacity);
+
+    // A first section fills the table.
+    let first = encoder.encode(0, &[field("aaaa", "1111"), field("bbbb", "2222")]);
+    decoder.on_encoder_stream(&encoder.take_encoder_stream()).expect("the encoder stream was refused");
+
+    // Tell the encoder the insertions arrived, so it may reference them, but
+    // never acknowledge the section itself.
+    encoder.on_decoder_instruction(DecoderInstruction::InsertCountIncrement { increment: 2 });
+    let referencing = encoder.encode(4, &[field("aaaa", "1111"), field("bbbb", "2222")]);
+
+    let before = encoder.dynamic_table().inserted_count();
+
+    // Now encode a section of fresh fields on another stream. Making room for
+    // them would mean evicting what stream 4 still names.
+    let _ = encoder.encode(8, &[field("cccc", "3333"), field("dddd", "4444")]);
+
+    assert_eq!(
+        encoder.dynamic_table().inserted_count(),
+        before,
+        "nothing may be inserted while doing so would evict an entry an unacknowledged section names"
+    );
+
+    // The peer can still read the section that is in flight.
+    decoder.on_encoder_stream(&encoder.take_encoder_stream()).expect("the encoder stream was refused");
+    let (fields, _) = decoder.decode(4, &referencing).expect("a section the encoder promised became unreadable");
+    assert_eq!(fields, vec![field("aaaa", "1111"), field("bbbb", "2222")]);
+
+    let (fields, _) = decoder.decode(0, &first).expect("the first section became unreadable");
+    assert_eq!(fields, vec![field("aaaa", "1111"), field("bbbb", "2222")]);
+}
+
+#[test]
+fn acknowledging_a_section_frees_what_it_named() {
+    let capacity = 2 * (HeaderField::OVERHEAD + 8);
+
+    let mut encoder = Encoder::new();
+    encoder.set_max_capacity(capacity);
+    encoder.set_capacity_limit(capacity);
+
+    let _ = encoder.encode(0, &[field("aaaa", "1111"), field("bbbb", "2222")]);
+    encoder.on_decoder_instruction(DecoderInstruction::InsertCountIncrement { increment: 2 });
+    let _ = encoder.encode(4, &[field("aaaa", "1111"), field("bbbb", "2222")]);
+
+    assert_eq!(encoder.outstanding(), 1, "the section on stream 4 names dynamic entries and is not acknowledged");
+    encoder.on_decoder_instruction(DecoderInstruction::SectionAcknowledgment { stream_id: 4 });
+    assert_eq!(encoder.outstanding(), 0);
+
+    let before = encoder.dynamic_table().inserted_count();
+    let _ = encoder.encode(8, &[field("cccc", "3333"), field("dddd", "4444")]);
+
+    assert!(
+        encoder.dynamic_table().inserted_count() > before,
+        "once nothing names them, the table is free to evict and insert again"
+    );
+}

@@ -139,7 +139,9 @@ pub unsafe extern "C" fn soyokaze_h1_is_token(text: *const u8, text_len: usize) 
 ///
 /// `headers` must either be null or be a section that has not been freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_h1_keep_alive(headers: *const Headers, version: Version) -> bool {
+pub unsafe extern "C" fn soyokaze_h1_keep_alive(headers: *const Headers, version: i32) -> bool {
+    let version = Version::of(version);
+
     Persistence::keep_alive(unsafe { headers.as_ref() }, version)
 }
 
@@ -234,7 +236,9 @@ pub unsafe extern "C" fn soyokaze_h1_version_parse(text: *const u8, text_len: us
 /// `name` and `value` must either be null or point to their stated number of
 /// readable octets.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_h1_field_encode(name: *const u8, name_len: usize, value: *const u8, value_len: usize, header_case: HeaderCase) -> Buffer {
+pub unsafe extern "C" fn soyokaze_h1_field_encode(name: *const u8, name_len: usize, value: *const u8, value_len: usize, header_case: i32) -> Buffer {
+    let header_case = HeaderCase::of(header_case);
+
     let (Some(name), Some(value)) = (unsafe { Slice::borrow_text(name, name_len) }, unsafe { Slice::borrow_text(value, value_len) }) else {
         return Buffer::EMPTY;
     };
@@ -251,7 +255,9 @@ pub unsafe extern "C" fn soyokaze_h1_field_encode(name: *const u8, name_len: usi
 ///
 /// `headers` must either be null or be a section that has not been freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_h1_field_encode_all(headers: *const Headers, header_case: HeaderCase) -> Buffer {
+pub unsafe extern "C" fn soyokaze_h1_field_encode_all(headers: *const Headers, header_case: i32) -> Buffer {
+    let header_case = HeaderCase::of(header_case);
+
     let Some(headers) = (unsafe { headers.as_ref() }) else {
         return Buffer::EMPTY;
     };

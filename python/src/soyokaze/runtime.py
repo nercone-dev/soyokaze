@@ -28,9 +28,19 @@ the connection to make a call that is waiting give up.
 import asyncio
 import concurrent.futures
 import inspect
+import threading
 
 from .errors import RuntimeError
 from .ffi import library
+
+GUARD = threading.Lock()
+"""Guards building the shared runtime and the shared pool.
+
+Either is built on first use, and first use can be two threads at once — a
+caller awaiting from more than one event loop, most of all. Without this, both
+would be built and one thrown away: a whole tokio runtime, or a thread pool,
+started and then left to a garbage collector.
+"""
 
 class Runtime:
     """A multi-threaded runtime, the crate's half of an awaited call.
@@ -61,7 +71,9 @@ class Runtime:
     def default(cls):
         """The runtime used when a call is not handed one, built on first use."""
         if cls.shared is None:
-            cls.shared = cls()
+            with GUARD:
+                if cls.shared is None:
+                    cls.shared = cls()
         return cls.shared
 
 class Threads:
@@ -91,7 +103,9 @@ class Threads:
     def default(cls):
         """The pool used when a call is not handed one, built on first use."""
         if cls.shared is None:
-            cls.shared = concurrent.futures.ThreadPoolExecutor(max_workers=cls.WORKERS, thread_name_prefix="soyokaze")
+            with GUARD:
+                if cls.shared is None:
+                    cls.shared = concurrent.futures.ThreadPoolExecutor(max_workers=cls.WORKERS, thread_name_prefix="soyokaze")
         return cls.shared
 
     @classmethod
@@ -101,17 +115,20 @@ class Threads:
         Call this before the first awaited call; a pool that is already
         serving calls is left alone, since the calls on it are still waiting.
         """
-        if cls.shared is not None:
-            raise RuntimeError("the shared pool is already in use")
-        cls.shared = concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="soyokaze")
-        return cls.shared
+        with GUARD:
+            if cls.shared is not None:
+                raise RuntimeError("the shared pool is already in use")
+            cls.shared = concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="soyokaze")
+            return cls.shared
 
     @classmethod
     def close(cls, wait=True):
         """Releases the shared pool, waiting for the calls on it by default."""
-        if cls.shared is not None:
-            cls.shared.shutdown(wait=wait)
-            cls.shared = None
+        with GUARD:
+            pool, cls.shared = cls.shared, None
+
+        if pool is not None:
+            pool.shutdown(wait=wait)
 
 async def offload(call, *arguments):
     """Awaits a blocking library call, made on a worker thread.

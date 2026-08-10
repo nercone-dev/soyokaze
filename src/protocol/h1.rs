@@ -190,6 +190,37 @@ impl Persistence {
     }
 }
 
+/// The `Expect` field, which is what a client asks for before it commits to
+/// sending content.
+pub struct Expectation;
+
+impl Expectation {
+    /// The one expectation HTTP defines.
+    pub const CONTINUE: &'static str = "100-continue";
+
+    /// The interim status that answers it.
+    pub const STATUS: u16 = 100;
+
+    /// Whether a request asks to be told to go ahead before it sends content.
+    ///
+    /// HTTP/1.0 has no interim responses to build on, so an `Expect` there is
+    /// ignored rather than answered — RFC 9110 §10.1.1. The token is matched
+    /// across repeats and comma-separated lists, as every field of this shape
+    /// is.
+    pub fn requested(headers: Option<&Headers>, version: Version) -> bool {
+        if version == Version::V1_0 {
+            return false;
+        }
+
+        headers.is_some_and(|headers| {
+            headers
+                .get_all("expect")
+                .flat_map(|value| value.split(','))
+                .any(|token| token.trim().eq_ignore_ascii_case(Self::CONTINUE))
+        })
+    }
+}
+
 /// The start line: a request line or a status line.
 ///
 /// [`StartLine::parse`] tells the two apart by the leading `HTTP/`, since that
@@ -202,7 +233,12 @@ impl StartLine {
     /// # Errors
     ///
     /// Returns [`Error::Version`] for a message that is not HTTP/1.x, and
-    /// [`Error::Protocol`] for one that is neither a request nor a response.
+    /// [`Error::Protocol`] for one that is neither a request nor a response,
+    /// or whose target [`URL::is_target`] refuses — a target carrying a space
+    /// or a CRLF would otherwise write a second request line, which is what
+    /// request smuggling is built out of.
+    ///
+    /// [`URL::is_target`]: crate::models::URL::is_target
     pub fn write(message: &Message, out: &mut BytesMut) -> Result<(), Error> {
         if message.version.major() != 1 {
             return Err(Error::Version(format!("{} has no start line", message.version)));
@@ -213,6 +249,10 @@ impl StartLine {
         if let Some(method) = message.method {
             let method = method.as_str();
             let target = message.target.as_deref().unwrap_or("/");
+
+            if !crate::models::URL::is_target(target) {
+                return Err(Error::Protocol(format!("request target {target:?} is malformed")));
+            }
 
             let start = out.len();
             out.resize(start + method.len() + target.len() + version.len() + 2, 0);
@@ -757,9 +797,12 @@ impl Field {
     pub fn parse_bytes(line: &[u8]) -> Result<(Text, Text), Error> {
         let spans = Self::spans(line)?;
 
-        let name = Text::from_verified_ascii_lowercase(&line[spans.name]);
+        // SAFETY: `Field::spans` has already established that the name is a
+        // token, and so ASCII, and that the value carries no octet at or above
+        // 0x80 wherever it reports `ascii`.
+        let name = unsafe { Text::from_verified_ascii_lowercase(&line[spans.name]) };
         let value = match spans.ascii {
-            true => Text::from_verified_ascii(&line[spans.value]),
+            true => unsafe { Text::from_verified_ascii(&line[spans.value]) },
             false => Text::from_utf8_lossy(&line[spans.value]),
         };
 
@@ -889,6 +932,42 @@ impl Chunk {
         out
     }
 
+    /// Reads a chunk size, which is `1*HEXDIG` and nothing else.
+    ///
+    /// Kept apart from the standard library's radix parsing, which admits a
+    /// leading `+`: a size a peer writes as `+5` would be read as five here
+    /// and refused by the next hop, or the other way round, which is one byte
+    /// stream read as two messages. Nothing is trimmed for the same reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when the digits are empty, carry anything
+    /// but hexadecimal, or name a size too large to address.
+    pub fn size(digits: &[u8]) -> Result<usize, Error> {
+        let malformed = || Error::Protocol(format!("chunk size {:?} is not hexadecimal", String::from_utf8_lossy(digits)));
+
+        if digits.is_empty() {
+            return Err(malformed());
+        }
+
+        let mut size = 0usize;
+        for digit in digits {
+            let value = match digit {
+                b'0'..=b'9' => digit - b'0',
+                b'a'..=b'f' => digit - b'a' + 10,
+                b'A'..=b'F' => digit - b'A' + 10,
+                _ => return Err(malformed()),
+            };
+
+            size = size
+                .checked_mul(16)
+                .and_then(|size| size.checked_add(value as usize))
+                .ok_or_else(|| Error::Protocol("chunk size is too large to address".into()))?;
+        }
+
+        Ok(size)
+    }
+
     /// Reads a chunk size line, returning where the data starts and how long it
     /// is.
     ///
@@ -897,8 +976,8 @@ impl Chunk {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Protocol`] when the line is not terminated by CRLF or
-    /// the size is not hexadecimal.
+    /// Returns [`Error::Protocol`] when the line is not terminated by CRLF, and
+    /// otherwise as [`Chunk::size`].
     pub fn parse_size(data: &[u8]) -> Result<Option<(usize, usize)>, Error> {
         let Some(end) = scan::find(data, b'\n') else {
             return Ok(None);
@@ -908,13 +987,13 @@ impl Chunk {
             return Err(Error::Protocol("chunk size line is not terminated by CRLF".into()));
         }
 
-        let line = String::from_utf8_lossy(&data[..end - 1]);
-        let (size, _) = line.split_once(';').unwrap_or((&line, ""));
+        let line = &data[..end - 1];
+        let digits = match scan::find(line, b';') {
+            Some(at) => &line[..at],
+            None => line,
+        };
 
-        let size = usize::from_str_radix(size.trim_end_matches([' ', '\t']), 16)
-            .map_err(|_| Error::Protocol(format!("chunk size {size:?} is not hexadecimal")))?;
-
-        Ok(Some((end + 1, size)))
+        Ok(Some((end + 1, Self::size(digits)?)))
     }
 
     /// Reads one whole chunk.
@@ -967,6 +1046,9 @@ pub enum BodyLength {
 }
 
 impl BodyLength {
+    /// The one transfer coding that frames a body rather than coding it.
+    pub const CHUNKED: &'static str = "chunked";
+
     /// Works out how a message's body is framed.
     ///
     /// `method` is the method of the request this responds to, which some
@@ -986,7 +1068,7 @@ impl BodyLength {
         let headers = message.headers.as_ref();
 
         if let Some(status_code) = message.status_code {
-            if matches!(status_code, 100..=199 | 204 | 304) || method == Some(Method::HEAD) {
+            if message.bodyless(method) {
                 return Ok(Self::None);
             }
 
@@ -1003,12 +1085,22 @@ impl BodyLength {
         }
 
         if encoded {
+            let codings = headers.into_iter().flat_map(|headers| headers.get_all("transfer-encoding")).flat_map(|value| value.split(','));
+            let applied = codings.filter(|coding| coding.trim().eq_ignore_ascii_case(Self::CHUNKED)).count();
+
+            if applied > 1 {
+                return Err(Error::Protocol("the chunked transfer coding is applied more than once".into()));
+            }
+
             let last = headers.and_then(|headers| headers.get_all("transfer-encoding").last()).unwrap_or_default();
             let last = last.rsplit(',').next().unwrap_or_default().trim();
 
-            if !last.eq_ignore_ascii_case("chunked") {
-                return if message.is_request() {
-                    Err(Error::Protocol("Transfer-Encoding on a request does not end with chunked".into()))
+            if !last.eq_ignore_ascii_case(Self::CHUNKED) {
+                // A coding applied before chunked would leave the body framed
+                // by something this end cannot read, which on a request is a
+                // length it must not guess at.
+                return if message.is_request() || applied > 0 {
+                    Err(Error::Protocol("Transfer-Encoding does not end with chunked".into()))
                 } else {
                     Ok(Self::Close)
                 };
@@ -1298,6 +1390,17 @@ where
         message.is_response().then(|| self.pending.front()?.accepted).flatten()
     }
 
+    /// The method of the request a message is answering, if it is answering
+    /// one.
+    ///
+    /// The counterpart of [`H1Connection::accepted`], for the other thing a
+    /// response cannot be framed without: a response to `HEAD` carries no
+    /// body however it is labelled, and only the exchange says which method
+    /// asked.
+    pub fn answering(&self, message: &Message) -> Option<Method> {
+        message.is_response().then(|| self.pending.front().map(|exchange| exchange.method)).flatten()
+    }
+
     /// Writes one whole message: start line, fields, and body.
     ///
     /// A client-side request is finalised first, so it carries the authority
@@ -1346,6 +1449,16 @@ where
         });
 
         let bodyless = matches!(message.status_code, Some(100..=199 | 204 | 304));
+
+        // Whether anything at all may follow the blank line. A 1xx, a 204 and
+        // a 304 are terminated by it, and so is every response to HEAD however
+        // it is labelled — RFC 9112 §6.3. A body written past it would frame
+        // nothing, and the peer would read it as the start of the next
+        // response. HEAD still carries the fields GET would have carried, so
+        // only the octets after the head are dropped, not the length that
+        // describes them.
+        let framed = !message.bodyless(self.answering(&message));
+
         let has_length = headers.is_some_and(|headers| headers.contains("content-length"));
 
         let inline = body.as_ref().is_some_and(|body| body.len() <= self.limits.inline_body_size as usize);
@@ -1388,7 +1501,7 @@ where
             return Err(error);
         }
 
-        let trailing = match (chunked, body) {
+        let trailing = match (chunked && framed, body.filter(|_| framed)) {
             (true, body) => {
                 if let Some(body) = body.filter(|body| !body.is_empty()) {
                     Chunk::write(&body, &mut out);
@@ -1447,7 +1560,17 @@ where
     /// the message goes past [`Limits::max_message_size`] or one of the other
     /// ceilings, and otherwise as the parsers above.
     pub async fn receive_message(&mut self) -> Result<Message, Error> {
-        let length = Line::end(&mut self.buffer, &mut self.transport, self.limits.max_startline_size as usize, self.limits.read_timeout).await?;
+        let max = self.limits.max_startline_size as usize;
+        let mut length = Line::end(&mut self.buffer, &mut self.transport, max, self.limits.read_timeout).await?;
+
+        // RFC 9112 §2.2: a server reading a request line ignores at least one
+        // empty line before it, which is what an older client leaves behind
+        // after a body. Exactly one, so a peer cannot spend the connection
+        // sending them.
+        if length == 0 && self.role.is_server() {
+            self.buffer.consume(2);
+            length = Line::end(&mut self.buffer, &mut self.transport, max, self.limits.read_timeout).await?;
+        }
 
         let mut message = match StartLine::parse_bytes(&self.buffer.as_slice()[..length]) {
             Ok(message) => {
@@ -1497,6 +1620,16 @@ where
         let method = if message.is_response() { self.pending.pop_front().map(|exchange| exchange.method) } else { None };
 
         let length = BodyLength::of(&message, method)?;
+
+        // RFC 9110 §10.1.1: a server that reads a 100-continue expectation
+        // must answer it, with either the interim status or a final one,
+        // before the client will send what follows. Answering it here rather
+        // than leaving it to a handler is what keeps a client that waits for
+        // permission from waiting out its own deadline.
+        if self.role.is_server() && length != BodyLength::None && Expectation::requested(message.headers.as_ref(), message.version) {
+            let interim = Message::response(Expectation::STATUS, self.version);
+            Box::pin(self.send_message(interim)).await?;
+        }
 
         message.body = match length {
             BodyLength::None => None,

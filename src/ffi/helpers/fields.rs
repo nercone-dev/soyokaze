@@ -36,6 +36,22 @@ pub enum Error {
 }
 
 impl Error {
+    /// The error a `soyokaze_fields_error_t` names, or `None` when it names
+    /// none.
+    ///
+    /// As [`crate::ffi::helpers::huffman::DecodeError::from_code`].
+    pub fn from_code(code: i32) -> Option<Self> {
+        Some(match code {
+            0 => Self::Ok,
+            1 => Self::IntegerOverflow,
+            2 => Self::Incomplete,
+            3 => Self::HuffmanInvalidPadding,
+            4 => Self::HuffmanUnknownSymbol,
+            5 => Self::Invalid,
+            _ => return None,
+        })
+    }
+
     /// The error that stands for `error`.
     pub fn of(error: &crate::helpers::fields::Error) -> Self {
         match error {
@@ -74,8 +90,8 @@ impl Error {
 ///
 /// Borrowed from the library and valid for its lifetime.
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_fields_error_message(error: Error) -> Slice {
-    Slice::text(error.message())
+pub extern "C" fn soyokaze_fields_error_message(error: i32) -> Slice {
+    Slice::maybe(Error::from_code(error).map(|error| error.message()))
 }
 
 /// One field going in: a name and a value.
@@ -295,16 +311,32 @@ pub unsafe extern "C" fn soyokaze_string_prefers_huffman(data: *const u8, data_l
     crate::helpers::fields::StringLiteral::prefers_huffman(unsafe { Slice::borrow(data, data_len) }.unwrap_or_default())
 }
 
+/// The widest prefix a string literal can be written with.
+///
+/// The bit just above the prefix carries the Huffman mark, so an eight-bit
+/// prefix would leave no room for it. Both compression formats stay at or
+/// under this.
+#[unsafe(no_mangle)]
+pub extern "C" fn soyokaze_string_max_prefix_bits() -> u8 {
+    crate::helpers::fields::StringLiteral::MAX_PREFIX_BITS
+}
+
 /// Encodes a string literal, owned by the caller.
 ///
 /// `huffman` picks the coding outright; [`soyokaze_string_encode_shorter`]
-/// picks whichever comes out smaller instead.
+/// picks whichever comes out smaller instead. An empty buffer comes back when
+/// `prefix_bits` is past [`soyokaze_string_max_prefix_bits`], which no
+/// representation uses.
 ///
 /// # Safety
 ///
 /// `data` must either be null or point to `data_len` readable octets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_string_encode(data: *const u8, data_len: usize, prefix_bits: u8, flags: u8, huffman: bool) -> Buffer {
+    if prefix_bits > crate::helpers::fields::StringLiteral::MAX_PREFIX_BITS {
+        return Buffer::EMPTY;
+    }
+
     let data = unsafe { Slice::borrow(data, data_len) }.unwrap_or_default();
     let mut out = Vec::new();
     crate::helpers::fields::StringLiteral::encode(&mut out, data, prefix_bits, flags, huffman);
@@ -318,6 +350,10 @@ pub unsafe extern "C" fn soyokaze_string_encode(data: *const u8, data_len: usize
 /// As [`soyokaze_string_encode`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_string_encode_shorter(data: *const u8, data_len: usize, prefix_bits: u8, flags: u8) -> Buffer {
+    if prefix_bits > crate::helpers::fields::StringLiteral::MAX_PREFIX_BITS {
+        return Buffer::EMPTY;
+    }
+
     let data = unsafe { Slice::borrow(data, data_len) }.unwrap_or_default();
     let mut out = Vec::new();
     crate::helpers::fields::StringLiteral::encode_shorter(&mut out, data, prefix_bits, flags);
@@ -335,6 +371,11 @@ pub unsafe extern "C" fn soyokaze_string_encode_shorter(data: *const u8, data_le
 /// `out`, `read` and `error` must either be null or be writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_string_decode(data: *const u8, data_len: usize, prefix_bits: u8, out: *mut Buffer, read: *mut usize, error: *mut Error) -> bool {
+    if prefix_bits > crate::helpers::fields::StringLiteral::MAX_PREFIX_BITS {
+        unsafe { Error::report(error, Error::Invalid) };
+        return false;
+    }
+
     let Some(data) = (unsafe { Slice::borrow(data, data_len) }) else {
         unsafe { Error::report(error, Error::Invalid) };
         return false;

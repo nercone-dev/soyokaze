@@ -52,7 +52,13 @@ pub extern "C" fn soyokaze_scan_marks_zero(word: u64) -> u64 {
 pub unsafe extern "C" fn soyokaze_scan_word_at(data: *const u8, data_len: usize, offset: usize) -> u64 {
     let data = unsafe { Slice::borrow(data, data_len) }.unwrap_or_default();
 
-    if offset + crate::helpers::scan::LANES > data.len() {
+    // Checked, because an `offset` near the top of the range would otherwise
+    // wrap past the length and let the read through.
+    let Some(end) = offset.checked_add(crate::helpers::scan::LANES) else {
+        return 0;
+    };
+
+    if end > data.len() {
         return 0;
     }
 

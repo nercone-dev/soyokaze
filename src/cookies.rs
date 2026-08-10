@@ -281,6 +281,60 @@ impl StoredCookie {
         false
     }
 
+    /// Whether a host falls under a cookie's domain, per RFC 6265 §5.1.3.
+    ///
+    /// The two match when they are identical, or when the host continues past
+    /// the domain at a `.` boundary. An IP address matches only itself, since
+    /// `1.2.3.4` is not a subdomain of `2.3.4`.
+    pub fn domain_matches(host: &str, domain: &str) -> bool {
+        if host == domain {
+            return true;
+        }
+
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            return false;
+        }
+
+        !domain.is_empty() && host.len() > domain.len() && host.ends_with(domain) && host.as_bytes()[host.len() - domain.len() - 1] == b'.'
+    }
+
+    /// Whether a domain is broad enough that no one host may claim it.
+    ///
+    /// A cookie scoped to a bare `com` would travel to every host under it, so
+    /// a `Domain` naming one label and nothing else is refused. This is the
+    /// bound that can be drawn without a public suffix list, which would be a
+    /// table this crate does not carry and a network fetch it does not make;
+    /// it stops the whole-registry case and leaves `example.co.uk`-shaped
+    /// registries to a caller that ships a list of its own.
+    pub fn too_broad(domain: &str) -> bool {
+        !domain.contains('.')
+    }
+
+    /// The domain and host-only flag a cookie is stored under.
+    ///
+    /// `attribute` is the `Domain` the server asked for, and `host` the host
+    /// the response came from, already lowercased. `None` means the cookie
+    /// must be ignored entirely: RFC 6265 §5.3 refuses one whose `Domain`
+    /// the request host does not domain-match, which is what stops a server
+    /// setting cookies for hosts that are not its own.
+    pub fn scope(host: &str, attribute: Option<&str>) -> Option<(String, bool)> {
+        let domain = attribute.map(|domain| domain.trim().trim_start_matches('.').to_ascii_lowercase()).filter(|domain| !domain.is_empty());
+
+        let Some(domain) = domain else {
+            return Some((host.to_owned(), true));
+        };
+
+        if domain == host {
+            return Some((domain, false));
+        }
+
+        if Self::too_broad(&domain) || !Self::domain_matches(host, &domain) {
+            return None;
+        }
+
+        Some((domain, false))
+    }
+
     /// The path a cookie takes when the server sets no `Path` attribute: the
     /// request target up to, but not including, its last `/`.
     pub fn default_path(target: &str) -> String {
@@ -304,10 +358,9 @@ impl StoredCookie {
         }
 
         let host = url.host.to_ascii_lowercase();
-        let domain_ok = if self.host_only {
-            host == self.domain
-        } else {
-            host == self.domain || host.ends_with(&format!(".{}", self.domain))
+        let domain_ok = match self.host_only {
+            true => host == self.domain,
+            false => Self::domain_matches(&host, &self.domain),
         };
 
         domain_ok && Self::path_matches(&url.target, &self.path)
@@ -361,7 +414,9 @@ impl CookieJar {
     ///
     /// Drops the oldest cookie for the domain when it is at
     /// [`CookieLimits::max_cookies_per_domain`], and then the oldest cookies
-    /// overall until the jar is under [`CookieLimits::max_cookies`].
+    /// overall until the jar is under [`CookieLimits::max_cookies`]. A ceiling
+    /// of zero empties the jar and keeps nothing, rather than looking for one
+    /// more entry to drop than there are.
     pub fn evict(entries: &mut Vec<StoredCookie>, domain: &str, limits: &CookieLimits) {
         if entries.iter().filter(|stored| stored.domain == domain).count() >= limits.max_cookies_per_domain as usize
             && let Some(oldest) = entries.iter().position(|stored| stored.domain == domain)
@@ -369,9 +424,17 @@ impl CookieJar {
             entries.remove(oldest);
         }
 
-        while entries.len() >= limits.max_cookies as usize {
+        while !entries.is_empty() && entries.len() >= limits.max_cookies as usize {
             entries.remove(0);
         }
+    }
+
+    /// Whether the jar may hold anything at all.
+    ///
+    /// A [`CookieLimits::max_cookies`] of zero turns the jar off: nothing is
+    /// stored, so nothing is ever sent back.
+    pub fn holds(limits: &CookieLimits) -> bool {
+        limits.max_cookies > 0
     }
 
     /// An empty jar with the default [`CookieLimits`].
@@ -389,8 +452,11 @@ impl CookieJar {
     ///
     /// A cookie replaces any it shares a name, domain and path with. One whose
     /// `Max-Age` has already passed deletes rather than stores. Values that do
-    /// not parse are skipped rather than failing the whole batch.
+    /// not parse, and ones whose `Domain` names a host the response did not
+    /// come from, are skipped rather than failing the whole batch — see
+    /// [`StoredCookie::scope`].
     pub fn learn(&self, url: &URL, values: &[&str], now: Instant) {
+        let host = url.host.to_ascii_lowercase();
         let mut entries = Lock::on(&self.entries);
 
         for value in values {
@@ -398,9 +464,8 @@ impl CookieJar {
                 continue;
             };
 
-            let (domain, host_only) = match &cookie.domain {
-                Some(domain) => (domain.trim_start_matches('.').to_ascii_lowercase(), false),
-                None => (url.host.to_ascii_lowercase(), true),
+            let Some((domain, host_only)) = StoredCookie::scope(&host, cookie.domain.as_deref()) else {
+                continue;
             };
             let path = cookie.path.clone().unwrap_or_else(|| StoredCookie::default_path(&url.target));
 
@@ -412,6 +477,10 @@ impl CookieJar {
             entries.retain(|stored| !(stored.name == cookie.name && stored.domain == domain && stored.path == path));
 
             if expired {
+                continue;
+            }
+
+            if !Self::holds(&self.limits) {
                 continue;
             }
 

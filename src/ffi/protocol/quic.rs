@@ -121,13 +121,21 @@ pub extern "C" fn soyokaze_quic_stream_client_initiated(stream_id: u64) -> bool 
 
 /// The first bidirectional stream a role may open.
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_quic_stream_first_bidi(role: Role) -> u64 {
+pub extern "C" fn soyokaze_quic_stream_first_bidi(role: i32) -> u64 {
+    let Some(role) = Role::from_code(role) else {
+        return u64::MAX;
+    };
+
     QUICStreamID::first_bidi(role)
 }
 
 /// The first unidirectional stream a role may open.
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_quic_stream_first_uni(role: Role) -> u64 {
+pub extern "C" fn soyokaze_quic_stream_first_uni(role: i32) -> u64 {
+    let Some(role) = Role::from_code(role) else {
+        return u64::MAX;
+    };
+
     QUICStreamID::first_uni(role)
 }
 

@@ -308,3 +308,73 @@ fn the_whole_limits_still_configure_a_jar() {
     assert_eq!(jar.limits.max_cookies, 7);
     assert_eq!(jar.limits.max_cookies_per_domain, soyokaze::Limits::default().max_cookies_per_domain);
 }
+
+// ---------------------------------------------------------------- conformance
+
+#[test]
+fn a_cookie_may_only_be_scoped_to_a_domain_the_response_came_from() {
+    let jar = CookieJar::new();
+    let now = Instant::now();
+
+    jar.learn(&url("https://evil.test/"), &[
+        "a=1; Domain=victim.test",
+        "b=1; Domain=test",
+        "c=1; Domain=evil.test.attacker.test",
+    ], now);
+
+    assert_eq!(
+        jar.cookie(&url("https://victim.test/"), now),
+        None,
+        "RFC 6265 5.3: a cookie whose Domain the request host does not domain-match is ignored entirely"
+    );
+    assert_eq!(jar.cookie(&url("https://other.test/"), now), None, "a bare registry must not be claimable");
+    assert_eq!(jar.cookie(&url("https://evil.test/"), now), None, "nor may a domain the host is not under");
+}
+
+#[test]
+fn a_cookie_scoped_to_the_host_or_a_parent_of_it_is_kept() {
+    let jar = CookieJar::new();
+    let now = Instant::now();
+
+    jar.learn(&url("https://shop.example.test/"), &["a=1; Domain=example.test", "b=2; Domain=shop.example.test", "c=3"], now);
+
+    let sent = jar.cookie(&url("https://shop.example.test/"), now).expect("the cookies were not kept");
+    assert!(sent.contains("a=1") && sent.contains("b=2") && sent.contains("c=3"));
+
+    let parent = jar.cookie(&url("https://example.test/"), now).expect("the parent domain cookie was not kept");
+    assert!(parent.contains("a=1"), "a cookie for a parent domain reaches the parent");
+    assert!(!parent.contains("b=2"), "one scoped to a subdomain does not");
+    assert!(!parent.contains("c=3"), "and neither does a host-only one");
+}
+
+#[test]
+fn an_address_may_only_set_a_cookie_for_itself() {
+    let jar = CookieJar::new();
+    let now = Instant::now();
+
+    jar.learn(&url("https://192.0.2.10/"), &["a=1; Domain=0.2.10", "b=2; Domain=192.0.2.10", "c=3"], now);
+
+    let sent = jar.cookie(&url("https://192.0.2.10/"), now).expect("the host-only cookies were not kept");
+    assert!(!sent.contains("a=1"), "an address is not a subdomain of its own tail");
+    assert!(sent.contains("b=2") && sent.contains("c=3"));
+}
+
+#[test]
+fn domain_matching_follows_the_dot_boundary() {
+    assert!(StoredCookie::domain_matches("example.test", "example.test"));
+    assert!(StoredCookie::domain_matches("a.example.test", "example.test"));
+    assert!(!StoredCookie::domain_matches("notexample.test", "example.test"), "the boundary is a dot, not a suffix");
+    assert!(!StoredCookie::domain_matches("example.test", "a.example.test"));
+    assert!(!StoredCookie::domain_matches("192.0.2.10", "0.2.10"), "an address matches only itself");
+}
+
+#[test]
+fn a_jar_that_may_hold_nothing_holds_nothing() {
+    let limits = soyokaze::models::Limits { max_cookies: 0, ..soyokaze::models::Limits::default() };
+    let jar = CookieJar::new().with_limits(limits);
+    let now = Instant::now();
+
+    jar.learn(&url("https://example.test/"), &["a=1", "b=2"], now);
+
+    assert_eq!(jar.cookie(&url("https://example.test/"), now), None, "a ceiling of zero turns the jar off");
+}

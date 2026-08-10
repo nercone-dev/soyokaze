@@ -137,7 +137,11 @@ pub unsafe extern "C" fn soyokaze_response_finalizer_free(finalizer: *mut Respon
 /// `finalizer` and `message` must either be null or be handles that have not
 /// been freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_response_finalizer_finalize(finalizer: *const ResponseFinalizer, role: Role, secure: bool, message: *mut Message) -> bool {
+pub unsafe extern "C" fn soyokaze_response_finalizer_finalize(finalizer: *const ResponseFinalizer, role: i32, secure: bool, message: *mut Message) -> bool {
+    let Some(role) = Role::from_code(role) else {
+        return false;
+    };
+
     let (Some(finalizer), Some(message)) = (unsafe { finalizer.as_ref() }, unsafe { message.as_mut() }) else {
         return false;
     };
@@ -191,7 +195,11 @@ pub unsafe extern "C" fn soyokaze_request_finalizer_authority(finalizer: *const 
 ///
 /// As [`soyokaze_response_finalizer_finalize`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_request_finalizer_finalize(finalizer: *const RequestFinalizer, role: Role, message: *mut Message) -> bool {
+pub unsafe extern "C" fn soyokaze_request_finalizer_finalize(finalizer: *const RequestFinalizer, role: i32, message: *mut Message) -> bool {
+    let Some(role) = Role::from_code(role) else {
+        return false;
+    };
+
     let (Some(finalizer), Some(message)) = (unsafe { finalizer.as_ref() }, unsafe { message.as_mut() }) else {
         return false;
     };

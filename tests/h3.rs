@@ -1022,3 +1022,124 @@ fn auto_never_compresses_a_client_request() {
     session.encode_message(StreamID(4), &mut named).expect("the request did not encode");
     assert_eq!(named.compression, Some(Compression::Zstd), "a request coding the caller named is applied");
 }
+
+// ---------------------------------------------------------------- conformance
+
+fn requested(session: &mut H3Session, stream_id: StreamID, method: &str) {
+    let mut encoder = Encoder::new();
+    let fields = vec![
+        HeaderField::new(":method", method),
+        HeaderField::new(":scheme", "https"),
+        HeaderField::new(":authority", "example.test"),
+        HeaderField::new(":path", "/"),
+    ];
+
+    let block = encoder.encode(stream_id.0, &fields);
+    session.on_stream_bytes(stream_id, &Frame::Headers(block.into()).encode(), true).expect("the request was refused");
+}
+
+fn framed(method: &str, status_code: u16, attach: impl FnOnce(&mut Message)) -> BytesMut {
+    let mut session = server();
+    let stream_id = StreamID(0);
+    requested(&mut session, stream_id, method);
+
+    let mut response = Message::response(status_code, Version::V3_0);
+    response.stream_id = Some(stream_id);
+    attach(&mut response);
+
+    let mut out = BytesMut::new();
+    session.encode_message_into(stream_id, &mut response, &mut out).expect("the response did not frame");
+    out
+}
+
+#[test]
+fn a_message_that_ends_at_its_field_section_frames_no_data() {
+    for (method, status_code) in [("GET", 204u16), ("GET", 304), ("HEAD", 200)] {
+        let wire = framed(method, status_code, |response| {
+            response.body = Some(Body::Data(bytes::Bytes::from_static(b"UNFRAMED-CONTENT")));
+        });
+
+        assert!(
+            !wire.windows(16).any(|window| window == b"UNFRAMED-CONTENT"),
+            "a {status_code} answering {method} carries no content, so no DATA frame may go out"
+        );
+    }
+}
+
+#[test]
+fn a_message_that_ends_at_its_field_section_frames_no_trailers() {
+    let wire = framed("HEAD", 200, |response| {
+        let mut trailers = Headers::new();
+        trailers.append("x-trailer", "UNFRAMED-TRAILER");
+        response.trailers = Some(trailers);
+    });
+
+    assert!(
+        !wire.windows(16).any(|window| window == b"UNFRAMED-TRAILER"),
+        "RFC 9112 6.3: a response to HEAD carries no trailer section either"
+    );
+}
+
+#[test]
+fn a_trailer_section_may_not_frame_or_route_the_message() {
+    for (name, value) in [("content-length", "0"), ("transfer-encoding", "chunked"), ("host", "elsewhere.test"), ("te", "trailers")] {
+        let mut session = server();
+        let stream_id = StreamID(0);
+        requested(&mut session, stream_id, "POST");
+
+        let refused = session.absorb_headers(stream_id, vec![HeaderField::new(name, value)]);
+        assert!(
+            refused.is_err(),
+            "RFC 9110 6.5.1: {name:?} arrives after the message has been framed and routed, so it may not appear in a trailer"
+        );
+    }
+}
+
+#[test]
+fn a_field_a_binary_version_may_not_carry_is_refused() {
+    for (name, value) in [("x-evil", "a\r\nInjected: yes"), ("bad name", "v"), ("", "v"), ("x", "\0nul"), ("x", " leading")] {
+        let mut session = server();
+
+        let fields = vec![
+            HeaderField::new(":method", "GET"),
+            HeaderField::new(":scheme", "https"),
+            HeaderField::new(":path", "/"),
+            HeaderField::new(name, value),
+        ];
+
+        assert!(
+            session.absorb_headers(StreamID(0), fields).is_err(),
+            "RFC 9114 4.2: a field of {name:?}: {value:?} is malformed and must be refused"
+        );
+    }
+}
+
+#[test]
+fn a_path_that_would_write_a_second_request_line_is_refused() {
+    let mut session = server();
+
+    let fields = vec![
+        HeaderField::new(":method", "GET"),
+        HeaderField::new(":scheme", "https"),
+        HeaderField::new(":path", "/x HTTP/1.1\r\nX-Smuggled: 1\r\n\r\nGET /admin"),
+    ];
+
+    assert!(
+        session.absorb_headers(StreamID(0), fields).is_err(),
+        "a path carrying a space or a CRLF would frame a request of its own if this message were forwarded over HTTP/1.1"
+    );
+}
+
+#[test]
+fn only_the_commands_that_frame_octets_wait_for_room() {
+    use soyokaze::protocol::h3::H3Command;
+
+    assert!(H3Command::Send(Message::response(200, Version::V3_0)).buffers());
+    assert!(H3Command::WriteEncoder(bytes::Bytes::from_static(b"x")).buffers());
+
+    assert!(
+        !H3Command::Reset(StreamID(0), h3::Code::REQUEST_CANCELLED).buffers(),
+        "a reset frees room, so holding it back would leave a stalled connection no way out"
+    );
+    assert!(!H3Command::Close.buffers(), "and neither may a close be held back");
+}

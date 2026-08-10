@@ -451,29 +451,50 @@ impl Frame {
     /// otherwise as [`Frame::assemble`].
     pub fn parse(buffer: &mut BytesMut, max_frame_size: u32) -> Result<Option<Frame>, Error> {
         loop {
-            let Some(octets) = buffer.get(..FrameHeader::SIZE) else {
-                return Ok(None);
-            };
-
-            let octets = <[u8; FrameHeader::SIZE]>::try_from(octets).unwrap_or([0; FrameHeader::SIZE]);
-            let (length, header) = FrameHeader::decode(&octets);
-
-            if length > max_frame_size {
-                return Err(Error::Limit(format!("frame of {length} octets exceeds the advertised maximum")));
+            match Self::take(buffer, max_frame_size)? {
+                Some(Ok(frame)) => return Ok(Some(frame)),
+                Some(Err(_)) => continue,
+                None => return Ok(None),
             }
+        }
+    }
 
-            let whole = FrameHeader::SIZE + length as usize;
-            if buffer.len() < whole {
-                return Ok(None);
-            }
+    /// [`Frame::parse`], reporting a frame of unknown type rather than reading
+    /// past it.
+    ///
+    /// The octets are consumed either way — an unknown frame still has to be
+    /// stepped over — but its type code comes back, so a caller that may not
+    /// have one arrive can say so. That is what gathering a field block needs:
+    /// RFC 9113 §6.10 admits nothing between a HEADERS frame and the
+    /// CONTINUATION frames that finish it, and one skipped quietly is one that
+    /// got between them unnoticed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Frame::parse`].
+    pub fn take(buffer: &mut BytesMut, max_frame_size: u32) -> Result<Option<Result<Frame, u8>>, Error> {
+        let Some(octets) = buffer.get(..FrameHeader::SIZE) else {
+            return Ok(None);
+        };
 
-            let mut frame = buffer.split_to(whole).freeze();
-            let payload = frame.split_off(FrameHeader::SIZE);
+        let octets = <[u8; FrameHeader::SIZE]>::try_from(octets).unwrap_or([0; FrameHeader::SIZE]);
+        let (length, header) = FrameHeader::decode(&octets);
 
-            match header {
-                Some(header) => return Frame::decode_shared(header, &payload).map(Some),
-                None => continue,
-            }
+        if length > max_frame_size {
+            return Err(Error::Limit(format!("frame of {length} octets exceeds the advertised maximum")));
+        }
+
+        let whole = FrameHeader::SIZE + length as usize;
+        if buffer.len() < whole {
+            return Ok(None);
+        }
+
+        let mut frame = buffer.split_to(whole).freeze();
+        let payload = frame.split_off(FrameHeader::SIZE);
+
+        match header {
+            Some(header) => Frame::decode_shared(header, &payload).map(|frame| Some(Ok(frame))),
+            None => Ok(Some(Err(octets[3]))),
         }
     }
 

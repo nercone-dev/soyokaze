@@ -104,6 +104,47 @@ impl URL {
         }
     }
 
+    /// Whether a string may be sent as a request target.
+    ///
+    /// Non-empty, and carrying neither whitespace nor a control octet: an
+    /// HTTP/1.x start line delimits the target with spaces and ends with CRLF,
+    /// so either would let one request read as two. HTTP/2 and HTTP/3 carry
+    /// the same string as `:path` and hold it to the same rule, since a
+    /// message framed there may be forwarded over HTTP/1.1 later.
+    ///
+    /// This is the decoded-text counterpart of [`Octets::is_target_bytes`],
+    /// which the HTTP/1 parser applies to the octets of a start line before
+    /// they are known to be UTF-8.
+    ///
+    /// [`Octets::is_target_bytes`]: crate::protocol::h1::Octets::is_target_bytes
+    pub fn is_target(target: &str) -> bool {
+        !target.is_empty() && target.bytes().all(|byte| byte > 0x20 && byte != 0x7f)
+    }
+
+    /// Whether a string may be sent as an authority.
+    ///
+    /// The host and, where there is one, the port — what a `Host` field and an
+    /// `:authority` pseudo-header carry. Unlike [`URL::is_host`] this admits
+    /// the `:` a port hangs off and the brackets an IPv6 literal wears, since
+    /// the authority is written with them; what it refuses is whitespace and
+    /// control octets, which would break the field it is written into.
+    pub fn is_authority(authority: &str) -> bool {
+        !authority.is_empty() && authority.bytes().all(|byte| byte > 0x20 && byte != 0x7f)
+    }
+
+    /// Whether a string may be sent as the host of an authority.
+    ///
+    /// Non-empty, and carrying nothing that would let the authority break out
+    /// of the `Host` field or the `:authority` pseudo-header it is written
+    /// into: no whitespace, no control octet, and none of the delimiters an
+    /// authority is parsed with. A colon is among them: the port hangs off one,
+    /// and the only host that carries one of its own is an IPv6 literal, which
+    /// wears brackets and is unwrapped before this is asked.
+    pub fn is_host(host: &str) -> bool {
+        !host.is_empty()
+            && host.bytes().all(|byte| byte > 0x20 && byte != 0x7f && !b"/?#@[]:".contains(&byte))
+    }
+
     /// Whether the scheme asks for TLS.
     pub fn secure(&self) -> bool {
         matches!(self.scheme.as_str(), "https" | "wss")
@@ -141,8 +182,10 @@ impl URL {
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] when the URL carries no scheme, when an
-    /// IPv6 authority is malformed, when the port is not a number, or when
-    /// the URL carries no host.
+    /// IPv6 authority is malformed, when the port is not a number, when the
+    /// URL carries no host or one [`URL::is_host`] refuses, or when the
+    /// request target is one [`URL::is_target`] refuses — which is what stops
+    /// a URL carrying a CRLF from writing a second request line.
     pub fn parse(text: &str) -> Result<Self, Error> {
         let (scheme, rest) = text.split_once("://").ok_or_else(|| Error::Protocol(format!("url {text:?} has no scheme")))?;
         let scheme = scheme.to_ascii_lowercase();
@@ -150,6 +193,10 @@ impl URL {
         let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let (authority, tail) = rest.split_at(end);
         let target = if tail.is_empty() { "/".to_owned() } else { tail.to_owned() };
+
+        if !Self::is_target(&target) {
+            return Err(Error::Protocol(format!("request target {target:?} is malformed")));
+        }
 
         let authority = authority.rsplit('@').next().unwrap_or(authority);
 
@@ -164,6 +211,10 @@ impl URL {
                 None => return Err(Error::Protocol("IPv6 authority has trailing characters".into())),
             };
 
+            if host.is_empty() || !host.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b':' || byte == b'.') {
+                return Err(Error::Protocol(format!("IPv6 authority {host:?} is malformed")));
+            }
+
             (host.to_owned(), port)
         } else if let Some((host, digits)) = authority.rsplit_once(':') {
             let port = digits.parse().map_err(|_| Error::Protocol(format!("port {digits:?} is not a number")))?;
@@ -174,6 +225,12 @@ impl URL {
 
         if host.is_empty() {
             return Err(Error::Protocol(format!("url {text:?} has no host")));
+        }
+
+        // A bracketed literal has already been checked as one; anything else
+        // reaching here with a colon was never an authority this could read.
+        if !authority.starts_with('[') && !Self::is_host(&host) {
+            return Err(Error::Protocol(format!("host {host:?} is malformed")));
         }
 
         let port = port.unwrap_or(Self::default_port(&scheme));
@@ -659,9 +716,20 @@ impl Headers {
         Self { fields: Vec::new(), present: 0 }
     }
 
+    /// The most entries a section is ever asked to make room for in advance.
+    ///
+    /// Room is an optimisation and nothing more — a section grows past this as
+    /// fields are added — so a caller asking for more than any field section
+    /// could hold is asking for an allocation the machine will refuse, and a
+    /// refused allocation ends the process rather than the call. Above this the
+    /// ask is taken as this.
+    pub const MAXIMUM_CAPACITY: usize = 64 * 1024;
+
     /// An empty section with room for `fields` entries.
+    ///
+    /// The room asked for is held to [`Headers::MAXIMUM_CAPACITY`].
     pub fn with_capacity(fields: usize) -> Self {
-        Self { fields: Vec::with_capacity(fields), present: 0 }
+        Self { fields: Vec::with_capacity(fields.min(Self::MAXIMUM_CAPACITY)), present: 0 }
     }
 
     /// The number of fields, counting repeats separately.
@@ -813,15 +881,24 @@ impl Headers {
     /// hand back exactly the list a section is made of, so it is moved in
     /// rather than copied field by field into a second one.
     ///
-    /// Every name must already be lowercase, as both codecs guarantee.
+    /// A name that is not lowercase is lowercased on the way in. The codecs
+    /// hand back whatever the peer wrote, so that a receiver can refuse an
+    /// uppercase name as the protocol requires — but a section that kept one
+    /// would answer [`Headers::contains`] with `false` for a field it holds,
+    /// since the presence bits are keyed on the lowercase name, and a lookup
+    /// that misses a `Content-Length` a message carries is how two ends come
+    /// to read one message two ways.
     ///
     /// [`hpack`]: crate::helpers::hpack
     /// [`qpack`]: crate::helpers::qpack
     pub fn from_fields(fields: Vec<HeaderField>) -> Self {
-        debug_assert!(
-            !fields.iter().any(|field| field.name.bytes().any(|byte| byte.is_ascii_uppercase())),
-            "a field name is not lowercase"
-        );
+        let mut fields = fields;
+
+        for field in &mut fields {
+            if field.name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                field.name.make_ascii_lowercase();
+            }
+        }
 
         Self { present: Self::presence(&fields), fields }
     }
@@ -987,6 +1064,25 @@ impl Message {
     /// Whether this is a 1xx response, which precedes the real one.
     pub fn is_informational(&self) -> bool {
         matches!(self.status_code, Some(100..=199))
+    }
+
+    /// Whether the message ends at its field section, whatever it carries.
+    ///
+    /// A 1xx, a 204 and a 304 carry no content by definition, and neither does
+    /// any response to `HEAD`, however it is labelled — RFC 9112 §6.3 and RFC
+    /// 9110 §9.3.2. `method` is the method of the request being answered, and
+    /// is the only way to tell the last of those apart from an ordinary
+    /// response; pass `None` on a request, which is never bodyless in this
+    /// sense.
+    ///
+    /// Every version asks this before it writes a body, since a body written
+    /// past a message that ends here is octets the peer will read as the next
+    /// message.
+    pub fn bodyless(&self, method: Option<Method>) -> bool {
+        match self.status_code {
+            Some(status_code) => matches!(status_code, 100..=199 | 204 | 304) || method == Some(Method::HEAD),
+            None => false,
+        }
     }
 
     /// Whether the body is currently carried compressed.

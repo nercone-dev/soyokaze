@@ -741,28 +741,46 @@ impl ECHKeys {
     /// client that fails ECH falls back to it. `config_id` lets a server tell
     /// its own configs apart while rotating them.
     ///
+    /// The longest `public_name` an ECHConfig can carry.
+    ///
+    /// The name is written behind a one-octet length, so nothing longer can be
+    /// described at all.
+    pub const MAXIMUM_PUBLIC_NAME: usize = u8::MAX as usize;
+
     /// # Errors
     ///
-    /// Currently infallible; the signature leaves room for key generation to
-    /// report failure.
+    /// As [`ECHKeys::encode`].
     pub fn generate(public_name: &str, config_id: u8) -> Result<Self, Error> {
         let mut public = [0u8; 32];
         let mut private = [0u8; 32];
         unsafe { boring_sys::X25519_keypair(public.as_mut_ptr(), private.as_mut_ptr()) };
 
-        Ok(Self { config: Self::encode(public_name, config_id, &public), private_key: private.to_vec() })
+        Ok(Self { config: Self::encode(public_name, config_id, &public)?, private_key: private.to_vec() })
     }
 
     /// Builds one ECHConfig around a public key.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// A `public_name` longer than 255 octets does not fit its length prefix.
-    pub fn encode(public_name: &str, config_id: u8, public_key: &[u8]) -> Vec<u8> {
+    /// Returns [`Error::TLS`] when `public_name` is longer than
+    /// [`ECHKeys::MAXIMUM_PUBLIC_NAME`] or `public_key` longer than a
+    /// two-octet length can describe. Neither fits its length prefix, and a
+    /// config that silently carried a truncated one would name a host the
+    /// server cannot present a certificate for — which is exactly where a
+    /// client that fails ECH falls back to.
+    pub fn encode(public_name: &str, config_id: u8, public_key: &[u8]) -> Result<Vec<u8>, Error> {
+        if public_name.len() > Self::MAXIMUM_PUBLIC_NAME {
+            return Err(Error::TLS(format!("an ECH public name of {} octets does not fit its length prefix", public_name.len())));
+        }
+
+        let Ok(key_length) = u16::try_from(public_key.len()) else {
+            return Err(Error::TLS(format!("an ECH public key of {} octets does not fit its length prefix", public_key.len())));
+        };
+
         let mut contents = Vec::new();
         contents.push(config_id);
         contents.extend_from_slice(&Self::KEM_X25519_HKDF_SHA256.to_be_bytes());
-        contents.extend_from_slice(&(public_key.len() as u16).to_be_bytes());
+        contents.extend_from_slice(&key_length.to_be_bytes());
         contents.extend_from_slice(public_key);
         contents.extend_from_slice(&4u16.to_be_bytes());
         contents.extend_from_slice(&Self::KDF_HKDF_SHA256.to_be_bytes());
@@ -775,7 +793,7 @@ impl ECHKeys {
         let mut config = ECHConfig::VERSION.to_be_bytes().to_vec();
         config.extend_from_slice(&(contents.len() as u16).to_be_bytes());
         config.extend_from_slice(&contents);
-        config
+        Ok(config)
     }
 
     /// The config wrapped as a one-entry `ECHConfigList`, ready to publish.

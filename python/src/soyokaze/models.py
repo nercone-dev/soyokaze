@@ -378,15 +378,23 @@ class Headers:
         """An empty section with room for ``fields`` entries."""
         return cls(handle=library.soyokaze_headers_with_capacity(fields), owned=True)
 
-    def __init__(self, handle=None, owned=None):
-        """An empty section, or a view of one the library handed back."""
+    def __init__(self, handle=None, owned=None, owner=None):
+        """An empty section, or a view of one the library handed back.
+
+        ``owner`` is whatever the handle is borrowed from — a :class:`Message`,
+        usually. A borrowed view holds it so that the thing it points into
+        cannot be collected while the view is still alive; without that,
+        ``message.headers`` outliving the message it came from would leave a
+        handle pointing at freed memory.
+        """
         self.owned = owned if owned is not None else handle is None
+        self.owner = owner
         self.handle = handle if handle is not None else library.soyokaze_headers_new()
 
     def __del__(self):
         if getattr(self, "owned", False) and getattr(self, "handle", None):
             library.soyokaze_headers_free(self.handle)
-            self.handle = None
+        self.handle = None
 
     def len(self):
         """How many fields the section holds."""
@@ -737,10 +745,10 @@ class Message(ResponseMixin):
     def headers(self):
         """The message's field section, borrowed from it.
 
-        Built empty when the message has none yet, and valid only for as long
-        as the message is.
+        Built empty when the message has none yet. The view holds the message,
+        so it stays valid for as long as the view itself is held.
         """
-        return Headers(handle=library.soyokaze_message_headers(self.handle), owned=False)
+        return Headers(handle=library.soyokaze_message_headers(self.handle), owned=False, owner=self)
 
     def header(self, name):
         """The first header value stored under ``name``, or ``None``.
@@ -774,7 +782,7 @@ class Message(ResponseMixin):
 
         As :attr:`headers`, for the fields that follow the body.
         """
-        return Headers(handle=library.soyokaze_message_trailers(self.handle), owned=False)
+        return Headers(handle=library.soyokaze_message_trailers(self.handle), owned=False, owner=self)
 
     def trailer(self, name):
         """The first trailer value stored under ``name``, or ``None``."""

@@ -274,20 +274,21 @@ class CookieJar:
     :class:`Client`: soyokaze.client.Client
     """
 
-    def __init__(self, limits=None, handle=None):
+    def __init__(self, limits=None, handle=None, owner=None):
         """An empty jar bounded by ``limits``, or a view of one already built.
 
         A jar reached through :attr:`Client.jar <soyokaze.api.client.Client.jar>`
-        belongs to that client: it is borrowed rather than owned, and is valid
-        only for as long as the client is.
+        belongs to that client: it is borrowed rather than owned. ``owner`` is
+        that client, held here so the jar cannot outlive what it points into.
         """
         self.owned = handle is None
+        self.owner = owner
         self.handle = handle if handle is not None else library.soyokaze_cookiejar_new(Limits.pointer(Limits.argument(limits)))
 
     def __del__(self):
         if getattr(self, "owned", False) and getattr(self, "handle", None):
             library.soyokaze_cookiejar_free(self.handle)
-            self.handle = None
+        self.handle = None
 
     @property
     def limits(self):

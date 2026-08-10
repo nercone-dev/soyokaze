@@ -816,3 +816,37 @@ fn a_client_builds_its_tls_configuration_once() {
 
     assert!(std::ptr::eq(first, second), "each dial built a fresh TLS configuration instead of reusing the client's");
 }
+
+// ---------------------------------------------------------------- conformance
+
+#[test]
+fn an_ech_config_refuses_a_name_longer_than_its_length_prefix() {
+    let key = [0u8; 32];
+
+    let fits = "a".repeat(tls::ECHKeys::MAXIMUM_PUBLIC_NAME);
+    assert!(tls::ECHKeys::encode(&fits, 0, &key).is_ok(), "a name that fits its one-octet length is encodable");
+
+    let over = "a".repeat(tls::ECHKeys::MAXIMUM_PUBLIC_NAME + 1);
+    assert!(
+        matches!(tls::ECHKeys::encode(&over, 0, &key), Err(soyokaze::Error::TLS(_))),
+        "a name that does not fit must be refused, not cut — a client that fails ECH falls back to whatever it names"
+    );
+    assert!(matches!(tls::ECHKeys::generate(&over, 0), Err(soyokaze::Error::TLS(_))), "and generating one must fail the same way");
+}
+
+#[test]
+fn an_ech_config_names_the_key_it_was_built_around() {
+    let key = [7u8; 32];
+    let config = tls::ECHKeys::encode("public.test", 9, &key).expect("an ordinary config did not encode");
+
+    let list = {
+        let mut list = (config.len() as u16).to_be_bytes().to_vec();
+        list.extend_from_slice(&config);
+        list
+    };
+
+    let parsed = tls::ECHConfigList::parse(&list).expect("the config list did not parse");
+    assert_eq!(parsed.configs.len(), 1);
+    assert_eq!(parsed.configs[0].public_name, "public.test");
+    assert_eq!(parsed.configs[0].maximum_name_length, tls::ECHKeys::MAXIMUM_NAME_LENGTH);
+}

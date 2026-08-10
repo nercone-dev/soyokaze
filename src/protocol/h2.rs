@@ -104,7 +104,7 @@ pub use frames::{Code, Flag, Frame, FrameHeader, FrameType, Settings, PREFACE};
 use crate::helpers::compression::Compression;
 use crate::helpers::fields::HeaderField;
 use crate::helpers::hpack::{Decoder as HPACKDecoder, Encoder as HPACKEncoder};
-use crate::models::{Body, ConnectionID, Headers, Limits, Message, Method, Role, StreamID, Version};
+use crate::models::{Body, ConnectionID, Limits, Message, Method, Role, StreamID, Version};
 use crate::tls::Security;
 use crate::protocol::base::{Connection, Stream};
 use crate::protocol::common::{self, Buffer, Error};
@@ -575,8 +575,25 @@ where
         self.start().await?;
         self.flush_resets().await?;
 
+        let window_local = self.settings_local.initial_window_size as i64;
+        let window_remote = self.settings_remote.initial_window_size as i64;
+
         let stream_id = match message.stream_id {
-            Some(stream_id) => stream_id,
+            // A stream the caller names is one that already exists: the
+            // request it answers opened it. Making one here instead would
+            // resurrect a stream the peer had reset, and since a resurrected
+            // stream never reaches `Closed` it would never be retired either,
+            // so the map would grow for the life of the connection and the
+            // concurrency ceiling would close over it.
+            Some(stream_id) => {
+                if !self.streams.contains_key(&stream_id) {
+                    let reason = format!("stream {} is no longer open", stream_id.0);
+                    return Err(Error::stream(stream_id, Code::STREAM_CLOSED as u64, reason));
+                }
+
+                stream_id
+            }
+
             None => {
                 let ceiling = self.local_stream_ceiling();
                 if self.streams.len() >= ceiling {
@@ -585,14 +602,11 @@ where
 
                 let stream_id = StreamID(self.next_stream_id);
                 self.next_stream_id += 2;
+
+                self.streams.insert(stream_id, H2Stream::new(stream_id, window_local, window_remote));
                 stream_id
             }
         };
-
-        let window_local = self.settings_local.initial_window_size as i64;
-        let window_remote = self.settings_remote.initial_window_size as i64;
-
-        self.streams.entry(stream_id).or_insert_with(|| H2Stream::new(stream_id, window_local, window_remote));
 
         message.materialize().await?;
         message.compress(message.is_response().then(|| self.streams.get(&stream_id)?.accepted).flatten())?;
@@ -604,10 +618,15 @@ where
         block.clear();
         self.hpack_encoder.encode_into(&mut block, &self.fields);
 
+        // A message that ends at its field section carries neither DATA nor a
+        // trailer section, whatever the caller attached — RFC 9112 §6.3 for
+        // the `HEAD` case, and the status itself for the rest.
+        let framed = !message.bodyless(self.streams.get(&stream_id).and_then(|stream| stream.method));
+
         let body = message.body.take().and_then(|body| body.inline());
 
-        let body = body.filter(|body| !body.is_empty());
-        let trailers = message.trailers.as_ref().filter(|trailers| !trailers.is_empty());
+        let body = body.filter(|body| framed && !body.is_empty());
+        let trailers = message.trailers.as_ref().filter(|trailers| framed && !trailers.is_empty());
 
         let tunneling = message.method == Some(Method::CONNECT)
             || (matches!(message.status_code, Some(200..=299))
@@ -756,10 +775,27 @@ where
     /// otherwise as [`Frame::parse`], [`H2Connection::flush_out`] and
     /// [`Buffer::fill`].
     pub async fn read_frame(&mut self) -> Result<Frame, Error> {
+        loop {
+            if let Ok(frame) = self.read_frame_kept().await? {
+                return Ok(frame);
+            }
+        }
+    }
+
+    /// [`H2Connection::read_frame`], reporting a frame of unknown type rather
+    /// than reading past it.
+    ///
+    /// What [`H2Connection::continue_headers`] reads through, since nothing at
+    /// all may come between a HEADERS frame and its CONTINUATION frames.
+    ///
+    /// # Errors
+    ///
+    /// As [`H2Connection::read_frame`].
+    pub async fn read_frame_kept(&mut self) -> Result<Result<Frame, u8>, Error> {
         let max_frame_size = self.settings_local.max_frame_size;
 
         loop {
-            if let Some(frame) = Frame::parse(self.buffer.as_bytes_mut(), max_frame_size)? {
+            if let Some(frame) = Frame::take(self.buffer.as_bytes_mut(), max_frame_size)? {
                 return Ok(frame);
             }
 
@@ -940,6 +976,24 @@ where
                     self.idle_frames = 0;
                 }
 
+                // The connection window is spent by every DATA frame that
+                // arrives, whatever becomes of the stream carrying it. It is
+                // accounted for and given back here rather than after the
+                // stream checks below, since a frame that costs one stream its
+                // life still cost the peer connection credit, and never
+                // returning that credit would shrink the connection window for
+                // good and stall every other stream on it.
+                self.window_local -= data.len() as i64;
+                if self.window_local < 0 {
+                    return Err(Error::Protocol("connection receive window overflowed".into()));
+                }
+
+                if !data.is_empty() {
+                    let increment = data.len() as u32;
+                    self.queue(&Frame::WindowUpdate { stream_id: StreamID(0), increment });
+                    self.window_local += increment as i64;
+                }
+
                 let stream = self.open_stream(stream_id)?;
                 stream.window_local -= data.len() as i64;
                 if stream.window_local < 0 {
@@ -969,21 +1023,12 @@ where
                     return Err(Error::Limit(format!("buffered messages exceed {limit} octets")));
                 }
 
-                self.window_local -= data.len() as i64;
-                if self.window_local < 0 {
-                    return Err(Error::Protocol("connection receive window overflowed".into()));
-                }
-
-                if !data.is_empty() {
+                if !data.is_empty() && self.streams.get(&stream_id).is_some_and(|stream| stream.state.receivable()) {
                     let increment = data.len() as u32;
-                    self.queue(&Frame::WindowUpdate { stream_id: StreamID(0), increment });
-                    self.window_local += increment as i64;
+                    self.queue(&Frame::WindowUpdate { stream_id, increment });
 
-                    if self.streams.get(&stream_id).is_some_and(|stream| stream.state.receivable()) {
-                        self.queue(&Frame::WindowUpdate { stream_id, increment });
-                        if let Some(stream) = self.streams.get_mut(&stream_id) {
-                            stream.window_local += increment as i64;
-                        }
+                    if let Some(stream) = self.streams.get_mut(&stream_id) {
+                        stream.window_local += increment as i64;
                     }
                 }
 
@@ -1023,7 +1068,7 @@ where
                 return Err(Error::Limit(format!("field block spans more than {} CONTINUATION frames", self.limits.max_header_count)));
             }
 
-            match self.read_frame().await? {
+            match self.read_frame_kept().await?.map_err(|kind| Error::Protocol(format!("a frame of type {kind:#x} interrupted a field block")))? {
                 Frame::Continuation { stream_id: other, end_headers, block } if other == stream_id => {
                     self.open_stream(stream_id)?.block.extend_from_slice(&block);
 
@@ -1125,22 +1170,19 @@ where
         let connection_id = self.id.clone();
         let client = self.client;
         let security = self.security;
-        let stream = self.open_stream(stream_id)?;
 
-        if let Some(message) = &mut stream.headers {
-            let mut trailers = Headers::with_capacity(decoded.len());
+        // A second field section on a stream is its trailer section, and is
+        // held to different rules, so which it is has to be settled before the
+        // fields are read at all.
+        if self.open_stream(stream_id)?.headers.is_some() {
+            let trailers = common::Fields::into_trailers(decoded)?;
 
-            for field in decoded {
-                if field.name.starts_with(':') {
-                    return Err(Error::Protocol("trailer section carries a pseudo-header".into()));
-                }
-
-                trailers.append(field.name, field.value);
+            if let Some(message) = &mut self.open_stream(stream_id)?.headers {
+                message.trailers = Some(trailers);
             }
-
-            message.trailers = Some(trailers);
         } else {
             let mut message = common::Fields::into_message(decoded, Version::V2_0)?;
+            let stream = self.open_stream(stream_id)?;
             message.stream_id = Some(stream_id);
             message.connection_id = Some(connection_id);
             message.client = client;
@@ -1159,6 +1201,7 @@ where
             stream.headers = Some(message);
         }
 
+        let stream = self.open_stream(stream_id)?;
         stream.state = if stream.state == StreamState::Idle { StreamState::Open } else { stream.state };
 
         let tunneling = stream.headers.as_ref().is_some_and(|message| message.tunneling(stream.method));
@@ -1264,7 +1307,15 @@ where
         let mut rest = data;
 
         loop {
-            let window = self.window_remote.min(self.streams.get(&stream_id).map(|stream| stream.window_remote).unwrap_or_default());
+            // A stream that has gone will never be given credit again, so
+            // waiting on it would hold the task until the send deadline for
+            // nothing. The peer reset it; say so and let the caller move on.
+            let Some(stream_window) = self.streams.get(&stream_id).map(|stream| stream.window_remote) else {
+                let reason = format!("stream {} is no longer open", stream_id.0);
+                return Err(Error::stream(stream_id, Code::STREAM_CLOSED as u64, reason));
+            };
+
+            let window = self.window_remote.min(stream_window);
 
             if window <= 0 && !rest.is_empty() {
                 if let Some(message) = self.pump().await? {

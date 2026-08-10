@@ -134,7 +134,8 @@ impl DateCache {
                 cell.set((seconds, octets));
             }
 
-            Text::from_verified_ascii(&octets)
+            // SAFETY: `DateCache::write` fills the array with ASCII alone.
+            unsafe { Text::from_verified_ascii(&octets) }
         })
     }
 }

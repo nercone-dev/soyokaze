@@ -49,6 +49,22 @@ pub enum DecodeError {
 }
 
 impl DecodeError {
+    /// The error a `soyokaze_huffman_error_t` names, or `None` when it names
+    /// none.
+    ///
+    /// A Rust enum holding a value it has no variant for is undefined
+    /// behaviour rather than a value to be matched, so a number arriving from
+    /// C is read here before it is taken for one.
+    pub fn from_code(code: i32) -> Option<Self> {
+        Some(match code {
+            0 => Self::Ok,
+            1 => Self::InvalidPadding,
+            2 => Self::UnknownSymbol,
+            3 => Self::Invalid,
+            _ => return None,
+        })
+    }
+
     /// The error that stands for `error`.
     pub fn of(error: &crate::helpers::huffman::DecodeError) -> Self {
         match error {
@@ -83,8 +99,8 @@ impl DecodeError {
 ///
 /// Borrowed from the library and valid for its lifetime.
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_huffman_error_message(error: DecodeError) -> Slice {
-    Slice::text(error.message())
+pub extern "C" fn soyokaze_huffman_error_message(error: i32) -> Slice {
+    Slice::maybe(DecodeError::from_code(error).map(|error| error.message()))
 }
 
 /// The end-of-string symbol, which never appears in a well-formed encoding.

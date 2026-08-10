@@ -190,7 +190,17 @@ impl Buffer {
     pub const EMPTY: Self = Self { data: std::ptr::null_mut(), len: 0, capacity: 0 };
 
     /// Hands `octets` to the caller.
+    ///
+    /// An empty `octets` comes back as [`Buffer::EMPTY`] rather than as a
+    /// pointer to nothing. A `Vec` that holds no octets still carries a
+    /// pointer — the aligned one it stands on before it allocates — and
+    /// handing that back would make `data` non-null for a buffer that is
+    /// empty, which is exactly what this type documents null to mean.
     pub fn new(octets: Vec<u8>) -> Self {
+        if octets.is_empty() {
+            return Self::EMPTY;
+        }
+
         let mut octets = std::mem::ManuallyDrop::new(octets);
         Self { data: octets.as_mut_ptr(), len: octets.len(), capacity: octets.capacity() }
     }

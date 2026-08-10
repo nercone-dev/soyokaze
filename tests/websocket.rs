@@ -544,3 +544,27 @@ fn taking_a_partial_frame_leaves_the_buffer_untouched() {
         assert_eq!(buffer, encoded[..partial], "{partial} octets must be left where they were");
     }
 }
+
+// ---------------------------------------------------------------- conformance
+
+#[test]
+fn a_close_reason_is_cut_on_a_character_boundary() {
+    use soyokaze::websocket::{WebSocketConnection, MAXIMUM_CONTROL_PAYLOAD};
+
+    let room = MAXIMUM_CONTROL_PAYLOAD - size_of::<u16>();
+
+    let plain = "a".repeat(200);
+    assert_eq!(WebSocketConnection::<tokio::io::DuplexStream>::reason(&plain).len(), room, "the code takes the first two octets");
+
+    // A reason whose cut would land inside a character: the multi-byte one
+    // straddles the room the payload leaves.
+    let straddling = format!("{}{}", "a".repeat(room - 1), "\u{3042}");
+    let cut = WebSocketConnection::<tokio::io::DuplexStream>::reason(&straddling);
+
+    assert!(cut.len() < room, "the cut moved back to a boundary rather than splitting the character");
+    assert_eq!(cut, "a".repeat(room - 1));
+    assert!(
+        std::str::from_utf8(cut.as_bytes()).is_ok(),
+        "RFC 6455 5.5.1: a close reason is valid UTF-8, and half a character is not"
+    );
+}

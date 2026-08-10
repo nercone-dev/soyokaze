@@ -31,6 +31,21 @@ pub enum DecodeError {
 }
 
 impl DecodeError {
+    /// The error a `soyokaze_base64_error_t` names, or `None` when it names
+    /// none.
+    ///
+    /// As [`crate::ffi::helpers::huffman::DecodeError::from_code`].
+    pub fn from_code(code: i32) -> Option<Self> {
+        Some(match code {
+            0 => Self::Ok,
+            1 => Self::InvalidLength,
+            2 => Self::InvalidSymbol,
+            3 => Self::InvalidPadding,
+            4 => Self::Invalid,
+            _ => return None,
+        })
+    }
+
     /// The error that stands for `error`, with the value it carries.
     pub fn of(error: &crate::helpers::base64::DecodeError) -> (Self, u64) {
         match error {
@@ -73,8 +88,8 @@ impl DecodeError {
 ///
 /// Borrowed from the library and valid for its lifetime.
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_base64_error_message(error: DecodeError) -> Slice {
-    Slice::text(error.message())
+pub extern "C" fn soyokaze_base64_error_message(error: i32) -> Slice {
+    Slice::maybe(DecodeError::from_code(error).map(|error| error.message()))
 }
 
 /// The standard alphabet, indexed by sextet value. Always 64 octets.

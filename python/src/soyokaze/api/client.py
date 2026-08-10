@@ -357,7 +357,7 @@ class Client:
         Borrowed from the client and valid only for as long as it is.
         """
         handle = library.soyokaze_client_jar(self.handle)
-        return None if not handle else CookieJar(handle=handle)
+        return None if not handle else CookieJar(handle=handle, owner=self)
 
     @property
     def store(self):
@@ -366,7 +366,7 @@ class Client:
         As :attr:`jar`, for the store.
         """
         handle = library.soyokaze_client_store(self.handle)
-        return None if not handle else HSTSStore(handle=handle)
+        return None if not handle else HSTSStore(handle=handle, owner=self)
 
     def apply_hsts(self, url):
         """Rewrites a URL to ``https`` when this client's store insists on it.

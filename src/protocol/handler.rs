@@ -266,13 +266,22 @@ impl Negotiation {
             && buffer.as_slice()[..sniffed] == h2::PREFACE[..sniffed];
 
         if h2 {
-            return Ok(AnyConnection::H2(H2Connection::resume(transport, Role::Origin, id, self.limits, buffer).with_client(client)));
+            let connection = H2Connection::resume(transport, Role::Origin, id, self.limits, buffer)
+                .with_response_finalizer(self.response_finalizer)
+                .with_client(client);
+
+            return Ok(AnyConnection::H2(connection));
         }
 
         let Some(version) = self.versions.iter().copied().find(|version| version.major() == 1) else {
             return Err(Error::Version("the peer sent no HTTP/2 preface and this port offers no HTTP/1.x".into()));
         };
 
-        Ok(AnyConnection::H1(H1Connection::resume(transport, Role::Origin, id, self.limits, buffer).with_version(version).with_client(client)))
+        let connection = H1Connection::resume(transport, Role::Origin, id, self.limits, buffer)
+            .with_version(version)
+            .with_response_finalizer(self.response_finalizer)
+            .with_client(client);
+
+        Ok(AnyConnection::H1(connection))
     }
 }

@@ -209,8 +209,12 @@ pub unsafe extern "C" fn soyokaze_client_free(client: *mut Client) {
 /// point to `url_len` readable octets, `request` must either be null or be a
 /// message handle the caller owns, and `out` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_client_fetch(runtime: *mut Runtime, client: *const Client, method: Method, url: *const u8, url_len: usize, request: *mut Message, out: *mut *mut Message, error: *mut *mut ErrorHandle) -> Status {
+pub unsafe extern "C" fn soyokaze_client_fetch(runtime: *mut Runtime, client: *const Client, method: i32, url: *const u8, url_len: usize, request: *mut Message, out: *mut *mut Message, error: *mut *mut ErrorHandle) -> Status {
     let request = (!request.is_null()).then(|| *unsafe { Box::from_raw(request) });
+
+    let Some(method) = Method::from_code(method) else {
+        return unsafe { ErrorHandle::raise(error, Status::Invalid) };
+    };
 
     let (Some(runtime), Some(client), Some(url)) = (unsafe { runtime.as_ref() }, unsafe { client.as_ref() }, unsafe { Slice::borrow_text(url, url_len) })
     else {
@@ -242,7 +246,7 @@ pub unsafe extern "C" fn soyokaze_client_fetch(runtime: *mut Runtime, client: *c
 /// As [`soyokaze_client_fetch`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_client_get(runtime: *mut Runtime, client: *const Client, url: *const u8, url_len: usize, out: *mut *mut Message, error: *mut *mut ErrorHandle) -> Status {
-    unsafe { soyokaze_client_fetch(runtime, client, Method::GET, url, url_len, std::ptr::null_mut(), out, error) }
+    unsafe { soyokaze_client_fetch(runtime, client, Method::GET as i32, url, url_len, std::ptr::null_mut(), out, error) }
 }
 
 /// A `HEAD`; see [`soyokaze_client_fetch`].
@@ -252,7 +256,7 @@ pub unsafe extern "C" fn soyokaze_client_get(runtime: *mut Runtime, client: *con
 /// As [`soyokaze_client_fetch`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_client_head(runtime: *mut Runtime, client: *const Client, url: *const u8, url_len: usize, out: *mut *mut Message, error: *mut *mut ErrorHandle) -> Status {
-    unsafe { soyokaze_client_fetch(runtime, client, Method::HEAD, url, url_len, std::ptr::null_mut(), out, error) }
+    unsafe { soyokaze_client_fetch(runtime, client, Method::HEAD as i32, url, url_len, std::ptr::null_mut(), out, error) }
 }
 
 /// A `POST`; see [`soyokaze_client_fetch`].
@@ -262,7 +266,7 @@ pub unsafe extern "C" fn soyokaze_client_head(runtime: *mut Runtime, client: *co
 /// As [`soyokaze_client_fetch`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_client_post(runtime: *mut Runtime, client: *const Client, url: *const u8, url_len: usize, request: *mut Message, out: *mut *mut Message, error: *mut *mut ErrorHandle) -> Status {
-    unsafe { soyokaze_client_fetch(runtime, client, Method::POST, url, url_len, request, out, error) }
+    unsafe { soyokaze_client_fetch(runtime, client, Method::POST as i32, url, url_len, request, out, error) }
 }
 
 /// A `PUT`; see [`soyokaze_client_fetch`].
@@ -272,7 +276,7 @@ pub unsafe extern "C" fn soyokaze_client_post(runtime: *mut Runtime, client: *co
 /// As [`soyokaze_client_fetch`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_client_put(runtime: *mut Runtime, client: *const Client, url: *const u8, url_len: usize, request: *mut Message, out: *mut *mut Message, error: *mut *mut ErrorHandle) -> Status {
-    unsafe { soyokaze_client_fetch(runtime, client, Method::PUT, url, url_len, request, out, error) }
+    unsafe { soyokaze_client_fetch(runtime, client, Method::PUT as i32, url, url_len, request, out, error) }
 }
 
 /// A `DELETE`; see [`soyokaze_client_fetch`].
@@ -282,7 +286,7 @@ pub unsafe extern "C" fn soyokaze_client_put(runtime: *mut Runtime, client: *con
 /// As [`soyokaze_client_fetch`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soyokaze_client_delete(runtime: *mut Runtime, client: *const Client, url: *const u8, url_len: usize, out: *mut *mut Message, error: *mut *mut ErrorHandle) -> Status {
-    unsafe { soyokaze_client_fetch(runtime, client, Method::DELETE, url, url_len, std::ptr::null_mut(), out, error) }
+    unsafe { soyokaze_client_fetch(runtime, client, Method::DELETE as i32, url, url_len, std::ptr::null_mut(), out, error) }
 }
 
 /// Opens a connection for a URL, taking the transport from its scheme.

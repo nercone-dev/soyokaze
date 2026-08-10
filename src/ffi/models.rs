@@ -36,8 +36,12 @@ pub enum PortKind {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Port {
-    /// Which transport the port names.
-    pub kind: PortKind,
+    /// Which transport the port names, as a [`PortKind`] number.
+    ///
+    /// Held as its number rather than as the enum, so that a value naming no
+    /// kind is a port that will not parse rather than a Rust enum holding
+    /// something it has no variant for, which is undefined behaviour.
+    pub kind: i32,
     /// The port number, for a TCP or QUIC port.
     pub number: u16,
     /// The socket path, for a Unix domain socket.
@@ -46,10 +50,23 @@ pub struct Port {
     pub path_len: usize,
 }
 
+impl PortKind {
+    /// The kind a `soyokaze_port_kind_t` names, or `None` when it names none.
+    pub fn from_code(code: i32) -> Option<Self> {
+        Some(match code {
+            0 => Self::UDS,
+            1 => Self::TCP,
+            2 => Self::QUIC,
+            _ => return None,
+        })
+    }
+}
+
 impl Port {
     /// The [`Port`] this names.
     ///
-    /// Returns `None` when a Unix socket path is absent or is not UTF-8.
+    /// Returns `None` when the kind names none, or when a Unix socket path is
+    /// absent or is not UTF-8.
     ///
     /// [`Port`]: crate::models::Port
     ///
@@ -57,7 +74,7 @@ impl Port {
     ///
     /// `path` must either be null or point to `path_len` readable octets.
     pub unsafe fn parse(&self) -> Option<crate::models::Port> {
-        match self.kind {
+        match PortKind::from_code(self.kind)? {
             PortKind::TCP => Some(crate::models::Port::TCP(self.number)),
             PortKind::QUIC => Some(crate::models::Port::QUIC(self.number)),
             PortKind::UDS => Some(crate::models::Port::UDS(unsafe { Slice::borrow_text(self.path, self.path_len) }?.to_owned())),
@@ -193,8 +210,8 @@ pub unsafe extern "C" fn soyokaze_url_authority(url: *const URL) -> Buffer {
 /// [`soyokaze_message_request`] and [`soyokaze_message_response`] are the
 /// usual entry points; this is for the rare caller assembling one by hand.
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_message_new(version: Version) -> *mut Message {
-    Box::into_raw(Box::new(Message::new(version)))
+pub extern "C" fn soyokaze_message_new(version: i32) -> *mut Message {
+    Box::into_raw(Box::new(Message::new(Version::of(version))))
 }
 
 /// Builds a request.
@@ -202,19 +219,19 @@ pub extern "C" fn soyokaze_message_new(version: Version) -> *mut Message {
 /// # Safety
 ///
 /// `target` must point to `target_len` readable octets. Returns null when it is
-/// not UTF-8.
+/// not UTF-8, or when `method` names no method.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_message_request(method: Method, target: *const u8, target_len: usize, version: Version) -> *mut Message {
-    match unsafe { Slice::borrow_text(target, target_len) } {
-        Some(target) => Box::into_raw(Box::new(Message::request(method, target, version))),
-        None => std::ptr::null_mut(),
+pub unsafe extern "C" fn soyokaze_message_request(method: i32, target: *const u8, target_len: usize, version: i32) -> *mut Message {
+    match (Method::from_code(method), unsafe { Slice::borrow_text(target, target_len) }) {
+        (Some(method), Some(target)) => Box::into_raw(Box::new(Message::request(method, target, Version::of(version)))),
+        _ => std::ptr::null_mut(),
     }
 }
 
 /// Builds a response.
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_message_response(status_code: u16, version: Version) -> *mut Message {
-    Box::into_raw(Box::new(Message::response(status_code, version)))
+pub extern "C" fn soyokaze_message_response(status_code: u16, version: i32) -> *mut Message {
+    Box::into_raw(Box::new(Message::response(status_code, Version::of(version))))
 }
 
 /// Releases a [`Message`].
@@ -1226,7 +1243,11 @@ pub unsafe extern "C" fn soyokaze_port_transport(port: *const Port) -> Transport
 ///
 /// As [`soyokaze_port_transport`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_port_carries(port: *const Port, version: Version) -> bool {
+pub unsafe extern "C" fn soyokaze_port_carries(port: *const Port, version: i32) -> bool {
+    let Some(version) = Version::from_code(version) else {
+        return false;
+    };
+
     unsafe { port.as_ref() }.and_then(|port| unsafe { port.parse() }).is_some_and(|port| port.carries(version))
 }
 
@@ -1245,7 +1266,7 @@ pub unsafe extern "C" fn soyokaze_port_offers(port: *const Port, versions: *cons
         return 0;
     };
 
-    let offered = port.offers(&versions);
+    let offered = port.offers(versions);
 
     if !out.is_null() {
         for (index, version) in offered.iter().take(count).enumerate() {
@@ -1310,8 +1331,8 @@ pub unsafe extern "C" fn soyokaze_url_authority_of(scheme: *const u8, scheme_len
 /// The ALPN identifier a version is negotiated under, borrowed from the
 /// library.
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_version_alpn(version: Version) -> Slice {
-    Slice::text(version.alpn())
+pub extern "C" fn soyokaze_version_alpn(version: i32) -> Slice {
+    Slice::maybe(Version::from_code(version).map(|version| version.alpn()))
 }
 
 /// The version an ALPN identifier names, or `-1` when it names none.
@@ -1329,20 +1350,20 @@ pub unsafe extern "C" fn soyokaze_version_from_alpn(alpn: *const u8, alpn_len: u
 
 /// The major version number.
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_version_major(version: Version) -> u8 {
-    version.major()
+pub extern "C" fn soyokaze_version_major(version: i32) -> u8 {
+    Version::from_code(version).map_or(0, |version| version.major())
 }
 
 /// What the version runs over.
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_version_transport(version: Version) -> TransportKind {
-    TransportKind::build(version.transport())
+pub extern "C" fn soyokaze_version_transport(version: i32) -> TransportKind {
+    TransportKind::build(Version::of(version).transport())
 }
 
 /// How the version is written out, borrowed from the library.
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_version_name(version: Version) -> Slice {
-    Slice::text(version.as_str())
+pub extern "C" fn soyokaze_version_name(version: i32) -> Slice {
+    Slice::maybe(Version::from_code(version).map(|version| version.as_str()))
 }
 
 /// The version a name spells out, or `-1` when it spells none.
@@ -1425,8 +1446,8 @@ pub unsafe extern "C" fn soyokaze_alpn_negotiated(alpn: *const u8, alpn_len: usi
 
 /// The method as it is written on the wire, borrowed from the library.
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_method_name(method: Method) -> Slice {
-    Slice::text(method.as_str())
+pub extern "C" fn soyokaze_method_name(method: i32) -> Slice {
+    Slice::maybe(Method::from_code(method).map(|method| method.as_str()))
 }
 
 /// The method a name spells out, or `-1` when it spells none.
@@ -1444,26 +1465,26 @@ pub unsafe extern "C" fn soyokaze_method_parse(name: *const u8, name_len: usize)
 
 /// Whether the method is read-only, so that issuing it changes nothing.
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_method_safe(method: Method) -> bool {
-    method.safe()
+pub extern "C" fn soyokaze_method_safe(method: i32) -> bool {
+    Method::from_code(method).is_some_and(|method| method.safe())
 }
 
 /// Whether repeating the method has the same effect as issuing it once.
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_method_idempotent(method: Method) -> bool {
-    method.idempotent()
+pub extern "C" fn soyokaze_method_idempotent(method: i32) -> bool {
+    Method::from_code(method).is_some_and(|method| method.idempotent())
 }
 
 /// Whether this role sends requests and reads responses.
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_role_is_client(role: Role) -> bool {
-    role.is_client()
+pub extern "C" fn soyokaze_role_is_client(role: i32) -> bool {
+    Role::from_code(role).is_some_and(|role| role.is_client())
 }
 
 /// Whether this role reads requests and sends responses.
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_role_is_server(role: Role) -> bool {
-    role.is_server()
+pub extern "C" fn soyokaze_role_is_server(role: i32) -> bool {
+    Role::from_code(role).is_some_and(|role| role.is_server())
 }
 
 /// How field names are cased on the way out.
@@ -1499,12 +1520,32 @@ impl HeaderCase {
             crate::models::HeaderCase::Lower => Self::Lower,
         }
     }
+
+    /// The casing a `soyokaze_header_case_t` names, or `None` when it names
+    /// none.
+    ///
+    /// As [`Version::from_code`].
+    pub fn from_code(code: i32) -> Option<Self> {
+        Some(match code {
+            0 => Self::Title,
+            1 => Self::Lower,
+            _ => return None,
+        })
+    }
+
+    /// The casing a code names, or [`HeaderCase::Lower`] when it names none.
+    ///
+    /// Lowercase is what every version accepts, so it is the safe reading of a
+    /// code this end does not know.
+    pub fn of(code: i32) -> Self {
+        Self::from_code(code).unwrap_or(Self::Lower)
+    }
 }
 
 /// The casing a version expects: title case for HTTP/1.x, lowercase above.
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_header_case_from_version(version: Version) -> HeaderCase {
-    HeaderCase::build(crate::models::HeaderCase::from_version(version))
+pub extern "C" fn soyokaze_header_case_from_version(version: i32) -> HeaderCase {
+    HeaderCase::build(crate::models::HeaderCase::from_version(Version::of(version)))
 }
 
 /// A field name in this casing, owned by the caller.
@@ -1513,9 +1554,9 @@ pub extern "C" fn soyokaze_header_case_from_version(version: Version) -> HeaderC
 ///
 /// `name` must either be null or point to `name_len` readable octets.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_header_case_apply(case: HeaderCase, name: *const u8, name_len: usize) -> Buffer {
+pub unsafe extern "C" fn soyokaze_header_case_apply(case: i32, name: *const u8, name_len: usize) -> Buffer {
     match unsafe { Slice::borrow_text(name, name_len) } {
-        Some(name) => Buffer::new(case.parse().apply(name).into_bytes()),
+        Some(name) => Buffer::new(HeaderCase::of(case).parse().apply(name).into_bytes()),
         None => Buffer::EMPTY,
     }
 }
@@ -1526,12 +1567,12 @@ pub unsafe extern "C" fn soyokaze_header_case_apply(case: HeaderCase, name: *con
 ///
 /// `name` must either be null or point to `name_len` writable octets.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_header_case_apply_in_place(case: HeaderCase, name: *mut u8, name_len: usize) -> bool {
+pub unsafe extern "C" fn soyokaze_header_case_apply_in_place(case: i32, name: *mut u8, name_len: usize) -> bool {
     if name.is_null() {
         return false;
     }
 
-    case.parse().apply_in_place(unsafe { std::slice::from_raw_parts_mut(name, name_len) });
+    HeaderCase::of(case).parse().apply_in_place(unsafe { std::slice::from_raw_parts_mut(name, name_len) });
     true
 }
 
@@ -1826,6 +1867,50 @@ pub unsafe extern "C" fn soyokaze_message_tunneling(message: *const Message, met
     message.tunneling(Method::from_code(method))
 }
 
+impl Version {
+    /// The version a `soyokaze_version_t` names, or `None` when it names none.
+    ///
+    /// Every call that takes a version takes it as its number and comes
+    /// through here. A Rust enum holding a value it has no variant for is
+    /// undefined behaviour rather than a value to be matched, so nothing a C
+    /// caller passes is ever taken for one until it has been read here.
+    pub fn from_code(code: i32) -> Option<Self> {
+        Some(match code {
+            0 => Self::V1_0,
+            1 => Self::V1_1,
+            2 => Self::V2_0,
+            3 => Self::V3_0,
+            _ => return None,
+        })
+    }
+
+    /// The version a code names, or [`Version::V1_1`] when it names none.
+    ///
+    /// For the calls that take a version alongside everything else they need
+    /// and have no way to report one argument being wrong. HTTP/1.1 is what a
+    /// message that was never told a version is framed as, so it is what an
+    /// unreadable one falls back to.
+    pub fn of(code: i32) -> Self {
+        Self::from_code(code).unwrap_or(Self::V1_1)
+    }
+}
+
+impl Role {
+    /// The role a `soyokaze_role_t` names, or `None` when it names none.
+    ///
+    /// As [`Version::from_code`].
+    pub fn from_code(code: i32) -> Option<Self> {
+        Some(match code {
+            0 => Self::UserAgent,
+            1 => Self::Origin,
+            2 => Self::Proxy,
+            3 => Self::Gateway,
+            4 => Self::Tunnel,
+            _ => return None,
+        })
+    }
+}
+
 impl Method {
     /// The method a wire code names, or `None` when it names none.
     ///
@@ -1853,8 +1938,8 @@ impl Method {
 ///
 /// As [`soyokaze_message_tunneling`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_message_set_version(message: *mut Message, version: Version) -> bool {
-    let Some(message) = (unsafe { message.as_mut() }) else {
+pub unsafe extern "C" fn soyokaze_message_set_version(message: *mut Message, version: i32) -> bool {
+    let (Some(message), Some(version)) = (unsafe { message.as_mut() }, Version::from_code(version)) else {
         return false;
     };
 

@@ -91,7 +91,7 @@ fn every_status_carries_a_description() {
     ];
 
     for status in statuses {
-        let message = read(soyokaze_status_message(status)).expect("a status always describes itself");
+        let message = read(soyokaze_status_message(status as i32)).expect("a status always describes itself");
         assert!(!message.is_empty(), "{status:?} described itself as nothing");
     }
 }
@@ -224,7 +224,7 @@ fn a_null_url_reads_as_absent_throughout() {
 #[test]
 fn a_request_and_a_response_each_carry_only_what_belongs_to_them() {
     let (data, len) = text("/index.html");
-    let request = unsafe { soyokaze_message_request(Method::GET, data, len, Version::V1_1) };
+    let request = unsafe { soyokaze_message_request(Method::GET as i32, data, len, Version::V1_1 as i32) };
     assert!(!request.is_null());
 
     assert!(unsafe { soyokaze_message_is_request(request) });
@@ -234,7 +234,7 @@ fn a_request_and_a_response_each_carry_only_what_belongs_to_them() {
     assert_eq!(read(unsafe { soyokaze_message_target(request) }), Some(&b"/index.html"[..]));
     assert_eq!(unsafe { soyokaze_message_version(request) }, Version::V1_1);
 
-    let response = soyokaze_message_response(404, Version::V2_0);
+    let response = soyokaze_message_response(404, Version::V2_0 as i32);
     assert!(unsafe { soyokaze_message_is_response(response) });
     assert!(!unsafe { soyokaze_message_is_request(response) });
     assert_eq!(unsafe { soyokaze_message_status_code(response) }, 404);
@@ -248,13 +248,13 @@ fn a_request_and_a_response_each_carry_only_what_belongs_to_them() {
 #[test]
 fn a_target_that_is_not_utf8_yields_no_message() {
     let invalid = [0xff, 0xfe];
-    let request = unsafe { soyokaze_message_request(Method::GET, invalid.as_ptr(), invalid.len(), Version::V1_1) };
+    let request = unsafe { soyokaze_message_request(Method::GET as i32, invalid.as_ptr(), invalid.len(), Version::V1_1 as i32) };
     assert!(request.is_null());
 }
 
 #[test]
 fn appending_keeps_every_field_and_inserting_keeps_one() {
-    let response = soyokaze_message_response(200, Version::V1_1);
+    let response = soyokaze_message_response(200, Version::V1_1 as i32);
     let (name, name_len) = text("set-cookie");
 
     for value in ["a=1", "b=2"] {
@@ -279,7 +279,7 @@ fn appending_keeps_every_field_and_inserting_keeps_one() {
 
 #[test]
 fn a_field_that_is_absent_is_told_apart_from_one_that_is_empty() {
-    let response = soyokaze_message_response(200, Version::V1_1);
+    let response = soyokaze_message_response(200, Version::V1_1 as i32);
     let (name, name_len) = text("x-empty");
     let (value, value_len) = text("");
 
@@ -297,7 +297,7 @@ fn a_field_that_is_absent_is_told_apart_from_one_that_is_empty() {
 
 #[test]
 fn a_field_is_matched_without_regard_to_case() {
-    let response = soyokaze_message_response(200, Version::V1_1);
+    let response = soyokaze_message_response(200, Version::V1_1 as i32);
     let (name, name_len) = text("Content-Type");
     let (value, value_len) = text("text/plain");
     assert!(unsafe { soyokaze_message_append_header(response, name, name_len, value, value_len) });
@@ -312,7 +312,7 @@ fn a_field_is_matched_without_regard_to_case() {
 
 #[test]
 fn walking_past_the_last_field_reads_as_absent() {
-    let response = soyokaze_message_response(200, Version::V1_1);
+    let response = soyokaze_message_response(200, Version::V1_1 as i32);
     let (name, name_len) = text("x-one");
     let (value, value_len) = text("1");
     assert!(unsafe { soyokaze_message_append_header(response, name, name_len, value, value_len) });
@@ -347,7 +347,7 @@ fn a_body_reads_back_whichever_way_it_was_set() {
     let runtime = soyokaze_runtime_new(1);
     assert!(!runtime.is_null());
 
-    let message = soyokaze_message_response(200, Version::V1_1);
+    let message = soyokaze_message_response(200, Version::V1_1 as i32);
     let mut buffer = Buffer::EMPTY;
 
     assert_eq!(unsafe { soyokaze_message_body_len(message) }, -1, "a message with no body has no length");
@@ -374,7 +374,7 @@ fn a_body_reads_back_whichever_way_it_was_set() {
 #[test]
 fn a_body_that_names_a_file_is_read_only_when_it_is_asked_for() {
     let runtime = soyokaze_runtime_new(1);
-    let message = soyokaze_message_response(200, Version::V1_1);
+    let message = soyokaze_message_response(200, Version::V1_1 as i32);
 
     let (path, path_len) = text("tests/ffi.rs");
     assert!(unsafe { soyokaze_message_set_body_file(message, path, path_len) });
@@ -486,7 +486,7 @@ extern "C" fn echo(context: *mut c_void, request: *mut Message) -> *mut Message 
     let target = read(unsafe { soyokaze_message_target(request) }).unwrap_or_default().to_vec();
     unsafe { soyokaze_message_free(request) };
 
-    let response = unsafe { soyokaze_response_with_body(200, version, target.as_ptr(), target.len()) };
+    let response = unsafe { soyokaze_response_with_body(200, version as i32, target.as_ptr(), target.len()) };
     let (name, name_len) = text("x-answered-by");
     let (value, value_len) = text("callback");
     unsafe { soyokaze_message_append_header(response, name, name_len, value, value_len) };
@@ -506,7 +506,7 @@ fn serve(runtime: *mut Runtime, handler: soyokaze::ffi::api::server::OnRequest, 
     let server = unsafe { soyokaze_server_new(ptr::null()) };
     assert!(!server.is_null());
 
-    let port = Port { kind: PortKind::TCP, number: 0, path: ptr::null(), path_len: 0 };
+    let port = Port { kind: PortKind::TCP as i32, number: 0, path: ptr::null(), path_len: 0 };
     let mut handle = ptr::null_mut();
     let mut error: *mut ErrorHandle = ptr::null_mut();
 
@@ -530,14 +530,14 @@ fn a_request_crosses_to_the_callback_and_its_answer_crosses_back() {
     let url = format!("{origin}/hello");
     let (url_data, url_len) = text(&url);
 
-    let request = unsafe { soyokaze_message_request(Method::GET, url_data, url_len, Version::V1_1) };
+    let request = unsafe { soyokaze_message_request(Method::GET as i32, url_data, url_len, Version::V1_1 as i32) };
     let (name, name_len) = text("x-probe");
     let (value, value_len) = text("sent");
     assert!(unsafe { soyokaze_message_append_header(request, name, name_len, value, value_len) });
 
     let mut response = ptr::null_mut();
     let mut error: *mut ErrorHandle = ptr::null_mut();
-    let status = unsafe { soyokaze_client_fetch(runtime, client, Method::GET, url_data, url_len, request, &mut response, &mut error) };
+    let status = unsafe { soyokaze_client_fetch(runtime, client, Method::GET as i32, url_data, url_len, request, &mut response, &mut error) };
 
     assert_eq!(status, Status::Ok, "the exchange failed");
     assert!(!response.is_null());
@@ -619,7 +619,7 @@ fn a_port_that_names_nothing_usable_is_refused() {
     let runtime = soyokaze_runtime_new(1);
     let server = unsafe { soyokaze_server_new(ptr::null()) };
 
-    let port = Port { kind: PortKind::UDS, number: 0, path: ptr::null(), path_len: 0 };
+    let port = Port { kind: PortKind::UDS as i32, number: 0, path: ptr::null(), path_len: 0 };
     let mut handle = ptr::null_mut();
 
     let status = unsafe { soyokaze_server_serve(runtime, server, echo, None, ptr::null_mut(), &port, 1, &mut handle, ptr::null_mut()) };
@@ -661,7 +661,7 @@ fn trailers_mirror_headers_on_a_message() {
         soyokaze_message_trailer_value,
     };
 
-    let message = soyokaze_message_response(200, Version::V1_1);
+    let message = soyokaze_message_response(200, Version::V1_1 as i32);
     let (name, name_len) = text("checksum");
 
     for value in ["abc", "def"] {
@@ -693,7 +693,7 @@ fn the_connection_facts_read_as_absent_until_a_connection_sets_them() {
         soyokaze_message_tls_version,
     };
 
-    let message = soyokaze_message_response(200, Version::V2_0);
+    let message = soyokaze_message_response(200, Version::V2_0 as i32);
 
     assert_eq!(unsafe { soyokaze_message_stream_id(message) }, -1);
     assert!(unsafe { soyokaze_message_connection_id(message) }.is_absent());
@@ -736,7 +736,7 @@ fn the_connection_facts_cross_as_the_wire_codes_the_handshake_settled() {
         quic_version: None,
     };
 
-    let message = soyokaze_message_response(200, Version::V1_1);
+    let message = soyokaze_message_response(200, Version::V1_1 as i32);
     unsafe { (*message).security = security };
 
     assert!(unsafe { soyokaze_message_secure(message) });
@@ -752,7 +752,7 @@ fn the_connection_facts_cross_as_the_wire_codes_the_handshake_settled() {
 
     // A QUIC connection reports itself, and the TLS 1.3 that RFC 9001 makes
     // the only version it can be carrying.
-    let message = soyokaze_message_response(200, Version::V3_0);
+    let message = soyokaze_message_response(200, Version::V3_0 as i32);
     unsafe { (*message).security = Security::quic(Some(1)) };
 
     assert!(unsafe { soyokaze_message_quic(message) });
@@ -796,11 +796,11 @@ fn each_response_constructor_sets_its_content_type() {
     let (kind, kind_len) = text("content-type");
 
     let cases: [(*mut Message, &[u8]); 5] = [
-        (unsafe { soyokaze_response_text(content, content_len, Version::V1_1) }, b"text/plain"),
-        (unsafe { soyokaze_response_html(content, content_len, Version::V1_1) }, b"text/html"),
-        (unsafe { soyokaze_response_markdown(content, content_len, Version::V1_1) }, b"text/markdown"),
-        (unsafe { soyokaze_response_json(content, content_len, Version::V1_1) }, b"application/json"),
-        (unsafe { soyokaze_response_content(kind, kind_len, content, content_len, Version::V1_1) }, b"content-type"),
+        (unsafe { soyokaze_response_text(content, content_len, Version::V1_1 as i32) }, b"text/plain"),
+        (unsafe { soyokaze_response_html(content, content_len, Version::V1_1 as i32) }, b"text/html"),
+        (unsafe { soyokaze_response_markdown(content, content_len, Version::V1_1 as i32) }, b"text/markdown"),
+        (unsafe { soyokaze_response_json(content, content_len, Version::V1_1 as i32) }, b"application/json"),
+        (unsafe { soyokaze_response_content(kind, kind_len, content, content_len, Version::V1_1 as i32) }, b"content-type"),
     ];
 
     for (response, expected) in cases {
@@ -810,12 +810,12 @@ fn each_response_constructor_sets_its_content_type() {
     }
 
     let (path, path_len) = text("style.css");
-    let file = unsafe { soyokaze_response_file(path, path_len, Version::V1_1) };
+    let file = unsafe { soyokaze_response_file(path, path_len, Version::V1_1 as i32) };
     assert_eq!(read(unsafe { soyokaze_message_header(file, kind, kind_len) }), Some(&b"text/css"[..]));
     unsafe { soyokaze_message_free(file) };
 
     let (target, target_len) = text("/elsewhere");
-    let redirect = unsafe { soyokaze_response_redirect(target, target_len, Version::V1_1) };
+    let redirect = unsafe { soyokaze_response_redirect(target, target_len, Version::V1_1 as i32) };
     assert_eq!(unsafe { soyokaze_message_status_code(redirect) }, 307);
     let (location, location_len) = text("location");
     assert_eq!(read(unsafe { soyokaze_message_header(redirect, location, location_len) }), Some(&b"/elsewhere"[..]));
@@ -1191,7 +1191,7 @@ fn a_cluster_answers_and_reports_its_workers() {
 
     let seen = std::sync::atomic::AtomicUsize::new(0);
     let server = unsafe { soyokaze_server_new(ptr::null()) };
-    let port = Port { kind: PortKind::TCP, number: 0, path: ptr::null(), path_len: 0 };
+    let port = Port { kind: PortKind::TCP as i32, number: 0, path: ptr::null(), path_len: 0 };
 
     let mut cluster = ptr::null_mut();
     let status = unsafe {
@@ -1250,7 +1250,7 @@ fn a_websocket_crosses_from_the_client_to_the_server_callback_and_back() {
 
     let runtime = soyokaze_runtime_new(0);
     let server = unsafe { soyokaze_server_new(ptr::null()) };
-    let port = Port { kind: PortKind::TCP, number: 0, path: ptr::null(), path_len: 0 };
+    let port = Port { kind: PortKind::TCP as i32, number: 0, path: ptr::null(), path_len: 0 };
 
     let mut handle = ptr::null_mut();
     let status = unsafe {
@@ -1314,7 +1314,7 @@ fn a_connection_exposes_the_raw_exchange() {
     let client = unsafe { soyokaze_client_new(&config) };
 
     let (host, host_len) = text("127.0.0.1");
-    let port = Port { kind: PortKind::TCP, number: bound, path: ptr::null(), path_len: 0 };
+    let port = Port { kind: PortKind::TCP as i32, number: bound, path: ptr::null(), path_len: 0 };
     let mut connection = ptr::null_mut();
     assert_eq!(
         unsafe { soyokaze_client_connect(runtime, client, host, host_len, &port, &mut connection, ptr::null_mut()) },
@@ -1325,7 +1325,7 @@ fn a_connection_exposes_the_raw_exchange() {
     assert!(!take(unsafe { soyokaze_connection_id(connection) }).is_empty());
 
     let (target, target_len) = text("/raw");
-    let request = unsafe { soyokaze_message_request(Method::GET, target, target_len, Version::V1_1) };
+    let request = unsafe { soyokaze_message_request(Method::GET as i32, target, target_len, Version::V1_1 as i32) };
     let (name, name_len) = text("host");
     let (value, value_len) = text("127.0.0.1");
     assert!(unsafe { soyokaze_message_append_header(request, name, name_len, value, value_len) });
@@ -1421,7 +1421,7 @@ fn compression_reports_the_ceiling_and_the_unsettled_coding_as_failures() {
 
 #[test]
 fn a_message_carries_its_coding_and_the_address_it_came_from() {
-    let message = soyokaze_message_response(200, Version::V1_1);
+    let message = soyokaze_message_response(200, Version::V1_1 as i32);
 
     let client = unsafe { soyokaze_message_client(message) };
     assert!(client.data.is_null(), "a message the caller built has no access source");
@@ -1450,7 +1450,7 @@ fn a_message_carries_its_coding_and_the_address_it_came_from() {
 
 #[test]
 fn a_message_codes_and_uncodes_its_own_body() {
-    let message = soyokaze_message_response(200, Version::V1_1);
+    let message = soyokaze_message_response(200, Version::V1_1 as i32);
     let body = vec![b'a'; 4096];
 
     unsafe { soyokaze_message_set_body_data(message, body.as_ptr(), body.len()) };
@@ -1477,4 +1477,129 @@ fn a_message_codes_and_uncodes_its_own_body() {
 fn the_default_limits_bound_a_decoded_body_separately() {
     let limits = soyokaze_limits_default();
     assert!(limits.max_decompressed_body_size > limits.max_message_body_size);
+}
+
+// ---------------------------------------------------------------- conformance
+
+#[test]
+fn a_number_that_names_no_enumeration_value_is_refused() {
+    use soyokaze::ffi::models::{
+        soyokaze_header_case_from_version, soyokaze_message_free, soyokaze_message_new, soyokaze_message_request,
+        soyokaze_method_idempotent, soyokaze_method_name, soyokaze_method_safe, soyokaze_role_is_client,
+        soyokaze_role_is_server, soyokaze_version_alpn, soyokaze_version_major, soyokaze_version_name,
+    };
+
+    // Every one of these was a Rust enum holding a value it has no variant for
+    // — undefined behaviour, and in practice a crash — before the number was
+    // read before it stood for anything.
+    for code in [4i32, 7, 99, -1, i32::MAX, i32::MIN] {
+        assert!(read(soyokaze_version_name(code)).is_none(), "version {code} names none");
+        assert!(read(soyokaze_version_alpn(code)).is_none(), "version {code} negotiates under nothing");
+        assert_eq!(soyokaze_version_major(code), 0, "version {code} has no major number");
+    }
+
+    for code in [9i32, 200, -1, i32::MAX] {
+        assert!(read(soyokaze_method_name(code)).is_none(), "method {code} names none");
+        assert!(!soyokaze_method_safe(code));
+        assert!(!soyokaze_method_idempotent(code));
+    }
+
+    for code in [5i32, 99, -1, i32::MAX] {
+        assert!(!soyokaze_role_is_client(code), "role {code} names none");
+        assert!(!soyokaze_role_is_server(code));
+    }
+
+    for code in [11i32, 12, 1000, -5, i32::MAX] {
+        assert!(read(soyokaze_status_message(code)).is_none(), "status {code} names none");
+        assert!(unsafe { soyokaze::ffi::errors::soyokaze_error_new(code, ptr::null(), 0) }.is_null(), "and describes no failure");
+    }
+
+    // A version a message could not be framed in must not be stored in one.
+    let message = soyokaze_message_new(0x7f);
+    assert_eq!(unsafe { soyokaze_message_version(message) }, Version::V1_1, "an unreadable version reads as HTTP/1.1");
+    unsafe { soyokaze_message_free(message) };
+
+    let (target, target_len) = text("/");
+    assert!(
+        unsafe { soyokaze_message_request(99, target, target_len, Version::V1_1 as i32) }.is_null(),
+        "a request cannot be built for a method that does not exist"
+    );
+
+    // Reading a casing off a version that names none still answers with one
+    // every version accepts.
+    let _ = soyokaze_header_case_from_version(99);
+}
+
+#[test]
+fn a_port_whose_kind_names_nothing_carries_nothing() {
+    use soyokaze::ffi::models::{soyokaze_port_carries, soyokaze_port_transport};
+
+    let port = Port { kind: 99, number: 8080, path: ptr::null(), path_len: 0 };
+
+    assert!(!unsafe { soyokaze_port_carries(&port, Version::V1_1 as i32) }, "a kind that names nothing carries nothing");
+    let _ = unsafe { soyokaze_port_transport(&port) };
+}
+
+#[test]
+fn an_empty_buffer_comes_back_with_a_null_pointer() {
+    use soyokaze::ffi::helpers::huffman::soyokaze_huffman_encode;
+    use soyokaze::ffi::helpers::qpack::{soyokaze_qpack_encoder_free, soyokaze_qpack_encoder_new, soyokaze_qpack_encoder_take_stream};
+
+    let buffer = unsafe { soyokaze_huffman_encode(ptr::null(), 0) };
+    assert!(buffer.data.is_null(), "a buffer holding nothing says so with a null pointer, as the header states");
+    assert_eq!(buffer.len, 0);
+
+    let encoder = soyokaze_qpack_encoder_new();
+    let stream = unsafe { soyokaze_qpack_encoder_take_stream(encoder) };
+    assert!(stream.data.is_null(), "an idle encoder stream holds nothing");
+    unsafe { soyokaze_buffer_free(stream) };
+    unsafe { soyokaze_qpack_encoder_free(encoder) };
+}
+
+#[test]
+fn a_prefix_no_representation_uses_is_refused() {
+    use soyokaze::ffi::helpers::fields::{
+        soyokaze_string_decode, soyokaze_string_encode, soyokaze_string_encode_shorter, soyokaze_string_max_prefix_bits,
+    };
+
+    assert_eq!(soyokaze_string_max_prefix_bits(), 7);
+
+    let (data, data_len) = text("hello");
+    for prefix_bits in [8u8, 64, 255] {
+        let encoded = unsafe { soyokaze_string_encode(data, data_len, prefix_bits, 0, true) };
+        assert!(encoded.data.is_null(), "a prefix of {prefix_bits} leaves no room for the Huffman mark");
+
+        let shorter = unsafe { soyokaze_string_encode_shorter(data, data_len, prefix_bits, 0) };
+        assert!(shorter.data.is_null());
+
+        let mut out = Buffer::EMPTY;
+        let mut read_len = 0usize;
+        let decoded = unsafe { soyokaze_string_decode(data, data_len, prefix_bits, &mut out, &mut read_len, ptr::null_mut()) };
+        assert!(!decoded, "and names no representation to decode either");
+    }
+}
+
+#[test]
+fn asking_for_more_room_than_a_section_could_hold_is_not_an_allocation() {
+    use soyokaze::ffi::models::{soyokaze_headers_free, soyokaze_headers_len, soyokaze_headers_with_capacity};
+
+    let headers = soyokaze_headers_with_capacity(usize::MAX);
+    assert!(!headers.is_null(), "room is an optimisation, so an outsized ask is taken as the ceiling");
+    assert_eq!(unsafe { soyokaze_headers_len(headers) }, 0);
+    unsafe { soyokaze_headers_free(headers) };
+}
+
+#[test]
+fn a_word_read_past_the_end_reads_nothing() {
+    use soyokaze::ffi::helpers::scan::soyokaze_scan_word_at;
+
+    let data = b"abcdefghij";
+
+    assert_ne!(unsafe { soyokaze_scan_word_at(data.as_ptr(), data.len(), 0) }, 0);
+    assert_eq!(unsafe { soyokaze_scan_word_at(data.as_ptr(), data.len(), 3) }, 0, "no whole word remains at 3 of 10");
+    assert_eq!(
+        unsafe { soyokaze_scan_word_at(data.as_ptr(), data.len(), usize::MAX) },
+        0,
+        "an offset that would wrap past the length must not read through"
+    );
 }

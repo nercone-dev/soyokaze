@@ -43,6 +43,30 @@ pub enum Status {
 }
 
 impl Status {
+    /// The status a `soyokaze_status_t` names, or `None` when it names none.
+    ///
+    /// A status comes back from every fallible call, so a caller holding one
+    /// in an `int` and passing it on is the ordinary way to use this ABI. A
+    /// Rust enum holding a value it has no variant for is undefined behaviour
+    /// rather than a value to be matched, so nothing arriving from C is taken
+    /// for one until it has been read here.
+    pub fn from_code(code: i32) -> Option<Self> {
+        Some(match code {
+            0 => Self::Ok,
+            1 => Self::Closed,
+            2 => Self::Protocol,
+            3 => Self::Limit,
+            4 => Self::Stream,
+            5 => Self::Timeout,
+            6 => Self::TLS,
+            7 => Self::Version,
+            8 => Self::IO,
+            9 => Self::Invalid,
+            10 => Self::Runtime,
+            _ => return None,
+        })
+    }
+
     /// The status that stands for `error`.
     pub fn of(error: &Error) -> Self {
         match error {
@@ -253,8 +277,8 @@ pub unsafe extern "C" fn soyokaze_error_code(error: *const ErrorHandle) -> i64 {
 ///
 /// Borrowed from the library and valid for its lifetime.
 #[unsafe(no_mangle)]
-pub extern "C" fn soyokaze_status_message(status: Status) -> Slice {
-    Slice::text(status.message())
+pub extern "C" fn soyokaze_status_message(status: i32) -> Slice {
+    Slice::maybe(Status::from_code(status).map(|status| status.message()))
 }
 
 /// Builds an [`ErrorHandle`] for a status and the reason that goes with it.
@@ -268,7 +292,11 @@ pub extern "C" fn soyokaze_status_message(status: Status) -> Slice {
 ///
 /// `reason` must either be null or point to `reason_len` readable octets.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soyokaze_error_new(status: Status, reason: *const u8, reason_len: usize) -> *mut ErrorHandle {
+pub unsafe extern "C" fn soyokaze_error_new(status: i32, reason: *const u8, reason_len: usize) -> *mut ErrorHandle {
+    let Some(status) = Status::from_code(status) else {
+        return std::ptr::null_mut();
+    };
+
     let reason = unsafe { Slice::borrow_text(reason, reason_len) }.unwrap_or_default().to_owned();
     Box::into_raw(Box::new(ErrorHandle::new(&ErrorHandle::build(status, reason))))
 }

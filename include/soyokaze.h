@@ -17,6 +17,11 @@
  *  - A handle is freed exactly once, with the `_free` call matching the one
  *    that produced it. A call documented as consuming a handle frees it itself.
  *  - A NULL handle is treated as absent and is never dereferenced.
+ *  - An enumeration value outside the ones named here is refused rather than
+ *    acted on. Every call reads the number it was given before it stands for
+ *    anything, and answers as it would for an absent argument: false, zero,
+ *    an absent slice, an empty buffer, NULL, or SOYOKAZE_INVALID, whichever
+ *    the return type can say. Nothing is ever taken for a value it is not.
  */
 
 #ifndef SOYOKAZE_H
@@ -320,7 +325,14 @@ uint32_t soyokaze_headers_bit(bool matched, uint32_t index);
 bool soyokaze_headers_named(const uint8_t *stored, size_t stored_len,
                             const uint8_t *name, size_t name_len);
 soyokaze_headers_t *soyokaze_headers_new(void);
+
+/* Room is an optimisation: a section grows past `fields` as fields are added,
+ * and an ask larger than any section could hold is taken as the ceiling rather
+ * than made into an allocation the machine would refuse. */
 soyokaze_headers_t *soyokaze_headers_with_capacity(size_t fields);
+
+/* Only a section from soyokaze_headers_new or soyokaze_headers_with_capacity
+ * is freed this way; one borrowed from a message belongs to that message. */
 void soyokaze_headers_free(soyokaze_headers_t *headers);
 size_t soyokaze_headers_len(const soyokaze_headers_t *headers);
 bool soyokaze_headers_is_empty(const soyokaze_headers_t *headers);
@@ -1755,6 +1767,12 @@ soyokaze_buffer_t soyokaze_integer_encode(uint64_t value, uint8_t prefix_bits, u
 bool soyokaze_integer_decode(const uint8_t *data, size_t data_len, uint8_t prefix_bits,
                              uint64_t *out, size_t *read, soyokaze_fields_error_t *error);
 bool soyokaze_string_prefers_huffman(const uint8_t *data, size_t data_len);
+
+/* The bit just above a string literal's prefix carries the Huffman mark, so a
+ * `prefix_bits` past `soyokaze_string_max_prefix_bits()` names no
+ * representation. The encoders answer with an empty buffer and the decoder
+ * with SOYOKAZE_FIELDS_INVALID. */
+uint8_t soyokaze_string_max_prefix_bits(void);
 soyokaze_buffer_t soyokaze_string_encode(const uint8_t *data, size_t data_len,
                                          uint8_t prefix_bits, uint8_t flags, bool huffman);
 soyokaze_buffer_t soyokaze_string_encode_shorter(const uint8_t *data, size_t data_len,
