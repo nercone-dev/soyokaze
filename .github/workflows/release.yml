@@ -225,17 +225,22 @@ jobs:
         with:
           ref: main
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
       - name: Update version in Cargo.toml and pyproject.toml
         run: |
           TAG="${{ github.event.release.tag_name }}"
           VERSION="${TAG#v}"
 
           sed -i "s/^version = .*/version = \"${VERSION}\"/" Cargo.toml
-          caego update
+          cargo update --workspace
 
           cd python
           sed -i "s/^version = .*/version = \"${VERSION}\"/" pyproject.toml
-          uv lock --upgrade
+          uv lock
 
           echo "Soyokaze ${VERSION}"
 
@@ -247,7 +252,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add Cargo.toml python/pyproject.toml
+          git add Cargo.toml Cargo.lock python/pyproject.toml python/uv.lock
 
           if git diff --cached --quiet; then
             echo "No changes; skipping commit."
