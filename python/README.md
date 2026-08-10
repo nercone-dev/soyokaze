@@ -4,7 +4,7 @@ Python bindings for Soyokaze, an HTTP/1, HTTP/2 and HTTP/3 library written in Ru
 ## Requirements
 
 - Linux / macOS (x86_64, AArch64)
-- Python 3.9+
+- Python 3.10+
 
 ## Installation
 
@@ -27,5 +27,7 @@ uv run examples/websocket_loopback.py
 ```
 
 ## Links
+- [crates.io](https://crates.io/crates/soyokaze/) - Rust crate
+- [pypi.org](https://pypi.org/project/soyokaze/) - Python package
 - [docs.rs](https://docs.rs/soyokaze/) - Documentation (for the Rust crate)
 - [deepwiki.com](https://deepwiki.com/nercone-dev/soyokaze/) - Documentation; Automatically generated.
