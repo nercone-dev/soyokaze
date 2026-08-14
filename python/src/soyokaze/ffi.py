@@ -87,6 +87,7 @@ class Limits(Structure):
         ("read_chunk_size", c_uint64),
         ("idle_capacity", c_uint64),
         ("max_pending_handshakes", c_uint32),
+        ("handshake_timeout", c_double),
         ("read_timeout", c_double),
         ("write_timeout", c_double),
         ("receive_timeout", c_double),

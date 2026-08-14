@@ -15,7 +15,7 @@ use bytes::Bytes;
 
 use crate::models::{ALPN, ConnectionID, Limits, Role, Version};
 use crate::tls::Security;
-use crate::protocol::base::{AnyConnection, Transport};
+use crate::protocol::base::{AnyConnection, Connection, Transport};
 use crate::protocol::common::{Buffer, Error};
 use crate::protocol::h1::H1Connection;
 use crate::protocol::h2::{self, H2Connection};
@@ -145,8 +145,9 @@ pub struct Negotiation {
 impl Negotiation {
     /// Negotiates a version and builds the connection.
     ///
-    /// A stream transport is held to [`Limits::read_timeout`], so a peer that
-    /// connects and then says nothing does not hold a slot indefinitely.
+    /// A stream transport is held to [`Limits::handshake_timeout`], so a peer
+    /// that connects and then says nothing gives its slot back promptly rather
+    /// than holding one for as long as a connection that is speaking is given.
     ///
     /// # Errors
     ///
@@ -156,10 +157,36 @@ impl Negotiation {
         match incoming {
             Incoming::Stream { transport, id, client } => {
                 let assembling = std::pin::pin!(self.assemble(transport, id, client));
-                sync::Timeout::within(self.limits.read_timeout, assembling).await?
+                sync::Timeout::within(self.limits.handshake_timeout, assembling).await?
             }
 
             Incoming::QUIC(incoming) => self.assemble_quic(incoming),
+        }
+    }
+
+    /// Turns a connection away, at the least cost its transport allows.
+    ///
+    /// The mirror of [`Negotiation::accept`], and what admission control calls
+    /// on a connection it refuses. Nothing is negotiated and nothing is served,
+    /// which is the whole point: a refusal has to be cheaper than the flood it
+    /// turns away, or refusing becomes the way in.
+    ///
+    /// A stream is refused by closing it, which is what dropping it does. A
+    /// QUIC connection cannot simply be dropped: the endpoint routes datagrams
+    /// by the connection IDs it holds for one, and gives them up only when
+    /// whatever drives that connection says so, so one that was never driven
+    /// leaves them behind for good. It is assembled and closed instead, on a
+    /// task of its own so the caller waits for none of it. Driving it far
+    /// enough to close it is the price of getting the endpoint's own state
+    /// back, and it is the smaller of the two: a refusal that leaked would
+    /// grow the endpoint by every connection it turned away.
+    pub fn refuse(&self, incoming: Incoming) {
+        let Incoming::QUIC(incoming) = incoming else {
+            return;
+        };
+
+        if let Ok(mut connection) = self.assemble_quic(incoming) {
+            tokio::spawn(async move { connection.close().await });
         }
     }
 
@@ -258,7 +285,7 @@ impl Negotiation {
         let mut buffer = Buffer::with_chunk_size(self.limits.read_chunk_size as usize);
 
         let probe = h2::PREFACE.len().min(4);
-        while buffer.len() < probe && buffer.fill(&mut transport, self.limits.read_timeout).await? {}
+        while buffer.len() < probe && buffer.fill(&mut transport, self.limits.handshake_timeout).await? {}
 
         let sniffed = buffer.len().min(probe);
         let h2 = self.versions.contains(&Version::V2_0)

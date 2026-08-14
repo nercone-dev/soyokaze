@@ -988,6 +988,8 @@ pub struct Limits {
     /// The number of connections a listener may negotiate at once.
     pub max_pending_handshakes: u32,
 
+    /// In seconds, how long one connection may take to negotiate. Zero waits forever.
+    pub handshake_timeout: f64,
     /// In seconds, how long one read may wait. Zero waits forever.
     pub read_timeout: f64,
     /// In seconds, how long one write may wait. Zero waits forever.
@@ -1057,6 +1059,7 @@ impl Limits {
             read_chunk_size: self.read_chunk_size,
             idle_capacity: self.idle_capacity,
             max_pending_handshakes: self.max_pending_handshakes,
+            handshake_timeout: self.handshake_timeout,
             read_timeout: self.read_timeout,
             write_timeout: self.write_timeout,
             receive_timeout: self.receive_timeout,
@@ -1096,6 +1099,7 @@ impl Limits {
             read_chunk_size: limits.read_chunk_size,
             idle_capacity: limits.idle_capacity,
             max_pending_handshakes: limits.max_pending_handshakes,
+            handshake_timeout: limits.handshake_timeout,
             read_timeout: limits.read_timeout,
             write_timeout: limits.write_timeout,
             receive_timeout: limits.receive_timeout,

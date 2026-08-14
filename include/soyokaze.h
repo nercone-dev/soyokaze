@@ -164,6 +164,7 @@ typedef struct {
 
     uint32_t max_pending_handshakes;
 
+    double handshake_timeout;
     double read_timeout;
     double write_timeout;
     double receive_timeout;

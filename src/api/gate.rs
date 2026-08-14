@@ -1,8 +1,9 @@
 //! Admission control for incoming connections.
 //!
-//! A [`Gate`] decides whether a connection may proceed before a handler is
-//! reached, so a refused connection costs a handshake and nothing more; a
-//! [`Permit`] is a connection's claim on a slot, given back when it drops.
+//! A [`Gate`] decides whether a connection may proceed the moment it is
+//! accepted and before it negotiates, so a refused connection costs an accept
+//! and nothing more; a [`Permit`] is a connection's claim on a slot, given back
+//! when it drops.
 //! Nothing here knows about HTTP or the server around it — it counts
 //! connections by address and by rate, and that is all.
 
@@ -20,9 +21,10 @@ pub struct GateState {
 
 /// Admission control for incoming connections.
 ///
-/// Checked before a handler is reached, so a refused connection costs a
-/// handshake and nothing more. Shared across every listener and worker, so the
-/// totals are for the server as a whole rather than per port.
+/// Checked as a connection is accepted and before it negotiates, so a refused
+/// connection costs an accept and nothing more, and a connection that never
+/// speaks is counted like any other. Shared across every listener and worker,
+/// so the totals are for the server as a whole rather than per port.
 ///
 /// The total count is an atomic, since every connection touches it; the
 /// per-address tallies sit behind a lock, since they are only consulted for a
@@ -78,7 +80,8 @@ impl Gate {
     ///
     /// `None` means turn the connection away. A [`Permit`] means it may
     /// proceed, and releases its slot when dropped — so holding the permit for
-    /// as long as the connection lives is what keeps the count honest.
+    /// as long as the connection lives, from the accept that produced it right
+    /// through the handshake, is what keeps the count honest.
     ///
     /// An `ip` of `None` skips the per-address checks; a Unix socket has no
     /// address to limit by.

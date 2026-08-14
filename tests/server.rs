@@ -491,3 +491,312 @@ fn a_unix_socket_mode_of_zero_leaves_the_umask_its_say() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&bare);
 }
+
+/// Everything a test needs to watch a port admit: the gate it admits through,
+/// the port the kernel gave it, and the connections it hands out.
+struct Watched {
+    gate: Arc<soyokaze::Gate>,
+    port: u16,
+    admitted: tokio::sync::mpsc::UnboundedReceiver<soyokaze::api::server::Admitted>,
+    held: Vec<soyokaze::api::server::Admitted>,
+}
+
+impl Watched {
+    /// How many more connections the port has handed out since it was last
+    /// asked, keeping every one of them alive — a connection dropped here
+    /// would give its slot back and take the count with it.
+    fn served(&mut self) -> usize {
+        let mut served = 0;
+
+        while let Ok(connection) = self.admitted.try_recv() {
+            self.held.push(connection);
+            served += 1;
+        }
+
+        served
+    }
+
+    /// Waits for the port to have handed out `expected` connections, and
+    /// reports how many it actually did. Negotiation finishes on another task,
+    /// so a tally is only meaningful once it has had the chance to settle.
+    async fn handed(&mut self, expected: usize) -> usize {
+        let mut served = 0;
+
+        for _ in 0..400 {
+            served += self.served();
+
+            if served >= expected {
+                break;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        served
+    }
+}
+
+/// Binds `port` on `server`, drives its accept loop in the background, and
+/// watches what it admits. Everything the port hands out is kept alive in the
+/// channel, so a connection stays counted until the watcher is dropped.
+async fn watch(server: Server, port: Port) -> Watched {
+    let listener = server.bind(port).await.expect("the port did not bind");
+    let bound = listener.address().expect("the port has no address").port();
+    let gate = Arc::clone(listener.gate());
+
+    let (sender, admitted) = tokio::sync::mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        let mut listener = listener;
+
+        while let Ok(connection) = listener.accept().await {
+            if sender.send(connection).is_err() {
+                break;
+            }
+        }
+    });
+
+    Watched { gate, port: bound, admitted, held: Vec::new() }
+}
+
+/// A plaintext HTTP/1.1 server holding to `limits`.
+fn plaintext(limits: soyokaze::ServerLimits) -> Server {
+    Server::new(ServerConfig { versions: vec![soyokaze::Version::V1_1], limits, ..ServerConfig::default() })
+}
+
+/// Limits that leave a silent connection pending for as long as a test runs,
+/// so what refuses it is the gate rather than the handshake deadline.
+fn patient(limits: soyokaze::ServerLimits) -> soyokaze::ServerLimits {
+    soyokaze::ServerLimits {
+        message: soyokaze::Limits { handshake_timeout: 30.0, ..limits.message },
+        ..limits
+    }
+}
+
+/// Opens a connection and says nothing on it, as a flood does.
+async fn silent(port: u16) -> tokio::net::TcpStream {
+    let address = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+    tokio::net::TcpStream::connect(address).await.expect("the port would not take a connection")
+}
+
+/// Whether a connection is turned away: closed by the server, or never taken
+/// at all. A connection left open and waiting is neither, and is what a gate
+/// that failed to refuse looks like.
+async fn refused(port: u16) -> bool {
+    let address = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+    let Ok(mut stream) = tokio::net::TcpStream::connect(address).await else {
+        return true;
+    };
+
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut byte));
+
+    matches!(read.await, Ok(Ok(0)) | Ok(Err(_)))
+}
+
+/// Waits for the gate to hold `expected` connections, and reports what it
+/// actually holds. Admission happens on another task, so a count is only
+/// meaningful once it has had the chance to settle.
+async fn settles(gate: &soyokaze::Gate, expected: u32) -> u32 {
+    for _ in 0..400 {
+        if gate.count() == expected {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    gate.count()
+}
+
+/// A connection must be admitted before it is negotiated.
+///
+/// A peer that connects and then says nothing has negotiated nothing, so a
+/// gate consulted after negotiation never sees it — and a flood of exactly
+/// those connections is what admission control exists to bound. Counting one
+/// from the moment it is accepted is what makes every limit below mean
+/// anything at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_that_has_not_negotiated_is_already_counted() {
+    let watched = watch(plaintext(patient(soyokaze::ServerLimits::default())), Port::TCP(0)).await;
+
+    let held = silent(watched.port).await;
+
+    assert_eq!(settles(&watched.gate, 1).await, 1, "a connection that has not negotiated must still be counted");
+
+    drop(held);
+}
+
+/// The per-address ceiling must bound silent connections too.
+///
+/// One address holding the ceiling in unnegotiated connections is over it, and
+/// the next connection from that address is refused — closed without a
+/// handshake being spent on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_connection_counts_against_the_per_address_ceiling() {
+    let limits = patient(soyokaze::ServerLimits { max_connections_per_ip: 1, ..soyokaze::ServerLimits::default() });
+    let watched = watch(plaintext(limits), Port::TCP(0)).await;
+
+    let held = silent(watched.port).await;
+    assert_eq!(settles(&watched.gate, 1).await, 1, "the first connection must be admitted");
+
+    assert!(refused(watched.port).await, "an address at its ceiling must be refused even while its connection is silent");
+    assert_eq!(watched.gate.count(), 1, "a refused connection must not be counted");
+
+    drop(held);
+}
+
+/// The total ceiling must bound silent connections too, exactly as the
+/// per-address one does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_connection_counts_against_the_total_ceiling() {
+    let limits = patient(soyokaze::ServerLimits { max_connections: 1, ..soyokaze::ServerLimits::default() });
+    let watched = watch(plaintext(limits), Port::TCP(0)).await;
+
+    let held = silent(watched.port).await;
+    assert_eq!(settles(&watched.gate, 1).await, 1, "the first connection must be admitted");
+
+    assert!(refused(watched.port).await, "a server at its ceiling must refuse, whether or not what fills it has spoken");
+    assert_eq!(watched.gate.count(), 1, "a refused connection must not be counted");
+
+    drop(held);
+}
+
+/// A rate limit must be spent by connecting, not by negotiating.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_connection_spends_the_rate_limit() {
+    let limits = patient(soyokaze::ServerLimits { max_connection_rate: vec![(60.0, 1)], ..soyokaze::ServerLimits::default() });
+    let watched = watch(plaintext(limits), Port::TCP(0)).await;
+
+    let held = silent(watched.port).await;
+    assert_eq!(settles(&watched.gate, 1).await, 1, "the first connection must be admitted");
+
+    assert!(refused(watched.port).await, "a rate limit spent by a silent connection must refuse the next one");
+
+    drop(held);
+}
+
+/// Refusing must be cheaper than admitting, or a flood is served by the
+/// refusal itself.
+///
+/// A refused connection is turned away before a handshake slot is reserved, so
+/// it never takes one of the [`Limits::max_pending_handshakes`]. Were it to
+/// take one, a flood would exhaust the slots through refusals alone, the accept
+/// loop would stop accepting, and connections after that would be left waiting
+/// rather than refused — which is what this checks does not happen.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_connection_spends_no_handshake_slot() {
+    let limits = soyokaze::ServerLimits {
+        max_connections_per_ip: 1,
+        message: soyokaze::Limits { max_pending_handshakes: 2, handshake_timeout: 30.0, ..soyokaze::Limits::default() },
+        ..soyokaze::ServerLimits::default()
+    };
+
+    let watched = watch(plaintext(limits), Port::TCP(0)).await;
+
+    let held = silent(watched.port).await;
+    assert_eq!(settles(&watched.gate, 1).await, 1, "the first connection must be admitted");
+
+    for attempt in 0..8 {
+        assert!(refused(watched.port).await, "refusal {attempt} was left waiting, so refusing is spending a handshake slot");
+    }
+
+    drop(held);
+}
+
+/// A handshake that never finishes must give its slot back.
+///
+/// The permit is taken at the accept and belongs to the connection from then
+/// on, so a negotiation that fails or times out has to release it as surely as
+/// a connection that ran to completion does. A permit lost on the handshake
+/// path would leak the ceiling away one silent connection at a time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handshake_that_times_out_gives_its_slot_back() {
+    let limits = soyokaze::ServerLimits {
+        message: soyokaze::Limits { handshake_timeout: 0.25, ..soyokaze::Limits::default() },
+        ..soyokaze::ServerLimits::default()
+    };
+
+    let watched = watch(plaintext(limits), Port::TCP(0)).await;
+
+    let held = silent(watched.port).await;
+    assert_eq!(settles(&watched.gate, 1).await, 1, "the connection must be admitted");
+    assert_eq!(settles(&watched.gate, 0).await, 0, "a handshake that timed out must release the slot it held");
+
+    drop(held);
+}
+
+/// A connection that did negotiate stays counted until the connection itself
+/// is done with, not until its peer's socket goes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_that_negotiated_is_counted_until_it_is_dropped() {
+    let mut watched = watch(plaintext(soyokaze::ServerLimits::default()), Port::TCP(0)).await;
+
+    let mut stream = silent(watched.port).await;
+    stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await.expect("the request did not go out");
+
+    assert_eq!(settles(&watched.gate, 1).await, 1, "a negotiated connection must be counted");
+    assert_eq!(watched.handed(1).await, 1, "a negotiated connection must be handed out");
+
+    drop(stream);
+    assert_eq!(watched.gate.count(), 1, "the permit belongs to the connection, not to the peer's socket");
+}
+
+/// Negotiating is given less patience than reading.
+///
+/// The handshake deadline bounds how long one of the
+/// [`Limits::max_pending_handshakes`] slots may be held, so a peer that has not
+/// begun speaking must not be given the same patience as one that has: were
+/// they the same, a silent connection would hold a slot for as long as a
+/// working one holds a read.
+#[test]
+fn negotiating_is_given_less_patience_than_reading() {
+    let limits = soyokaze::Limits::default();
+
+    assert!(limits.handshake_timeout > 0.0, "a handshake left without a deadline holds its slot forever");
+    assert!(
+        limits.handshake_timeout <= limits.read_timeout,
+        "a peer that has not begun speaking must not be given more patience than one that has",
+    );
+}
+
+/// Admission must reach a QUIC port too.
+///
+/// What refusing costs there is not what it costs a stream: a QUIC endpoint
+/// routes datagrams by the connection IDs it holds for a connection, and gives
+/// them up only when whatever drives that connection says so, so a refusal
+/// that dropped one undriven would leave those IDs behind for good. That is
+/// why [`Negotiation::refuse`] closes a QUIC connection rather than dropping
+/// it, and why this checks the ceiling reaches a QUIC port at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quic_connection_over_the_ceiling_is_refused() {
+    let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("no certificate was issued");
+    let identity = soyokaze::Identity::new(vec![issued.cert.pem().into_bytes()], issued.signing_key.serialize_pem().into_bytes());
+
+    let server = Server::new(ServerConfig {
+        versions: vec![soyokaze::Version::V3_0],
+        identity: Some(identity),
+        limits: soyokaze::ServerLimits { max_connections_per_ip: 1, ..soyokaze::ServerLimits::default() },
+        ..ServerConfig::default()
+    });
+
+    let mut watched = watch(server, Port::QUIC(0)).await;
+
+    let client = soyokaze::Client::new(soyokaze::ClientConfig {
+        versions: vec![soyokaze::Version::V3_0],
+        roots: Some(vec![issued.cert.der().to_vec()]),
+        ..soyokaze::ClientConfig::default()
+    });
+
+    let held = client.connect("localhost", Port::QUIC(watched.port)).await.expect("the first connection was refused");
+    assert_eq!(settles(&watched.gate, 1).await, 1, "the first connection must be admitted");
+    assert_eq!(watched.handed(1).await, 1, "the first connection must be handed out");
+
+    let over = client.connect("localhost", Port::QUIC(watched.port)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    assert_eq!(watched.gate.count(), 1, "a refused connection must not be counted");
+    assert_eq!(watched.served(), 0, "an address at its ceiling must have its QUIC connection refused, not served");
+
+    drop(over);
+    drop(held);
+}

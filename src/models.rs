@@ -1316,6 +1316,16 @@ pub struct Limits {
     /// The number of connections a listener may negotiate at once (mitigates slow handshake floods).
     pub max_pending_handshakes: u32,
 
+    /// In seconds, how long one connection may take to negotiate (0 waits forever).
+    ///
+    /// The deadline on everything between an accepted transport and a
+    /// connection a handler can be given: the TLS handshake, or the wait for
+    /// the first octets on a plaintext port. It is what bounds how long one of
+    /// the [`Limits::max_pending_handshakes`] slots may be held, which is why
+    /// it is shorter than [`Limits::read_timeout`] — a peer that has not begun
+    /// speaking has not yet earned the patience given to one that has.
+    pub handshake_timeout: f64,
+
     /// In seconds, how long one read may wait for the peer to deliver more octets (0 waits forever).
     pub read_timeout: f64,
     /// In seconds, how long one write may wait for the peer to accept more octets (0 waits forever).
@@ -1407,6 +1417,7 @@ impl Default for Limits {
 
             max_pending_handshakes: 256,
 
+            handshake_timeout: 10.0,
             read_timeout: 30.0,
             write_timeout: 30.0,
             receive_timeout: 300.0,

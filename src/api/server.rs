@@ -10,11 +10,14 @@
 //! the port itself for QUIC. Handlers are written against
 //! [`AnyConnection`], so they do not need to care which it was.
 //!
-//! Admission control lives in [`Gate`], and runs before the handler is
-//! reached: a total connection count, a per-address count, and a set of
-//! sliding-window rate limits. Handshakes negotiate concurrently, bounded by
-//! [`Limits::max_pending_handshakes`], so a peer that opens a connection and
-//! then goes quiet cannot hold up the accept loop.
+//! Admission control lives in [`Gate`], and runs the moment a connection is
+//! accepted, before it is negotiated: a total connection count, a per-address
+//! count, and a set of sliding-window rate limits. Doing it there is what makes
+//! the limits mean anything against a peer that never speaks — a refused
+//! stream is closed without a handshake, and takes none of the
+//! [`Limits::max_pending_handshakes`] slots. Handshakes negotiate concurrently
+//! within those slots, each bounded by [`Limits::handshake_timeout`], so a peer
+//! that opens a connection and then goes quiet cannot hold up the accept loop.
 
 use std::net::{Ipv6Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
@@ -28,7 +31,7 @@ use crate::models::{ConnectionID, Limits, Port, Version};
 use crate::protocol::base::{AnyConnection, Connection, Transport};
 use crate::protocol::common::Error;
 use crate::api::cluster::Cluster;
-use crate::api::gate::Gate;
+use crate::api::gate::{Gate, Permit};
 use crate::protocol::handler::{Incoming, Negotiation};
 use crate::protocol::quic::{self, QUICIncoming};
 use crate::tls::Identity;
@@ -242,7 +245,9 @@ impl Server {
         let negotiation = Negotiation { versions, limits: self.config.limits.message, acceptor, response_finalizer };
         let (negotiating, negotiated) = tokio::sync::mpsc::channel(negotiation.limits.max_pending_handshakes.max(1) as usize);
 
-        Ok(Listener { socket, negotiation: Arc::new(negotiation), negotiating, negotiated })
+        let gate = self.config.limits.gate();
+
+        Ok(Listener { socket, gate, negotiation: Arc::new(negotiation), negotiating, negotiated })
     }
 }
 
@@ -303,7 +308,11 @@ pub enum Socket {
     /// connections, so what arrives here is a queue of connections rather than
     /// a socket to accept on.
     QUIC {
-        /// Connections `tokio-quiche` has completed the handshake for.
+        /// Connections `tokio-quiche` has routed an Initial packet to.
+        ///
+        /// Their handshakes run once each is driven, not before it arrives
+        /// here, which is why one that is turned away still has to be driven
+        /// far enough to close.
         incoming: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<std::io::Result<QUICIncoming>>>,
         /// The address the UDP socket is bound to.
         address: std::net::SocketAddr,
@@ -354,23 +363,67 @@ impl Socket {
     }
 }
 
-/// One bound port, accepting and negotiating connections.
+/// A negotiated connection and the admission slot it holds.
 ///
-/// Handshakes run concurrently in their own tasks rather than in the accept
-/// loop, so one slow peer does not hold up the rest. The channel between them
-/// is what bounds that concurrency to
-/// [`Limits::max_pending_handshakes`].
+/// The [`Permit`] was taken when the connection was accepted, before it was
+/// negotiated, and belongs with the connection from then on: dropping it is
+/// what gives the slot back, so it has to outlive the connection rather than
+/// the handshake. Keeping the two together is what makes that hard to get
+/// wrong.
+pub struct Admitted {
+    /// The connection, negotiated and ready for a handler.
+    pub connection: AnyConnection,
+    /// The gate slot it holds for as long as it lives.
+    pub permit: Permit,
+}
+
+/// One bound port, admitting, accepting and negotiating connections.
+///
+/// A connection is put to the [`Gate`] as soon as it is accepted and before
+/// anything is negotiated, so a refused stream costs an accept and nothing
+/// more — no handshake, and none of the [`Limits::max_pending_handshakes`]
+/// slots. That ordering is what lets the limits bite on a peer that never
+/// speaks: admitting only what has finished negotiating would leave every
+/// silent connection unlimited. What admission saves on a QUIC port is the
+/// serving rather than the handshake, since a refused QUIC connection has to
+/// be driven far enough to close it; [`Negotiation::refuse`] is what turns
+/// either away.
+///
+/// Handshakes then run concurrently in their own tasks rather than in the
+/// accept loop, so one slow peer does not hold up the rest. The channel
+/// between them is what bounds that concurrency to
+/// [`Limits::max_pending_handshakes`], and [`Limits::handshake_timeout`] is
+/// what bounds how long one of those slots may be held.
 pub struct Listener {
     socket: Socket,
+    gate: Arc<Gate>,
     negotiation: Arc<Negotiation>,
-    negotiating: tokio::sync::mpsc::Sender<Result<AnyConnection, Error>>,
-    negotiated: tokio::sync::mpsc::Receiver<Result<AnyConnection, Error>>,
+    negotiating: tokio::sync::mpsc::Sender<Result<Admitted, Error>>,
+    negotiated: tokio::sync::mpsc::Receiver<Result<Admitted, Error>>,
 }
 
 impl Listener {
+    /// Puts this port behind `gate` rather than the one its configuration
+    /// described.
+    ///
+    /// A listener built by [`Server::attach`] gates on a [`Gate`] of its own,
+    /// so a port bound on its own still holds to the configured limits. This
+    /// is how several listeners come to share one: [`Server::serve`] and
+    /// [`Server::run`] hand the same gate to every port and every worker, so
+    /// the limits are the server's rather than each port's.
+    pub fn with_gate(mut self, gate: Arc<Gate>) -> Self {
+        self.gate = gate;
+        self
+    }
+
     /// The versions this port offers.
     pub fn versions(&self) -> &[Version] {
         &self.negotiation.versions
+    }
+
+    /// The gate this port admits connections through.
+    pub fn gate(&self) -> &Arc<Gate> {
+        &self.gate
     }
 
     /// The limits each connection holds itself to.
@@ -404,36 +457,48 @@ impl Listener {
         self.socket.address()
     }
 
-    /// Waits for the next connection that has finished negotiating.
+    /// Waits for the next connection that has been admitted and has finished
+    /// negotiating.
     ///
-    /// Accepting and negotiating go on in the background while this waits, so
-    /// a caller that is slow to take connections still lets handshakes
-    /// progress. Handshakes that fail are dropped rather than returned — one
-    /// peer failing to negotiate is not the listener's failure.
+    /// Accepting, admitting and negotiating go on in the background while this
+    /// waits, so a caller that is slow to take connections still lets
+    /// handshakes progress. A connection the gate turns away is closed where it
+    /// is accepted and never reaches here, and a handshake that fails is
+    /// dropped rather than returned — neither a refused nor a failed peer is
+    /// the listener's failure.
+    ///
+    /// The gate is consulted before a handshake slot is reserved, so a refused
+    /// connection cannot crowd out one that would be admitted.
     ///
     /// # Errors
     ///
     /// Returns [`Error::IO`] or [`Error::Closed`] when accepting itself fails.
-    pub async fn accept(&mut self) -> Result<AnyConnection, Error> {
+    pub async fn accept(&mut self) -> Result<Admitted, Error> {
         loop {
             tokio::select! {
                 biased;
 
                 Some(negotiated) = self.negotiated.recv() => {
-                    if let Ok(connection) = negotiated {
-                        return Ok(connection);
+                    if let Ok(admitted) = negotiated {
+                        return Ok(admitted);
                     }
                 }
 
                 incoming = self.socket.accept(), if self.negotiating.capacity() > 0 => {
                     let incoming = incoming?;
 
-                    let Ok(permit) = self.negotiating.clone().try_reserve_owned() else {
+                    let Some(permit) = self.gate.admit(incoming.client().map(|address| address.ip()), std::time::Instant::now()) else {
+                        self.negotiation.refuse(incoming);
+                        continue;
+                    };
+
+                    let Ok(slot) = self.negotiating.clone().try_reserve_owned() else {
+                        self.negotiation.refuse(incoming);
                         continue;
                     };
 
                     let negotiation = Arc::clone(&self.negotiation);
-                    tokio::spawn(async move { permit.send(negotiation.accept(incoming).await) });
+                    tokio::spawn(async move { slot.send(negotiation.accept(incoming).await.map(|connection| Admitted { connection, permit })) });
                 }
             }
         }
@@ -452,8 +517,15 @@ pub struct ServerLimits {
     /// The listen backlog for a TCP socket.
     pub backlog: u32,
     /// The number of connections that may be open at once. Zero is unbounded.
+    ///
+    /// Counted from the accept, so a connection still negotiating is one of
+    /// them. A connection that never finishes negotiating is exactly what a
+    /// ceiling is for, and one that only counted what had finished would not
+    /// bound it.
     pub max_connections: u32,
     /// The number of connections one address may have open. Zero is unbounded.
+    ///
+    /// Counted from the accept, as [`ServerLimits::max_connections`] is.
     pub max_connections_per_ip: u32,
     /// Rate limits as `[(period in seconds, count), ...]`; every entry must be
     /// satisfied, so several together shape both bursts and sustained rate.
@@ -471,6 +543,10 @@ pub struct ServerLimits {
 
 impl ServerLimits {
     /// The admission [`Gate`] these limits describe.
+    ///
+    /// A fresh one each time. [`Server::serve`] and [`Server::run`] build one
+    /// and hand it to every port and worker through [`Listener::with_gate`],
+    /// which is what makes the limits the server's rather than each port's.
     pub fn gate(&self) -> Arc<Gate> {
         Gate::new(self.max_connections, self.max_connections_per_ip, self.max_connection_rate.clone(), self.max_connection_history)
     }
@@ -652,9 +728,11 @@ impl Server {
 
     /// Starts an accept loop for each listener.
     ///
-    /// Each accepted connection is put to the gate before a task is spawned
-    /// for it; one that is refused is closed at once. The permit is held for
-    /// as long as the connection runs.
+    /// Every listener is put behind the one `gate`, so the limits are the
+    /// server's rather than each port's. Admission happens inside the listener,
+    /// the moment a connection is accepted and before it negotiates; what
+    /// arrives here is already admitted, and carries the permit its slot is
+    /// held by. The permit is held for as long as the connection runs.
     pub fn launch<H: Handler>(&self, handler: Arc<H>, listeners: Vec<Listener>, gate: Arc<Gate>) -> ServerHandle {
         let (shutdown, receiver) = tokio::sync::watch::channel(false);
         let tasks = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
@@ -662,13 +740,14 @@ impl Server {
         let mut accept_loops = Vec::new();
         let mut addresses = Vec::new();
 
-        for mut listener in listeners {
+        for listener in listeners {
             if let Ok(address) = listener.address() {
                 addresses.push(address);
             }
 
+            let mut listener = listener.with_gate(gate.clone());
+
             let handler = handler.clone();
-            let gate = gate.clone();
             let tasks = tasks.clone();
             let mut receiver = receiver.clone();
 
@@ -678,15 +757,8 @@ impl Server {
                         _ = receiver.changed() => break,
 
                         result = listener.accept() => {
-                            let Ok(mut connection) = result else {
+                            let Ok(Admitted { connection, permit }) = result else {
                                 break;
-                            };
-
-                            let ip = connection.client().map(|address| address.ip());
-
-                            let Some(permit) = gate.admit(ip, std::time::Instant::now()) else {
-                                connection.close().await;
-                                continue;
                             };
 
                             let handler = handler.clone();
