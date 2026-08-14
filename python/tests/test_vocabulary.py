@@ -198,6 +198,9 @@ def test_scanning_finds_an_octet_and_classifies_a_field_value():
     assert scan.find(b"abcdef", ord("d")) == 3
     assert scan.find(b"abcdef", ord("z")) is None
     assert scan.copy(b"abcdef") == b"abcdef"
+    assert scan.same(b"abcdef", b"abcdef")
+    assert not scan.same(b"abcdef", b"abcdeg")
+    assert not scan.same(b"abcdef", b"abcde")
 
     assert scan.is_field_value(b"plain text")
     assert not scan.is_field_value(b"with\nnewline")
@@ -269,6 +272,9 @@ def test_accept_encoding_selection_follows_rfc_9110_quality_rules():
 
     assert Compression.quality("gzip") == 1.0
     assert Compression.quality("gzip;q=0") == 0.0
+    assert Compression.qvalue("0.5") == 0.5
+    assert Compression.qvalue("1") == 1.0
+    assert Compression.qvalue("nonsense") is None
 
 def test_content_encoding_names_a_coding_only_when_it_names_one():
     def applied(*values):

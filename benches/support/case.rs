@@ -1,11 +1,15 @@
 //! One measured case, and the group it is reported in.
 
 use crate::support::budget::Budget;
+use crate::support::contention::Contention;
+use crate::support::figure::Figure;
 use crate::support::filter::Filter;
+use crate::support::growth::Growth;
 use crate::support::load::driver::{Driver, Run};
 use crate::support::load::workload::Workload;
 use crate::support::measure::Measure;
 use crate::support::report::Report;
+use crate::support::sample::Samples;
 
 /// One measured case: what it is called, and what came of measuring it.
 #[derive(Debug, Clone)]
@@ -30,6 +34,10 @@ impl Case {
 /// long benchmark reports as it goes. Everything a group decides — how long to
 /// measure for, what to write, what to skip — comes from the environment, so a
 /// benchmark says only what it measures.
+///
+/// One method per way of measuring, all shaped alike: a name, whatever that
+/// way needs, and the body. Which of them a group uses is what says how the
+/// thing under it is being looked at.
 pub struct Group {
     /// What the group is called.
     pub name: String,
@@ -99,10 +107,51 @@ impl Group {
         }
     }
 
-    /// Counts the allocations a case makes, over this many rounds.
-    pub fn allocations<T>(&mut self, case: &str, rounds: u64, body: impl FnMut(u64) -> T) {
+    /// Counts what a case costs the allocator, over this many rounds.
+    ///
+    /// The body is given the round number, so that a round can work on a fresh
+    /// stream or a fresh key rather than measuring the same one over and over.
+    pub fn footprint<T>(&mut self, case: &str, rounds: u64, body: impl FnMut(u64) -> T) {
         if self.wants(case) {
-            self.push(Case::new(case, Measure::allocations(rounds, body)));
+            self.push(Case::new(case, Measure::footprint(rounds, body)));
+        }
+    }
+
+    /// Measures a case at every one of these sizes and reports how its cost
+    /// grows with them.
+    ///
+    /// `fixture` builds whatever the size means — a header set of that many
+    /// fields, a store holding that many hosts, a connection carrying that many
+    /// streams — and `body` is the one call that is timed against it, so the
+    /// building never lands in the reading.
+    pub fn growth<F, T>(&mut self, case: &str, sizes: &[usize], mut fixture: impl FnMut(usize) -> F, mut body: impl FnMut(&mut F) -> T) {
+        if !self.wants(case) {
+            return;
+        }
+
+        let mut growth = Growth::new();
+
+        for size in sizes {
+            let mut held = fixture(*size);
+            growth.at(*size, Samples::measure(self.budget, || body(&mut held)).median());
+        }
+
+        self.push(Case::new(case, Measure::Growth(growth)));
+    }
+
+    /// Measures a case alone and then on several threads at once, one case per
+    /// thread count.
+    ///
+    /// The body is shared rather than cloned, so what the threads reach for is
+    /// one structure. Which thread counts run comes from the environment, per
+    /// [`Contention::counts`].
+    pub fn contention<T>(&mut self, case: &str, body: impl Fn() -> T + Sync) {
+        for threads in Contention::counts() {
+            let name = format!("{case} ({})", Figure::many(threads, "thread"));
+
+            if self.wants(&name) {
+                self.push(Case::new(name, Measure::contention(self.budget, threads, &body)));
+            }
         }
     }
 

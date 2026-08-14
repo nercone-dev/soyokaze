@@ -1573,6 +1573,8 @@ uint64_t soyokaze_scan_word_at(const uint8_t *data, size_t data_len, size_t offs
 ptrdiff_t soyokaze_scan_find(const uint8_t *data, size_t data_len, uint8_t needle);
 bool soyokaze_scan_copy(uint8_t *destination, size_t destination_len,
                         const uint8_t *source, size_t source_len);
+bool soyokaze_scan_same(const uint8_t *left, size_t left_len,
+                        const uint8_t *right, size_t right_len);
 uint8_t soyokaze_scan_value_control(void);
 uint8_t soyokaze_scan_value_obs_text(void);
 uint8_t soyokaze_scan_classify_field_value(const uint8_t *data, size_t data_len);
@@ -1613,6 +1615,10 @@ bool soyokaze_compression_encoded(const soyokaze_headers_t *headers);
 /* The quality one entry of a coding list carries; an entry with no q parameter
  * is fully acceptable and reads as 1. -1 when the entry is unreadable. */
 float soyokaze_compression_quality(const uint8_t *entry, size_t entry_len);
+
+/* The quality a qvalue text names on its own, as RFC 9110 12.4.2 writes one.
+ * -1 when the text is outside that grammar. */
+float soyokaze_compression_qvalue(const uint8_t *text, size_t text_len);
 
 /* Codes octets, and undoes it. Encoding refuses SOYOKAZE_COMPRESSION_AUTO,
  * which names no coding. Decoding produces at most `max` octets; passing it is

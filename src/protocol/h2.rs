@@ -18,6 +18,8 @@
 //! [`hpack`]: crate::helpers::hpack
 
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -181,11 +183,15 @@ pub struct H2Stream {
     accepted: Option<Compression>,
 
     pending_reset: Option<u64>,
+    resets: Arc<AtomicBool>,
 }
 
 impl H2Stream {
     /// An idle stream with the given starting windows.
-    pub fn new(id: StreamID, window_local: i64, window_remote: i64) -> Self {
+    ///
+    /// `resets` is the connection's flag saying some stream has asked to be
+    /// reset; see [`H2Connection::flush_resets`].
+    pub fn new(id: StreamID, window_local: i64, window_remote: i64, resets: Arc<AtomicBool>) -> Self {
         Self {
             id,
             state: StreamState::Idle,
@@ -198,6 +204,7 @@ impl H2Stream {
             method: None,
             accepted: None,
             pending_reset: None,
+            resets,
         }
     }
 
@@ -240,6 +247,7 @@ impl Stream for H2Stream {
     async fn reset(&mut self, code: u64) {
         self.state = StreamState::Closed;
         self.pending_reset = Some(code);
+        self.resets.store(true, Ordering::Relaxed);
     }
 }
 
@@ -281,6 +289,7 @@ pub struct H2Connection<T> {
     fields: Vec<HeaderField>,
     buffered_bound: u64,
 
+    resets: Arc<AtomicBool>,
     premature_resets: u32,
     idle_frames: u32,
     request_finalizer: crate::finalizer::RequestFinalizer,
@@ -338,6 +347,7 @@ where
             block: Vec::new(),
             fields: Vec::new(),
             buffered_bound: 0,
+            resets: Arc::new(AtomicBool::new(false)),
 
             premature_resets: 0,
             idle_frames: 0,
@@ -603,7 +613,7 @@ where
                 let stream_id = StreamID(self.next_stream_id);
                 self.next_stream_id += 2;
 
-                self.streams.insert(stream_id, H2Stream::new(stream_id, window_local, window_remote));
+                self.streams.insert(stream_id, H2Stream::new(stream_id, window_local, window_remote, self.resets.clone()));
                 stream_id
             }
         };
@@ -1124,7 +1134,7 @@ where
 
             let window_local = self.settings_local.initial_window_size as i64;
             let window_remote = self.settings_remote.initial_window_size as i64;
-            self.streams.insert(stream_id, H2Stream::new(stream_id, window_local, window_remote));
+            self.streams.insert(stream_id, H2Stream::new(stream_id, window_local, window_remote, self.resets.clone()));
         }
 
         Ok(())
@@ -1251,6 +1261,14 @@ where
     /// Currently infallible; the signature leaves room for a reset that has to
     /// flush.
     pub async fn flush_resets(&mut self) -> Result<(), Error> {
+        // Asked once per frame, where walking every stream of a connection
+        // carrying many would cost a pass over all of them per frame. The flag
+        // is set by the only thing that can record the intent, so a connection
+        // no caller has reset never walks anything.
+        if !self.resets.swap(false, Ordering::Relaxed) {
+            return Ok(());
+        }
+
         let pending: Vec<(StreamID, u64)> = self
             .streams
             .iter_mut()

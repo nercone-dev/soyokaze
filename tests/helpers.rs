@@ -187,6 +187,60 @@ fn hsts_prunes_expired_entries_and_keeps_live_ones() {
     assert!(store.secure("lasting.test", now));
 }
 
+/// RFC 6797 section 8.3: a host is covered by a congruent match against a
+/// Known HSTS Host, or by a superdomain match against one whose policy carries
+/// `includeSubDomains`. Anything else, and any policy past its `max-age`, is
+/// not a match.
+#[test]
+fn hsts_matches_a_host_congruently_or_by_a_superdomain_that_asked() {
+    let store = HSTSStore::new();
+    let now = Instant::now();
+
+    store.learn("alone.test", "max-age=600", true, now);
+    store.learn("covered.test", "max-age=600; includeSubDomains", true, now);
+    store.learn("brief.test", "max-age=60; includeSubDomains", true, now);
+
+    // A congruent match, whether or not the policy covers subdomains.
+    assert!(store.secure("alone.test", now), "a congruent match was refused");
+    assert!(store.secure("covered.test", now), "a congruent match was refused");
+
+    // A superdomain match, at every depth, when the policy covers subdomains.
+    assert!(store.secure("api.covered.test", now), "a superdomain match was refused");
+    assert!(store.secure("a.b.c.d.covered.test", now), "a deep superdomain match was refused");
+
+    // A superdomain match when the policy does not cover subdomains.
+    assert!(!store.secure("api.alone.test", now), "a policy leaked to a subdomain");
+    assert!(!store.secure("a.b.api.alone.test", now), "a policy leaked to a subdomain");
+
+    // Matching is by label, so a shared suffix is not a superdomain.
+    assert!(!store.secure("notcovered.test", now), "a suffix was read as a superdomain");
+    assert!(!store.secure("test", now), "a parent label was read as a match");
+    assert!(!store.secure("covered.test.example", now), "a subdomain was read as a superdomain");
+
+    // A host no policy names at all.
+    assert!(!store.secure("unrelated.example", now), "an unnamed host was called secure");
+
+    // An expired policy matches nothing, congruently or as a superdomain.
+    let later = now + Duration::from_secs(61);
+    assert!(!store.secure("brief.test", later), "an expired policy still matched congruently");
+    assert!(!store.secure("api.brief.test", later), "an expired policy still matched a subdomain");
+    assert!(store.secure("covered.test", later), "a live policy was dropped with an expired one");
+}
+
+/// RFC 6797 section 8.2: host names are canonicalized before they are matched,
+/// so case and a trailing root label do not change the answer.
+#[test]
+fn hsts_matches_a_host_however_it_was_written() {
+    let store = HSTSStore::new();
+    let now = Instant::now();
+
+    store.learn("Example.Test.", "max-age=600; includeSubDomains", true, now);
+
+    assert!(store.secure("example.test", now), "a stored name was not canonicalized");
+    assert!(store.secure("EXAMPLE.TEST", now), "a queried name was not canonicalized");
+    assert!(store.secure("API.Example.Test.", now), "a queried subdomain was not canonicalized");
+}
+
 #[test]
 fn hsts_never_applies_to_an_address_literal() {
     let store = HSTSStore::new();
@@ -431,6 +485,40 @@ fn a_field_value_carrying_obs_text_still_parses() {
 }
 
 #[test]
+fn two_runs_are_the_same_exactly_when_their_octets_are() {
+    let mut rng = harness::rng::Rng::new(0x9e37_79b9_7f4a_7c15);
+    let run = |rng: &mut harness::rng::Rng, length: usize| (0..length).map(|_| rng.bytes(1)[0]).collect::<Vec<u8>>();
+
+    for length in 0..40usize {
+        let left = run(&mut rng, length);
+
+        assert!(scan::same(&left, &left), "a run of {length} octets is not the same as itself");
+        assert!(!scan::same(&left, &left[..length.saturating_sub(1)]) || length == 0, "runs of different lengths were called the same");
+
+        for at in 0..length {
+            for difference in [1u8, 0x7f, 0x80, 0xff] {
+                let mut right = left.clone();
+                right[at] ^= difference;
+
+                assert!(
+                    !scan::same(&left, &right),
+                    "a difference of {difference:#04x} at {at} of {length} octets was not noticed"
+                );
+            }
+        }
+    }
+
+    for _ in 0..20_000 {
+        for length in [0usize, 1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64] {
+            let left = run(&mut rng, length);
+            let right = run(&mut rng, length);
+
+            assert_eq!(scan::same(&left, &right), left == right, "{left:?} against {right:?}");
+        }
+    }
+}
+
+#[test]
 fn the_octet_class_check_agrees_with_a_byte_at_a_time_reading() {
     let mut table = [0u8; 256];
     for (value, slot) in table.iter_mut().enumerate() {
@@ -544,4 +632,87 @@ fn text_round_trips_across_the_inline_boundary() {
         assert_eq!(text.is_inline(), length <= INLINE);
         assert_eq!(text.clone().into_string(), source);
     }
+}
+
+#[test]
+fn the_visible_scan_answers_the_octets_a_target_may_carry() {
+    // RFC 9110 §5.6.4 and RFC 9112 §3: a request target carries VCHAR and
+    // obs-text — everything above SP but for DEL. The scan is asked about each
+    // octet on its own, at every offset a word boundary can fall on, and about
+    // runs that are all of one octet.
+    for value in 0..=255u8 {
+        let admitted = value > 0x20 && value != 0x7f;
+
+        for length in 1..=24usize {
+            for at in 0..length {
+                let mut text = vec![b'a'; length];
+                text[at] = value;
+
+                assert_eq!(
+                    scan::all_visible(&text),
+                    admitted,
+                    "{value:#04x} at offset {at} of {length} is answered wrongly"
+                );
+            }
+        }
+    }
+
+    assert!(scan::all_visible(b""), "an empty run is vacuously all of anything");
+}
+
+#[test]
+fn the_visible_scan_and_the_start_line_table_agree() {
+    // The HTTP/1 line scanner and the decoded-text check must admit exactly
+    // the same octets, or a target would parse and then fail to be written
+    // back out.
+    for value in 0..=255u8 {
+        let octet = [value];
+
+        assert_eq!(
+            scan::all_visible(&octet),
+            h1::Octets::is_target_bytes(&octet),
+            "{value:#04x} is answered one way by the scan and another by the table"
+        );
+    }
+}
+
+#[test]
+fn connection_specific_and_forbidden_trailer_are_their_own_lists() {
+    // Both are recognised by length and first octet rather than by walking the
+    // list, so the two have to be checked against each other.
+    let corpus: Vec<String> = Fields::CONNECTION_SPECIFIC
+        .iter()
+        .chain(Fields::FORBIDDEN_TRAILERS)
+        .flat_map(|name| {
+            let name = name.to_string();
+            let cut = name[..name.len() - 1].to_string();
+            let grown = format!("{name}x");
+            let changed = format!("x{}", &name[1..]);
+            [name, cut, grown, changed]
+        })
+        .chain(["".into(), "accept".into(), "content-type".into(), "x-forwarded-for".into()])
+        .collect();
+
+    for name in &corpus {
+        assert_eq!(
+            Fields::connection_specific(name),
+            Fields::CONNECTION_SPECIFIC.contains(&name.as_str()),
+            "{name:?} is not classified as the list says"
+        );
+
+        assert_eq!(
+            Fields::forbidden_trailer(name),
+            Fields::CONNECTION_SPECIFIC.contains(&name.as_str()) || Fields::FORBIDDEN_TRAILERS.contains(&name.as_str()),
+            "{name:?} is not classified as the lists say"
+        );
+    }
+}
+
+#[test]
+fn a_pseudo_header_is_a_name_beginning_with_a_colon() {
+    assert!(Fields::pseudo(":method"));
+    assert!(Fields::pseudo(":"));
+    assert!(!Fields::pseudo(""));
+    assert!(!Fields::pseudo("method"));
+    assert!(!Fields::pseudo("m:ethod"));
 }

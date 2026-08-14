@@ -2,8 +2,11 @@
 
 /// How a measured number is written.
 ///
-/// Every column in every report goes through here, so that a duration, a count
-/// and a rate are written the same way wherever they appear.
+/// Every column in every report goes through here, so that a duration, a size,
+/// a count and a rate are written the same way wherever they appear. One
+/// function per kind of number, named after the kind: a reader who knows what
+/// [`Figure::octets`] gives knows what every size column in every report
+/// gives.
 pub struct Figure;
 
 impl Figure {
@@ -12,6 +15,9 @@ impl Figure {
 
     /// The suffixes a count is abbreviated with, each a thousand times the last.
     pub const SUFFIXES: &'static [&'static str] = &["", "k", "M", "G", "T"];
+
+    /// The suffixes a size is abbreviated with, each 1024 times the last.
+    pub const SIZES: &'static [&'static str] = &["B", "KiB", "MiB", "GiB", "TiB"];
 
     /// A length of time in seconds, in the largest unit that keeps it
     /// readable.
@@ -45,6 +51,28 @@ impl Figure {
         }
     }
 
+    /// A plain number, as a measurement that is neither a time nor a count is
+    /// written — a slope, a ratio, a multiplier.
+    pub fn number(value: f64) -> String {
+        format!("{value:.2}")
+    }
+
+    /// A size in octets, in the largest unit that keeps it readable.
+    pub fn octets(value: f64) -> String {
+        let mut value = value;
+        let mut suffix = 0;
+
+        while value >= 1024.0 && suffix + 1 < Self::SIZES.len() {
+            value /= 1024.0;
+            suffix += 1;
+        }
+
+        match suffix {
+            0 => format!("{value:.0} B"),
+            _ => format!("{value:.2} {}", Self::SIZES[suffix]),
+        }
+    }
+
     /// How many times a second something taking this many seconds happens.
     pub fn rate(each: f64) -> String {
         match each {
@@ -71,8 +99,17 @@ impl Figure {
         format!("{}/s", Self::count(value))
     }
 
+    /// A count of something, with the thing named and made plural when there
+    /// is not exactly one of it.
+    ///
+    /// So that a report says "1 thread" and "4 threads" rather than either of
+    /// them twice.
+    pub fn many(count: usize, noun: &str) -> String {
+        format!("{count} {noun}{}", if count == 1 { "" } else { "s" })
+    }
+
     /// A number of octets a second, as mebibytes.
-    pub fn octets(value: f64) -> String {
+    pub fn bandwidth(value: f64) -> String {
         format!("{:.1} MiB/s", value / Self::MEBIBYTE)
     }
 }

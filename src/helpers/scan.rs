@@ -92,6 +92,50 @@ pub fn copy(destination: &mut [u8], source: &[u8]) {
     }
 }
 
+/// Whether `left` and `right` hold the same octets.
+///
+/// Short runs — which field names and tokens are — are settled by a pair of
+/// overlapping fixed-width comparisons rather than by a length-driven loop,
+/// which is a call out to the C library and costs more than the answer it
+/// gives. Longer ones are left to that loop, which is what it is good at.
+///
+/// The counterpart of [`copy`], and split at the same widths.
+#[inline]
+pub fn same(left: &[u8], right: &[u8]) -> bool {
+    let len = left.len();
+
+    if len != right.len() {
+        return false;
+    }
+
+    if len > 32 {
+        return left == right;
+    }
+
+    let wide = |octets: &[u8], at: usize| u128::from_ne_bytes(octets[at..at + 16].try_into().expect("sixteen octets are sixteen octets"));
+    let word = |octets: &[u8], at: usize| u64::from_ne_bytes(octets[at..at + 8].try_into().expect("eight octets are eight octets"));
+    let half = |octets: &[u8], at: usize| u32::from_ne_bytes(octets[at..at + 4].try_into().expect("four octets are four octets"));
+    let pair = |octets: &[u8], at: usize| u16::from_ne_bytes(octets[at..at + 2].try_into().expect("two octets are two octets"));
+
+    if len >= 16 {
+        return (wide(left, 0) ^ wide(right, 0)) | (wide(left, len - 16) ^ wide(right, len - 16)) == 0;
+    }
+
+    if len >= 8 {
+        return (word(left, 0) ^ word(right, 0)) | (word(left, len - 8) ^ word(right, len - 8)) == 0;
+    }
+
+    if len >= 4 {
+        return (half(left, 0) ^ half(right, 0)) | (half(left, len - 4) ^ half(right, len - 4)) == 0;
+    }
+
+    if len >= 2 {
+        return (pair(left, 0) ^ pair(right, 0)) | (pair(left, len - 2) ^ pair(right, len - 2)) == 0;
+    }
+
+    len == 0 || left[0] == right[0]
+}
+
 /// [`classify_field_value`]: the value carries a control octet, and so is not
 /// a valid field value.
 pub const VALUE_CONTROL: u8 = 1 << 0;
@@ -169,6 +213,33 @@ pub fn classify_field_value(text: &[u8]) -> u8 {
 #[inline]
 pub fn is_field_value(text: &[u8]) -> bool {
     classify_field_value(text) & VALUE_CONTROL == 0
+}
+
+/// Whether every octet of `text` is visible: above `SP` and not `DEL`.
+///
+/// `VCHAR` and `obs-text` together, which is the set a request target and an
+/// authority are held to. A contiguous range rather than a scattered set, so
+/// the bit-twiddling above answers it and no table is reached for.
+///
+/// An empty `text` is vacuously all of anything, and answers `true`.
+#[inline]
+pub fn all_visible(text: &[u8]) -> bool {
+    let mut marked = 0u64;
+    let mut offset = 0;
+
+    let classify = |word: u64| holds_less(word, 0x21) | marks_zero(word ^ LOW.wrapping_mul(0x7f));
+
+    while offset + LANES <= text.len() {
+        marked |= classify(word_at(text, offset));
+        offset += LANES;
+    }
+
+    if offset < text.len() && text.len() >= LANES {
+        marked |= classify(word_at(text, text.len() - LANES));
+        offset = text.len();
+    }
+
+    marked == 0 && text[offset..].iter().all(|octet| *octet > 0x20 && *octet != 0x7f)
 }
 
 /// Whether every octet of `text` is one `table` marks with `mask`.

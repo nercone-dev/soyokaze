@@ -15,6 +15,8 @@ use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::sync::Arc;
 
+use crate::helpers::scan;
+
 /// The longest string held without allocating.
 ///
 /// Chosen so that [`Text`] fits in the same space as an `Arc<str>` plus its
@@ -25,10 +27,16 @@ pub const INLINE: usize = 30;
 #[derive(Clone)]
 pub enum Repr {
     /// Held in the value itself, `len` octets of `octets` being live.
+    ///
+    /// Every octet past `len` is zero — [`Text::copy_inline`] is the only way
+    /// one is built and it leaves them so, and nothing mutates them
+    /// afterwards. That is what lets two inline values be compared as one
+    /// fixed-width buffer rather than by length.
     Inline {
         /// How many leading octets are live; never above [`INLINE`].
         len: u8,
-        /// The octets, of which only the first `len` are meaningful.
+        /// The octets, of which only the first `len` are meaningful and the
+        /// rest are zero.
         octets: [u8; INLINE],
     },
     /// Held on the heap, for anything longer than [`INLINE`].
@@ -83,6 +91,21 @@ impl Text {
         }
 
         octets
+    }
+
+    /// Whether two inline buffers hold the same octets.
+    ///
+    /// Both are the same known width, so this is a pair of overlapping
+    /// fixed-width comparisons rather than one driven by a length — which is a
+    /// call out to the C library, and costs more than everything around it.
+    #[inline]
+    pub fn same_inline(left: &[u8; INLINE], right: &[u8; INLINE]) -> bool {
+        const _: () = assert!(INLINE >= 16, "an inline buffer is compared as two overlapping words");
+
+        let head = |octets: &[u8; INLINE]| u128::from_ne_bytes(octets[..16].try_into().expect("sixteen octets are sixteen octets"));
+        let tail = |octets: &[u8; INLINE]| u128::from_ne_bytes(octets[INLINE - 16..].try_into().expect("sixteen octets are sixteen octets"));
+
+        (head(left) ^ head(right)) | (tail(left) ^ tail(right)) == 0
     }
 
     /// Copies a string slice, staying inline when it is short enough.
@@ -340,7 +363,15 @@ impl From<Text> for String {
 impl PartialEq for Text {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.len() == other.len() && self.as_bytes() == other.as_bytes()
+        match (&self.0, &other.0) {
+            // Both buffers are the same width and everything past the length
+            // is zero, so this settles in a handful of word comparisons rather
+            // than a call out to one driven by a length only known at run
+            // time. Field names are compared once per table entry per field,
+            // which is where most of the comparing in a connection happens.
+            (Repr::Inline { len, octets }, Repr::Inline { len: other_len, octets: other_octets }) => len == other_len && Text::same_inline(octets, other_octets),
+            _ => self.len() == other.len() && self.as_bytes() == other.as_bytes(),
+        }
     }
 }
 
@@ -349,32 +380,32 @@ impl Eq for Text {}
 impl PartialEq<str> for Text {
     #[inline]
     fn eq(&self, other: &str) -> bool {
-        self.as_bytes() == other.as_bytes()
+        scan::same(self.as_bytes(), other.as_bytes())
     }
 }
 
 impl PartialEq<&str> for Text {
     #[inline]
     fn eq(&self, other: &&str) -> bool {
-        self.as_bytes() == other.as_bytes()
+        scan::same(self.as_bytes(), other.as_bytes())
     }
 }
 
 impl PartialEq<String> for Text {
     fn eq(&self, other: &String) -> bool {
-        self.as_bytes() == other.as_bytes()
+        scan::same(self.as_bytes(), other.as_bytes())
     }
 }
 
 impl PartialEq<Text> for str {
     fn eq(&self, other: &Text) -> bool {
-        self.as_bytes() == other.as_bytes()
+        scan::same(self.as_bytes(), other.as_bytes())
     }
 }
 
 impl PartialEq<Text> for &str {
     fn eq(&self, other: &Text) -> bool {
-        self.as_bytes() == other.as_bytes()
+        scan::same(self.as_bytes(), other.as_bytes())
     }
 }
 

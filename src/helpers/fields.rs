@@ -15,6 +15,7 @@ use std::fmt;
 use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::helpers::huffman;
+use crate::helpers::scan;
 use crate::helpers::text::Text;
 
 /// One field: a name and a value.
@@ -83,12 +84,26 @@ impl HeaderField {
     /// Whether the field is one of [`HeaderField::SENSITIVE`], and so must never be
     /// indexed.
     pub fn sensitive(&self) -> bool {
-        matches!(self.name.len(), 6 | 10 | 13 | 19) && Self::SENSITIVE.contains(&self.name.as_str())
+        let name = self.name.as_str();
+        let Some(first) = name.as_bytes().first() else {
+            return false;
+        };
+
+        match (name.len(), first) {
+            (6, b'c') => name == "cookie",
+            (10, b's') => name == "set-cookie",
+            (13, b'a') => name == "authorization",
+            (19, b'p') => name == "proxy-authorization",
+            _ => false,
+        }
     }
 
     /// [`HeaderField::TOKENS`]: the octet may appear in a token, and so in a
     /// field name.
     pub const TOKEN: u8 = 1 << 0;
+    /// [`HeaderField::TOKENS`]: the octet may appear in a token and is not an
+    /// uppercase letter, which is what the binary versions require of a name.
+    pub const LOWERCASE: u8 = 1 << 1;
 
     /// Which octets may appear in a field name.
     ///
@@ -111,7 +126,7 @@ impl HeaderField {
                     b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
                 );
 
-            octets[value] = token as u8;
+            octets[value] = token as u8 | ((token && !byte.is_ascii_uppercase()) as u8) << 1;
             value += 1;
         }
 
@@ -125,13 +140,16 @@ impl HeaderField {
     /// this is the part every version shares.
     #[inline]
     pub fn is_name(name: &str) -> bool {
-        !name.is_empty() && crate::helpers::scan::all_in_class(name.as_bytes(), Self::TOKENS, Self::TOKEN)
+        !name.is_empty() && scan::all_in_class(name.as_bytes(), Self::TOKENS, Self::TOKEN)
     }
 
     /// [`HeaderField::is_name`], and lowercase as the binary versions require.
+    ///
+    /// One pass rather than two: [`HeaderField::LOWERCASE`] marks exactly the
+    /// octets that are both, so the table answers the whole question.
     #[inline]
     pub fn is_lowercase_name(name: &str) -> bool {
-        Self::is_name(name) && !name.bytes().any(|byte| byte.is_ascii_uppercase())
+        !name.is_empty() && scan::all_in_class(name.as_bytes(), Self::TOKENS, Self::LOWERCASE)
     }
 
     /// Whether a field value may be sent or accepted.
@@ -147,7 +165,7 @@ impl HeaderField {
             return false;
         }
 
-        crate::helpers::scan::is_field_value(octets)
+        scan::is_field_value(octets)
     }
 }
 
@@ -158,28 +176,188 @@ impl HeaderField {
 #[derive(Default)]
 pub struct FieldHasher(u64);
 
+impl FieldHasher {
+    /// What an empty hash starts from.
+    pub const SEED: u64 = 0xcbf2_9ce4_8422_2325;
+    /// The odd multiplier each word is mixed with.
+    pub const FACTOR: u64 = 0x9e37_79b9_7f4a_7c15;
+
+    /// Mixes one word in.
+    #[inline]
+    pub fn mix(hash: u64, word: u64) -> u64 {
+        (hash.rotate_left(5) ^ word).wrapping_mul(Self::FACTOR)
+    }
+
+    /// The eight octets at `offset`, as a word.
+    ///
+    /// # Panics
+    ///
+    /// Panics when fewer than eight octets remain at `offset`.
+    #[inline]
+    pub fn word(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("eight octets are eight octets"))
+    }
+
+    /// Fewer than eight octets, gathered into a word.
+    ///
+    /// The pieces are read at fixed widths and may overlap, so nothing here
+    /// reaches for a copy driven by a length only known at run time — which is
+    /// a call out to the C library, and costs more than the whole hash. Two
+    /// runs of the same length still differ whenever their octets do, which is
+    /// all a hash asks.
+    ///
+    /// # Panics
+    ///
+    /// Panics when eight octets or more are given.
+    #[inline]
+    pub fn short(bytes: &[u8]) -> u64 {
+        match bytes.len() {
+            0 => 0,
+            len @ 1..=3 => bytes[0] as u64 | (bytes[len / 2] as u64) << 8 | (bytes[len - 1] as u64) << 16,
+            len => {
+                let head = u32::from_le_bytes(bytes[..4].try_into().expect("four octets are four octets")) as u64;
+                let tail = u32::from_le_bytes(bytes[len - 4..].try_into().expect("four octets are four octets")) as u64;
+                head | tail << 32
+            }
+        }
+    }
+}
+
 impl Hasher for FieldHasher {
     fn finish(&self) -> u64 {
-        self.0
+        // The bucket a map picks comes off the low bits and the tag off the
+        // high ones, so the last word's own bits are spread across both before
+        // either is read.
+        let hash = self.0;
+        hash ^ hash >> 32
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        let mut hash = if self.0 == 0 { 0xcbf2_9ce4_8422_2325 } else { self.0 };
+        let mut hash = match self.0 {
+            0 => Self::SEED,
+            held => held,
+        };
 
-        for byte in bytes {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        // Eight octets at a time: a field name is a handful of them, and a
+        // multiply per octet costs more than the whole lookup it leads to. The
+        // last word is read to end on the final octet rather than to begin
+        // after the one before, so it overlaps rather than needing a tail of
+        // its own.
+        if bytes.len() >= size_of::<u64>() {
+            let mut offset = 0;
+
+            while offset + size_of::<u64>() <= bytes.len() {
+                hash = Self::mix(hash, Self::word(bytes, offset));
+                offset += size_of::<u64>();
+            }
+
+            if offset < bytes.len() {
+                hash = Self::mix(hash, Self::word(bytes, bytes.len() - size_of::<u64>()));
+            }
+        } else {
+            hash = Self::mix(hash, Self::short(bytes));
         }
 
-        self.0 = hash;
+        self.0 = Self::mix(hash, bytes.len() as u64);
     }
 }
 
 /// A map keyed by field name, hashed with [`FieldHasher`].
 pub type FieldMap<K, V> = HashMap<K, V, BuildHasherDefault<FieldHasher>>;
 
+/// A hasher for keys that are hashes already.
+///
+/// A [`Mark`] is a [`FieldHasher`] digest, so putting it through a second
+/// round would mix bits that are spread as well as they are going to get. This
+/// hands the word straight back, which is what a map keyed by a mark wants —
+/// the same reason [`StreamHasher`] exists for a stream identifier.
+///
+/// [`StreamHasher`]: crate::protocol::common::StreamHasher
+#[derive(Default)]
+pub struct MarkHasher(u64);
+
+impl Hasher for MarkHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0 = bytes.iter().fold(self.0, |hash, octet| FieldHasher::mix(hash, *octet as u64));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+/// A map keyed by a [`Mark`], which is hashed already.
+pub type MarkMap<V> = HashMap<Mark, V, BuildHasherDefault<MarkHasher>>;
+
+/// A cheap stand-in for a field name, so a table can be searched without
+/// comparing the names themselves.
+///
+/// A dynamic table is searched from one end to the other for every field
+/// encoded, which is where most of the comparing on a connection happens. Two
+/// marks that differ stand for two names that differ, so a mismatch settles an
+/// entry in one word comparison; two that agree are still confirmed against
+/// the names, since a mark is a hash and hashes collide.
+///
+/// Only the name is marked. A value is only ever compared once the name has
+/// matched, which is rare enough that hashing every value to save those
+/// comparisons costs more than it saves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Mark(pub u64);
+
+impl Mark {
+    /// The mark of a name.
+    #[inline]
+    pub fn of(name: &str) -> Self {
+        let mut hasher = FieldHasher::default();
+        hasher.write(name.as_bytes());
+        Self(hasher.finish())
+    }
+}
+
+/// One entry of a dynamic table: the field, and the [`Mark`] it is searched by.
+///
+/// HPACK and QPACK number their tables differently but hold them the same way,
+/// so both keep their entries as these.
+#[derive(Debug, Clone)]
+pub struct Entry {
+    /// The field itself.
+    pub field: HeaderField,
+    /// What the field's name is searched by.
+    pub mark: Mark,
+}
+
+impl Entry {
+    /// An entry holding `field`.
+    pub fn of(field: HeaderField) -> Self {
+        Self { mark: Mark::of(&field.name), field }
+    }
+
+    /// What the field costs against a table's size.
+    pub fn size(&self) -> usize {
+        self.field.size()
+    }
+
+    /// Whether this entry's name is the marked field's.
+    #[inline]
+    pub fn named(&self, mark: Mark, field: &HeaderField) -> bool {
+        self.mark == mark && self.field.name == field.name
+    }
+
+    /// Whether this entry's value is the field's.
+    #[inline]
+    pub fn valued(&self, field: &HeaderField) -> bool {
+        self.field.value == field.value
+    }
+}
+
 /// Every static table entry that shares one name.
 pub struct NameEntry {
+    /// The name itself, which confirms a [`Mark`] that matched.
+    pub name: &'static str,
     /// The lowest index carrying this name, for a name-only reference.
     pub first: usize,
     /// Each value stored under this name, with its index.
@@ -192,7 +370,7 @@ pub struct NameEntry {
 /// table", and a linear scan of sixty or a hundred entries per field is the
 /// bulk of encoding a small request.
 pub struct StaticIndex {
-    by_name: FieldMap<&'static str, NameEntry>,
+    by_name: MarkMap<NameEntry>,
 }
 
 impl StaticIndex {
@@ -201,14 +379,15 @@ impl StaticIndex {
     /// HPACK numbers its static table from 1 and QPACK from 0, which is the
     /// only difference between the two.
     pub fn new(entries: &'static [HeaderField], base: usize) -> Self {
-        let mut by_name: FieldMap<&'static str, NameEntry> = FieldMap::default();
+        let mut by_name: MarkMap<NameEntry> = MarkMap::default();
 
         for (offset, entry) in entries.iter().enumerate() {
             let index = base + offset;
+            let name = entry.name.as_str();
 
             by_name
-                .entry(entry.name.as_str())
-                .or_insert_with(|| NameEntry { first: index, values: Vec::new() })
+                .entry(Mark::of(name))
+                .or_insert_with(|| NameEntry { name, first: index, values: Vec::new() })
                 .values
                 .push((entry.value.as_str(), index));
         }
@@ -221,11 +400,15 @@ impl StaticIndex {
     /// Returns the lowest index carrying the name, and the index carrying both
     /// name and value if there is one.
     pub fn lookup(&self, name: &str, value: &str) -> (Option<usize>, Option<usize>) {
-        let Some(entry) = self.by_name.get(name) else {
+        // Keyed by the mark rather than by the name, so a name that is not in
+        // the table — which is most of what a connection sends — is turned
+        // away on a word comparison, and one that is costs only the single
+        // comparison that confirms the mark.
+        let Some(entry) = self.by_name.get(&Mark::of(name)).filter(|entry| scan::same(entry.name.as_bytes(), name.as_bytes())) else {
             return (None, None);
         };
 
-        let exact = entry.values.iter().find(|(candidate, _)| *candidate == value).map(|(_, index)| *index);
+        let exact = entry.values.iter().find(|(candidate, _)| scan::same(candidate.as_bytes(), value.as_bytes())).map(|(_, index)| *index);
         (Some(entry.first), exact)
     }
 }

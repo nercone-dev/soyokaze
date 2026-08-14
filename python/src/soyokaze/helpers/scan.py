@@ -55,6 +55,11 @@ def copy(source):
     library.soyokaze_scan_copy(destination, len(source), source, len(source))
     return bytes(destination)
 
+def same(left, right):
+    """Whether the two runs hold the same octets."""
+    left, right = ffi.Library.encoded(left), ffi.Library.encoded(right)
+    return library.soyokaze_scan_same(left, len(left), right, len(right))
+
 def classify_field_value(text):
     """The or of :data:`VALUE_CONTROL` and :data:`VALUE_OBS_TEXT` over every octet."""
     text = ffi.Library.encoded(text)

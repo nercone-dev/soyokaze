@@ -1,17 +1,38 @@
 //! What a case measured, and what its numbers mean.
 
-use crate::support::alloc::Counter;
 use crate::support::budget::Budget;
+use crate::support::contention::Contention;
 use crate::support::figure::Figure;
+use crate::support::footprint::Footprint;
+use crate::support::growth::Growth;
 use crate::support::load::driver::Run;
 use crate::support::sample::Samples;
 
 /// What a case measured.
 ///
-/// Each variant carries exactly what its kind of measurement needs, and
-/// answers [`Measure::columns`] with the columns that kind is read in, so a
-/// report never has to know which kind it is looking at. A new kind of
-/// measurement is a new variant and nothing else.
+/// Each variant is one way of looking at a piece of the library, and each
+/// carries exactly what its way needs. Together they are the questions worth
+/// asking of any piece of it:
+///
+/// | Variant        | What it answers                                       |
+/// |----------------|-------------------------------------------------------|
+/// | [`Time`]       | How long does one call take?                          |
+/// | [`Throughput`] | How fast does it get through its octets?              |
+/// | [`Footprint`]  | What does one call cost the allocator?                |
+/// | [`Growth`]     | Does the cost stay bounded as the input grows?        |
+/// | [`Contention`] | How much of it survives being made from many threads? |
+/// | [`Load`]       | What does all of it come to over a real socket?       |
+///
+/// Every variant answers [`Measure::columns`] with the columns its kind is
+/// read in, so a report never has to know which kind it is looking at. A new
+/// way of looking at something is a new variant and nothing else.
+///
+/// [`Time`]: Measure::Time
+/// [`Throughput`]: Measure::Throughput
+/// [`Footprint`]: Measure::Footprint
+/// [`Growth`]: Measure::Growth
+/// [`Contention`]: Measure::Contention
+/// [`Load`]: Measure::Load
 #[derive(Debug, Clone)]
 pub enum Measure {
     /// How long one iteration takes.
@@ -20,13 +41,14 @@ pub enum Measure {
     /// How long one iteration takes, over a payload of this many octets.
     Throughput(Samples, usize),
 
-    /// How many allocations one round makes, over this many rounds.
-    Allocations {
-        /// How many allocations the rounds made together.
-        total: u64,
-        /// How many rounds ran.
-        rounds: u64,
-    },
+    /// What one round costs the allocator.
+    Footprint(Footprint),
+
+    /// How the cost grows with the size it is given.
+    Growth(Growth),
+
+    /// What one iteration costs when several threads run it at once.
+    Contention(Contention),
 
     /// What came of driving a server under load.
     Load(Run),
@@ -43,29 +65,22 @@ impl Measure {
         Self::Throughput(Samples::measure(budget, body), octets)
     }
 
-    /// Counts the allocations a body makes, over this many rounds.
-    ///
-    /// The body is given the round number, so that a round can work on a fresh
-    /// stream or a fresh key rather than measuring the same one over and over.
-    /// A tenth of the rounds run before any is counted, which is what leaves
-    /// out the tables, buffers and caches that are grown once and then reused.
-    pub fn allocations<T>(rounds: u64, mut body: impl FnMut(u64) -> T) -> Self {
-        let warmup = (rounds / 10).max(1);
+    /// Counts what a body costs the allocator, over this many rounds.
+    pub fn footprint<T>(rounds: u64, body: impl FnMut(u64) -> T) -> Self {
+        Self::Footprint(Footprint::measure(rounds, body))
+    }
 
-        for round in 0..warmup {
-            std::hint::black_box(body(round));
-        }
-
-        let total = (warmup..warmup + rounds).map(|round| Counter::count(|| body(round))).sum();
-
-        Self::Allocations { total, rounds }
+    /// Measures a body alone and then on this many threads at once.
+    pub fn contention<T>(budget: Budget, threads: usize, body: impl Fn() -> T + Sync) -> Self {
+        Self::Contention(Contention::measure(budget, threads, body))
     }
 
     /// The batches this measurement was reduced from, if it was timed.
     pub fn samples(&self) -> Option<&Samples> {
         match self {
             Self::Time(samples) | Self::Throughput(samples, _) => Some(samples),
-            Self::Allocations { .. } | Self::Load(_) => None,
+            Self::Contention(contention) => Some(&contention.alone),
+            Self::Footprint(_) | Self::Growth(_) | Self::Load(_) => None,
         }
     }
 
@@ -92,15 +107,33 @@ impl Measure {
                 ("throughput", Figure::throughput(*octets, samples.median())),
             ],
 
-            Self::Allocations { total, rounds } => vec![
-                ("per round", format!("{:.2}", *total as f64 / (*rounds).max(1) as f64)),
-                ("total", Figure::count(*total as f64)),
-                ("rounds", Figure::count(*rounds as f64)),
+            Self::Footprint(footprint) => vec![
+                ("calls", Figure::number(footprint.calls())),
+                ("octets", Figure::octets(footprint.octets())),
+                ("per call", Figure::octets(footprint.each())),
+                ("rounds", Figure::count(footprint.rounds as f64)),
+            ],
+
+            Self::Growth(growth) => vec![
+                ("smallest", Figure::time(growth.smallest().map(|point| point.each).unwrap_or(0.0))),
+                ("largest", Figure::time(growth.largest().map(|point| point.each).unwrap_or(0.0))),
+                ("over", growth.span()),
+                ("factor", Figure::number(growth.factor())),
+                ("slope", Figure::number(growth.slope())),
+                ("growth", growth.shape().to_owned()),
+            ],
+
+            Self::Contention(contention) => vec![
+                ("alone", Figure::time(contention.alone.median())),
+                ("together", Figure::time(contention.together.median())),
+                ("threads", Figure::count(contention.threads as f64)),
+                ("rate", Figure::per_second(contention.rate())),
+                ("kept", Figure::share(contention.efficiency())),
             ],
 
             Self::Load(run) => vec![
                 ("requests", Figure::per_second(run.rate())),
-                ("body", Figure::octets(run.bandwidth())),
+                ("body", Figure::bandwidth(run.bandwidth())),
                 ("p50", Figure::time(run.outcome.latency.quantile(0.50).as_secs_f64())),
                 ("p99", Figure::time(run.outcome.latency.quantile(0.99).as_secs_f64())),
                 ("worst", Figure::time(run.outcome.latency.worst.as_secs_f64())),
@@ -113,7 +146,9 @@ impl Measure {
     pub fn value(&self) -> f64 {
         match self {
             Self::Time(samples) | Self::Throughput(samples, _) => samples.median(),
-            Self::Allocations { total, rounds } => *total as f64 / (*rounds).max(1) as f64,
+            Self::Footprint(footprint) => footprint.calls(),
+            Self::Growth(growth) => growth.slope(),
+            Self::Contention(contention) => contention.rate(),
             Self::Load(run) => run.rate(),
         }
     }
@@ -122,7 +157,9 @@ impl Measure {
     pub fn dimension(&self) -> &'static str {
         match self {
             Self::Time(_) | Self::Throughput(..) => "seconds",
-            Self::Allocations { .. } => "allocations",
+            Self::Footprint(_) => "allocations",
+            Self::Growth(_) => "slope",
+            Self::Contention(_) => "iterations per second",
             Self::Load(_) => "requests per second",
         }
     }

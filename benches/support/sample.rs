@@ -77,6 +77,15 @@ impl Samples {
         Self { batches }
     }
 
+    /// Folds another set of batches into this one.
+    ///
+    /// What comes back is read exactly as one thread's readings are: the
+    /// batches are per-iteration times whoever took them, so a median over
+    /// several threads is what one iteration cost while they all ran.
+    pub fn merge(&mut self, other: &Self) {
+        self.batches.extend_from_slice(&other.batches);
+    }
+
     /// Runs a body untimed for the budget's warm-up, so that caches, branch
     /// predictors and any lazily built table are where they will be when the
     /// timing starts.

@@ -13,6 +13,7 @@ use bytes::Bytes;
 use crate::errors::Error;
 use crate::helpers::compression::Compression;
 use crate::helpers::fields::HeaderField;
+use crate::helpers::scan;
 use crate::helpers::text::Text;
 use crate::tls::Security;
 
@@ -118,7 +119,7 @@ impl URL {
     ///
     /// [`Octets::is_target_bytes`]: crate::protocol::h1::Octets::is_target_bytes
     pub fn is_target(target: &str) -> bool {
-        !target.is_empty() && target.bytes().all(|byte| byte > 0x20 && byte != 0x7f)
+        !target.is_empty() && scan::all_visible(target.as_bytes())
     }
 
     /// Whether a string may be sent as an authority.
@@ -129,7 +130,7 @@ impl URL {
     /// the authority is written with them; what it refuses is whitespace and
     /// control octets, which would break the field it is written into.
     pub fn is_authority(authority: &str) -> bool {
-        !authority.is_empty() && authority.bytes().all(|byte| byte > 0x20 && byte != 0x7f)
+        !authority.is_empty() && scan::all_visible(authority.as_bytes())
     }
 
     /// Whether a string may be sent as the host of an authority.
@@ -541,7 +542,7 @@ impl HeaderCase {
             }
 
             let mut at = 0;
-            while let Some(offset) = crate::helpers::scan::find(&written[at..], b'-') {
+            while let Some(offset) = scan::find(&written[at..], b'-') {
                 at += offset + 1;
 
                 match written.get_mut(at) {
@@ -704,9 +705,11 @@ impl Headers {
             (10, b's') => Self::bit(name == "set-cookie", 9),
             (12, b'c') => Self::bit(name == "content-type", 10),
             (14, b'c') => Self::bit(name == "content-length", 11),
-            (16, b'p') => Self::bit(name == "proxy-connection", 12),
-            (17, b't') => Self::bit(name == "transfer-encoding", 13),
-            (25, b's') => Self::bit(name == "strict-transport-security", 14),
+            (15, b'a') => Self::bit(name == "accept-encoding", 12),
+            (16, b'c') => Self::bit(name == "content-encoding", 13),
+            (16, b'p') => Self::bit(name == "proxy-connection", 14),
+            (17, b't') => Self::bit(name == "transfer-encoding", 15),
+            (25, b's') => Self::bit(name == "strict-transport-security", 16),
             _ => 0,
         }
     }
@@ -756,7 +759,7 @@ impl Headers {
             _ => {}
         }
 
-        stored == name || stored.eq_ignore_ascii_case(name)
+        scan::same(stored.as_bytes(), name.as_bytes()) || stored.eq_ignore_ascii_case(name)
     }
 
     /// Whether the presence bits prove `name` is not here.
@@ -901,6 +904,31 @@ impl Headers {
         }
 
         Self { present: Self::presence(&fields), fields }
+    }
+
+    /// A section over fields already known to be lowercase, with the presence
+    /// bits already worked out.
+    ///
+    /// [`Headers::from_fields`] walks the list twice more than the caller
+    /// already did: once to lowercase the names and once to gather
+    /// [`Headers::presence`]. A section HTTP/2 or HTTP/3 delivered has been
+    /// walked field by field on the way in — the format requires lowercase
+    /// names and the section was held to it — so both answers are already
+    /// there, and this takes them rather than working them out again.
+    ///
+    /// # Panics
+    ///
+    /// Debug builds assert that the names are lowercase and that `present` is
+    /// what [`Headers::presence`] would have said; release builds trust the
+    /// caller, and a wrong `present` makes lookups miss fields that are there.
+    pub fn adopt(fields: Vec<HeaderField>, present: u32) -> Self {
+        debug_assert!(
+            !fields.iter().any(|field| field.name.bytes().any(|byte| byte.is_ascii_uppercase())),
+            "a field name handed to Headers::adopt is not lowercase"
+        );
+        debug_assert_eq!(present, Self::presence(&fields), "the presence bits handed to Headers::adopt are not the fields'");
+
+        Self { fields, present }
     }
 
     /// Gives up the field list the section holds.

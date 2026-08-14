@@ -244,17 +244,33 @@ impl HSTSStore {
     ///
     /// True when the host itself is stored, or when a parent domain is stored
     /// with `includeSubDomains`. Expired entries are dropped as they are found.
+    ///
+    /// The store is keyed by host name, so this walks `host` and its parent
+    /// domains and looks each one up, rather than reading through what the
+    /// store holds. The work is the host's label count, not the store's size;
+    /// [`HSTSStore::prune`] is what sweeps the entries this never looks at.
     pub fn secure(&self, host: &str, now: Instant) -> bool {
         let Some(name) = Self::normalize(host) else {
             return false;
         };
 
         let mut entries = Lock::on(&self.entries);
-        entries.retain(|_, (expiry, _)| *expiry > now);
+        let mut candidate = name.as_str();
 
-        entries.iter().any(|(stored, (_, include_subdomains))| {
-            &name == stored || (*include_subdomains && name.ends_with(&format!(".{stored}")))
-        })
+        loop {
+            if let Some((expiry, include_subdomains)) = entries.get(candidate).copied() {
+                if expiry <= now {
+                    entries.remove(candidate);
+                } else if candidate == name || include_subdomains {
+                    return true;
+                }
+            }
+
+            match candidate.split_once('.') {
+                Some((_, parent)) => candidate = parent,
+                None => return false,
+            }
+        }
     }
 
     /// Drops every entry that has expired by `now`.

@@ -87,7 +87,10 @@ pub fn encode(input: &[u8]) -> String {
         out.extend_from_slice(&[symbol((packed >> 18) as u8), symbol((packed >> 12) as u8), if rest.len() > 1 { symbol((packed >> 6) as u8) } else { PAD }, PAD]);
     }
 
-    String::from_utf8(out).unwrap_or_default()
+    // SAFETY: every octet written above comes from `ALPHABET` or is `PAD`, all
+    // of which are ASCII. Validating them again would be one more pass over
+    // the whole result for an answer already known.
+    unsafe { String::from_utf8_unchecked(out) }
 }
 
 /// Packs a group of symbols into one integer, six bits per symbol.
@@ -132,11 +135,15 @@ pub fn decode(input: &str) -> Result<Vec<u8>, DecodeError> {
     let (body, last) = input.split_at(input.len() - 4);
 
     for group in body.chunks_exact(4) {
-        if group.contains(&PAD) {
-            return Err(DecodeError::InvalidPadding);
-        }
+        // Padding before the last group is refused, but only a group that has
+        // already turned out to carry something outside the alphabet can be
+        // carrying it — so the question is asked on the way to the error
+        // rather than of every group.
+        let packed = match sextets(group) {
+            Ok(packed) => packed,
+            Err(error) => return Err(if group.contains(&PAD) { DecodeError::InvalidPadding } else { error }),
+        };
 
-        let packed = sextets(group)?;
         out.extend_from_slice(&[(packed >> 16) as u8, (packed >> 8) as u8, packed as u8]);
     }
 

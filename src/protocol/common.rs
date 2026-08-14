@@ -304,9 +304,33 @@ impl Fields {
     /// into the field section would hand on.
     pub const FORBIDDEN_TRAILERS: &[&str] = &["content-length", "expect", "host", "te", "trailer"];
 
+    /// Whether a field name is a pseudo-header's.
+    ///
+    /// RFC 9113 §8.3 and RFC 9114 §4.3: a pseudo-header is exactly a name
+    /// beginning with a colon, and a colon may not appear in a token, so no
+    /// ordinary field can be taken for one.
+    pub fn pseudo(name: &str) -> bool {
+        matches!(name.as_bytes().first(), Some(b':'))
+    }
+
     /// Whether a field name is one of [`Fields::CONNECTION_SPECIFIC`].
+    ///
+    /// The length and the first octet together name at most one candidate, so
+    /// an ordinary field is turned away without comparing anything. Every
+    /// field of every section framed or received goes through this.
     pub fn connection_specific(name: &str) -> bool {
-        matches!(name.len(), 7 | 10 | 16 | 17) && Self::CONNECTION_SPECIFIC.contains(&name)
+        let Some(first) = name.as_bytes().first() else {
+            return false;
+        };
+
+        match (name.len(), first) {
+            (7, b'u') => name == "upgrade",
+            (10, b'c') => name == "connection",
+            (10, b'k') => name == "keep-alive",
+            (16, b'p') => name == "proxy-connection",
+            (17, b't') => name == "transfer-encoding",
+            _ => false,
+        }
     }
 
     /// Whether a field name may not appear in a trailer section.
@@ -315,7 +339,22 @@ impl Fields {
     /// [`Fields::CONNECTION_SPECIFIC`] ones alike, since neither belongs after
     /// a body.
     pub fn forbidden_trailer(name: &str) -> bool {
-        Self::connection_specific(name) || (matches!(name.len(), 2 | 4 | 6 | 7 | 14) && Self::FORBIDDEN_TRAILERS.contains(&name))
+        if Self::connection_specific(name) {
+            return true;
+        }
+
+        let Some(first) = name.as_bytes().first() else {
+            return false;
+        };
+
+        match (name.len(), first) {
+            (2, b't') => name == "te",
+            (4, b'h') => name == "host",
+            (6, b'e') => name == "expect",
+            (7, b't') => name == "trailer",
+            (14, b'c') => name == "content-length",
+            _ => false,
+        }
     }
 
     /// Checks one field of a section HTTP/2 or HTTP/3 delivered.
@@ -353,8 +392,10 @@ impl Fields {
     /// pseudo-header appears, and when the section carries a
     /// [`Fields::forbidden_trailer`].
     pub fn into_trailers(fields: Vec<HeaderField>) -> Result<Headers, Error> {
+        let mut present = 0u32;
+
         for field in &fields {
-            if field.name.starts_with(':') {
+            if Self::pseudo(&field.name) {
                 return Err(Error::Protocol("trailer section carries a pseudo-header".into()));
             }
 
@@ -363,9 +404,11 @@ impl Fields {
             if Self::forbidden_trailer(&field.name) {
                 return Err(Error::Protocol(format!("field {:?} cannot appear in a trailer section", field.name)));
             }
+
+            present |= Headers::well_known(&field.name);
         }
 
-        Ok(Headers::from_fields(fields))
+        Ok(Headers::adopt(fields, present))
     }
 
     /// A status code as the three digits `:status` carries.
@@ -461,7 +504,7 @@ impl Fields {
 
         if let Some(headers) = &message.headers {
             for field in headers.fields() {
-                if field.name.starts_with(':') || field.name == "host" {
+                if Self::pseudo(&field.name) || field.name == "host" {
                     continue;
                 }
 
@@ -518,6 +561,10 @@ impl Fields {
         let mut message = Message::new(version);
         let mut regular = false;
 
+        // Gathered as the section is walked, so that building the [`Headers`]
+        // costs nothing more: every field is looked at here anyway, and being
+        // lowercase is what `Fields::check` has just established.
+        let mut present = 0u32;
         let mut seen = 0u8;
         let mut authority: Option<Text> = None;
         let mut path: Option<Text> = None;
@@ -526,7 +573,7 @@ impl Fields {
         // as it stands: a decoded block already is what a section holds, so
         // rebuilding one field at a time would copy every field to no end.
         for field in &fields {
-            if !field.name.starts_with(':') {
+            if !Self::pseudo(&field.name) {
                 Self::check(field)?;
 
                 if Self::connection_specific(&field.name) {
@@ -537,6 +584,7 @@ impl Fields {
                     return Err(Error::Protocol("TE may only request trailers".into()));
                 }
 
+                present |= Headers::well_known(&field.name);
                 regular = true;
                 continue;
             }
@@ -621,7 +669,7 @@ impl Fields {
             return Err(Error::Protocol("message has neither :method nor :status".into()));
         }
 
-        let mut headers = Headers::from_fields(fields);
+        let mut headers = Headers::adopt(fields, present);
 
         if let Some(method) = message.method {
             if method == Method::CONNECT && seen & PSEUDO_PROTOCOL == 0 {

@@ -19,7 +19,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::OnceLock;
 
-use crate::helpers::fields::{self, HeaderField, Integer, StaticIndex, StringLiteral};
+use crate::helpers::fields::{self, Entry, HeaderField, Integer, Mark, StaticIndex, StringLiteral};
 use crate::helpers::huffman;
 
 /// The static table, and the reverse index over it.
@@ -124,7 +124,7 @@ impl StaticTable {
 /// different once anything is inserted. Insertion evicts from the far end
 /// until the new entry fits.
 pub struct DynamicTable {
-    entries: VecDeque<HeaderField>,
+    entries: VecDeque<Entry>,
     size: usize,
     capacity: usize,
 }
@@ -153,12 +153,12 @@ impl DynamicTable {
         }
 
         self.size += size;
-        self.entries.push_front(field);
+        self.entries.push_front(Entry::of(field));
     }
 
     /// The entry `index` places back from the most recent insertion.
     pub fn get(&self, index: usize) -> Option<&HeaderField> {
-        self.entries.get(index)
+        self.entries.get(index).map(|entry| &entry.field)
     }
 
     /// Changes the capacity, evicting until the table is under it.
@@ -199,14 +199,15 @@ impl DynamicTable {
     /// most recent insertion, which is how the wire indexes the table once
     /// the static entries are stepped over.
     pub fn find(&self, field: &HeaderField) -> Option<(usize, bool)> {
+        let mark = Mark::of(&field.name);
         let mut name_only = None;
 
         for (offset, entry) in self.entries.iter().enumerate() {
-            if entry.name != field.name {
+            if !entry.named(mark, field) {
                 continue;
             }
 
-            if entry.value == field.value {
+            if entry.valued(field) {
                 return Some((offset, true));
             }
 

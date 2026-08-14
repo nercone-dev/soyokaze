@@ -534,9 +534,16 @@ impl Octets {
     }
 
     /// [`Octets::is_target`] over raw octets.
+    ///
+    /// The class is a contiguous range, so it is answered by
+    /// [`scan::all_visible`] rather than by [`Octets::TABLE`] — the same
+    /// answer the [`Octets::TARGET`] bit gives for one octet, without a lookup
+    /// per octet, and the same one [`URL::is_target`] gives for decoded text.
+    ///
+    /// [`URL::is_target`]: crate::models::URL::is_target
     #[inline]
     pub fn is_target_bytes(text: &[u8]) -> bool {
-        !text.is_empty() && scan::all_in_class(text, Self::TABLE, Self::TARGET)
+        !text.is_empty() && scan::all_visible(text)
     }
 
     /// [`Octets::is_reason`] over raw octets.

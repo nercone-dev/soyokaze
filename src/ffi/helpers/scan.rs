@@ -102,6 +102,22 @@ pub unsafe extern "C" fn soyokaze_scan_copy(destination: *mut u8, destination_le
     true
 }
 
+/// Whether the two runs hold the same octets.
+///
+/// Runs of different lengths are never the same.
+///
+/// # Safety
+///
+/// `left` must either be null or point to `left_len` readable octets, and
+/// `right` likewise.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_scan_same(left: *const u8, left_len: usize, right: *const u8, right_len: usize) -> bool {
+    let left = unsafe { Slice::borrow(left, left_len) }.unwrap_or_default();
+    let right = unsafe { Slice::borrow(right, right_len) }.unwrap_or_default();
+
+    crate::helpers::scan::same(left, right)
+}
+
 /// [`soyokaze_scan_classify_field_value`]: an octet below space, or delete.
 #[unsafe(no_mangle)]
 pub extern "C" fn soyokaze_scan_value_control() -> u8 {

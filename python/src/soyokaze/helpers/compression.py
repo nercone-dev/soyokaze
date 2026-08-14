@@ -96,6 +96,17 @@ class Compression(enum.IntEnum):
         encoded = ffi.Library.encoded(entry)
         return library.soyokaze_compression_quality(encoded, len(encoded))
 
+    @classmethod
+    def qvalue(cls, text):
+        """The quality a ``qvalue`` text names on its own.
+
+        ``None`` for anything outside the grammar RFC 9110 §12.4.2 gives one;
+        :meth:`quality` reads the quality a whole list entry carries.
+        """
+        encoded = ffi.Library.encoded(text)
+        read = library.soyokaze_compression_qvalue(encoded, len(encoded))
+        return None if read < 0 else read
+
     def encode(self, data):
         """Codes octets in this coding.
 

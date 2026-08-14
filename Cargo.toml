@@ -51,7 +51,19 @@ name = "websocket"
 harness = false
 
 [[bench]]
+name = "security"
+harness = false
+
+[[bench]]
+name = "api"
+harness = false
+
+[[bench]]
 name = "allocations"
+harness = false
+
+[[bench]]
+name = "concurrency"
 harness = false
 
 [[bench]]

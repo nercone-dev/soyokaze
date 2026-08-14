@@ -251,6 +251,54 @@ fn an_entry_without_a_quality_is_fully_acceptable() {
 }
 
 #[test]
+fn a_quality_is_read_exactly_as_its_grammar_writes_it() {
+    // RFC 9110 §12.4.2: qvalue = ( "0" [ "." 0*3DIGIT ] ) / ( "1" [ "." 0*3("0") ] ),
+    // and a quality outside zero to one is a refusal. Every decimal of that
+    // shape is checked against the general float reader, which is what the
+    // shorter road through Coding::quality has to agree with.
+    for whole in 0..=1u32 {
+        for places in 0..=3u32 {
+            for fraction in 0..10u32.pow(places) {
+                let written = match places {
+                    0 => format!("{whole}"),
+                    _ => format!("{whole}.{fraction:0width$}", width = places as usize),
+                };
+
+                let named = written.parse::<f32>().expect("a decimal this crate wrote itself");
+                let expected = match (Coding::NONE..=Coding::FULL).contains(&named) {
+                    true => named,
+                    false => Coding::NONE,
+                };
+
+                assert_eq!(Coding::parse(&format!("gzip;q={written}")).quality, expected, "q={written}");
+            }
+        }
+    }
+
+    assert_eq!(Coding::parse("gzip;q=0.").quality, 0.0);
+    assert_eq!(Coding::parse("gzip;q=1.").quality, 1.0);
+}
+
+#[test]
+fn a_parameter_that_is_no_quality_at_all_is_a_refusal() {
+    // Reading one as full acceptance would let a malformed field talk this end
+    // into coding a body the peer cannot read.
+    for written in ["", " ", "q", "0.5.5", "2", "1.5", "9", "-0.5", "0x1", "nan", "inf", "0,5", "\u{661}"] {
+        assert!(!Coding::parse(&format!("gzip;q={written}")).accepts(), "q={written:?} was not read as a refusal");
+    }
+}
+
+#[test]
+fn a_quality_the_grammar_does_not_admit_still_names_the_decimal_it_holds() {
+    // A leading plus, a bare point and more than three places are each outside
+    // RFC 9110's grammar but name one decimal and nothing else, so they are
+    // read rather than refused.
+    assert_eq!(Coding::parse("gzip;q=+0.5").quality, 0.5);
+    assert_eq!(Coding::parse("gzip;q=.5").quality, 0.5);
+    assert_eq!(Coding::parse("gzip;q=0.1234").quality, 0.1234);
+}
+
+#[test]
 fn errors_describe_themselves() {
     assert_eq!(Error::Settled.to_string(), "the content coding was never settled");
     assert_eq!(Error::TooLarge(64).to_string(), "the decoded body exceeds 64 octets");

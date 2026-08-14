@@ -1,4 +1,5 @@
-use soyokaze::helpers::fields::{Error, HeaderField, Integer, StringLiteral};
+use soyokaze::helpers::fields::{Entry, Error, HeaderField, Integer, Mark, StaticIndex, StringLiteral};
+use soyokaze::helpers::{hpack, qpack};
 
 fn field(name: &str, value: &str) -> HeaderField {
     HeaderField::new(name, value)
@@ -105,11 +106,25 @@ fn prefers_huffman_only_when_it_helps() {
 
 #[test]
 fn every_sensitive_name_is_recognised() {
-    for name in HeaderField::SENSITIVE {
-        assert!(field(name, "value").sensitive(), "{name} should be treated as sensitive");
-    }
+    // Recognised by length and first octet rather than by walking the list, so
+    // the two are checked against each other over names near the list as well
+    // as the list itself.
+    let corpus: Vec<String> = HeaderField::SENSITIVE
+        .iter()
+        .flat_map(|name| {
+            let name = name.to_string();
+            [name.clone(), name[..name.len() - 1].to_string(), format!("{name}x"), format!("x{}", &name[1..])]
+        })
+        .chain(["".into(), "accept".into(), "cookies".into(), "content-type".into()])
+        .collect();
 
-    assert!(!field("accept", "value").sensitive());
+    for name in &corpus {
+        assert_eq!(
+            field(name, "value").sensitive(),
+            HeaderField::SENSITIVE.contains(&name.as_str()),
+            "{name:?} is not classified as the list says"
+        );
+    }
 }
 
 #[test]
@@ -179,5 +194,97 @@ fn a_prefix_no_representation_uses_never_takes_the_process_with_it() {
     for prefix_bits in [8u8, 64, 255] {
         let _ = StringLiteral::decode_into_ascii(&out, prefix_bits, &mut scratch);
         let _ = StringLiteral::decode_into_ascii(&[0x05, b'a'], prefix_bits, &mut scratch);
+    }
+}
+
+#[test]
+fn the_token_table_marks_lowercase_tokens() {
+    // RFC 9110 §5.6.2 gives the token characters; RFC 9113 §8.2.1 and RFC 9114
+    // §4.2 add that a field name carries no uppercase letter. The table holds
+    // both answers, and the second must be exactly the first without A-Z.
+    for value in 0..=255u8 {
+        let token = value.is_ascii_alphanumeric()
+            || matches!(value, b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~');
+
+        let marks = HeaderField::TOKENS[value as usize];
+        assert_eq!(marks & HeaderField::TOKEN != 0, token, "{value:#04x} is marked wrongly as a token");
+        assert_eq!(
+            marks & HeaderField::LOWERCASE != 0,
+            token && !value.is_ascii_uppercase(),
+            "{value:#04x} is marked wrongly as a lowercase token"
+        );
+    }
+}
+
+#[test]
+fn a_lowercase_name_is_a_token_carrying_no_capital() {
+    for value in 0..=255u8 {
+        let token = HeaderField::TOKENS[value as usize] & HeaderField::TOKEN != 0;
+
+        for length in 1..=20usize {
+            for at in 0..length {
+                let mut name = vec![b'a'; length];
+                name[at] = value;
+                let name = String::from_utf8_lossy(&name).into_owned();
+
+                assert_eq!(HeaderField::is_name(&name), token, "{name:?} is not classified as a token");
+                assert_eq!(
+                    HeaderField::is_lowercase_name(&name),
+                    token && !value.is_ascii_uppercase(),
+                    "{name:?} is not classified as a lowercase token"
+                );
+            }
+        }
+    }
+
+    assert!(!HeaderField::is_name(""), "an empty name is not a token");
+    assert!(!HeaderField::is_lowercase_name(""), "an empty name is not a lowercase token");
+}
+
+#[test]
+fn a_mark_stands_for_exactly_its_name() {
+    let names = [
+        "", "a", "b", "te", "host", "accept", "accept-encoding", "content-type", "content-length",
+        "strict-transport-security", "x-a-rather-long-header-field-name-indeed", "ab", "ba", "abc", "acb",
+    ];
+
+    for left in names {
+        assert_eq!(Mark::of(left), Mark::of(left), "the same name marks differently twice");
+
+        for right in names {
+            if left != right {
+                assert_ne!(Mark::of(left), Mark::of(right), "{left:?} and {right:?} share a mark");
+            }
+        }
+    }
+}
+
+#[test]
+fn an_entry_confirms_a_mark_against_the_name_itself() {
+    let entry = Entry::of(field("content-type", "text/html"));
+
+    assert!(entry.named(Mark::of("content-type"), &field("content-type", "text/plain")));
+    assert!(entry.valued(&field("anything", "text/html")));
+    assert!(!entry.valued(&field("content-type", "text/plain")));
+
+    // A mark that matched but a name that did not must not be taken for a hit,
+    // whatever the mark says.
+    assert!(!entry.named(Mark::of("content-type"), &field("content-length", "10")));
+}
+
+#[test]
+fn the_static_index_finds_every_entry_it_was_built_from() {
+    for (entries, base) in [(hpack::StaticTable::entries().as_slice(), 1usize), (qpack::StaticTable::entries().as_slice(), 0)] {
+        let index = StaticIndex::new(entries, base);
+
+        for (offset, entry) in entries.iter().enumerate() {
+            let (named, exact) = index.lookup(&entry.name, &entry.value);
+
+            let first = entries.iter().position(|other| other.name == entry.name).expect("the name is in the table");
+            assert_eq!(named, Some(base + first), "{:?} does not resolve to its lowest index", entry.name);
+            assert_eq!(exact, Some(base + offset), "{:?}: {:?} does not resolve to its own index", entry.name, entry.value);
+        }
+
+        assert_eq!(index.lookup("x-not-in-any-static-table", "?"), (None, None));
     }
 }

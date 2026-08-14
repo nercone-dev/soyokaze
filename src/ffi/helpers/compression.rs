@@ -140,6 +140,23 @@ pub unsafe extern "C" fn soyokaze_compression_quality(entry: *const u8, entry_le
     }
 }
 
+/// The quality a `qvalue` text names, or `-1` for anything outside the
+/// grammar RFC 9110 §12.4.2 gives it.
+///
+/// This reads the quality on its own; [`soyokaze_compression_quality`] reads
+/// the one a whole list entry carries.
+///
+/// # Safety
+///
+/// `text` must either be null or point to `text_len` readable octets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soyokaze_compression_qvalue(text: *const u8, text_len: usize) -> f32 {
+    match unsafe { Slice::borrow_text(text, text_len) }.and_then(Coding::qvalue) {
+        Some(quality) => quality,
+        None => -1.0,
+    }
+}
+
 /// Encodes octets in `compression` through `out`.
 ///
 /// Refuses `SOYOKAZE_COMPRESSION_AUTO`, which names no coding to encode in.

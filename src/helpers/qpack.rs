@@ -31,7 +31,7 @@ use std::sync::OnceLock;
 
 use bytes::BytesMut;
 
-use crate::helpers::fields::{self, HeaderField, Integer, StaticIndex, StringLiteral};
+use crate::helpers::fields::{self, Entry, HeaderField, Integer, Mark, StaticIndex, StringLiteral};
 use crate::helpers::huffman;
 use crate::helpers::text::Text;
 
@@ -179,7 +179,7 @@ impl StaticTable {
 /// what lets a field block name an entry without knowing how far the table has
 /// moved on by the time it is read.
 pub struct DynamicTable {
-    entries: VecDeque<HeaderField>,
+    entries: VecDeque<Entry>,
     size: usize,
     capacity: usize,
     inserted_count: u64,
@@ -210,7 +210,7 @@ impl DynamicTable {
         }
 
         self.size += size;
-        self.entries.push_front(field);
+        self.entries.push_front(Entry::of(field));
         self.inserted_count += 1;
 
         self.inserted_count - 1
@@ -266,7 +266,7 @@ impl DynamicTable {
     /// was never inserted.
     pub fn get(&self, absolute_index: u64) -> Option<&HeaderField> {
         let offset = self.inserted_count.checked_sub(absolute_index + 1)?;
-        self.entries.get(offset as usize)
+        self.entries.get(offset as usize).map(|entry| &entry.field)
     }
 
     /// Changes the capacity, evicting until the table is under it.
@@ -315,11 +315,12 @@ impl DynamicTable {
     /// reports an exact match anywhere in the table, acknowledged or not,
     /// which is what decides whether inserting the field again is worth it.
     pub fn probe(&self, field: &HeaderField, below: u64) -> (Option<(u64, bool)>, bool) {
+        let mark = Mark::of(&field.name);
         let mut name_only = None;
         let mut anywhere = false;
 
         for (offset, entry) in self.entries.iter().enumerate() {
-            if entry.name != field.name {
+            if !entry.named(mark, field) {
                 continue;
             }
 
@@ -327,7 +328,7 @@ impl DynamicTable {
                 break;
             };
 
-            if entry.value == field.value {
+            if entry.valued(field) {
                 anywhere = true;
                 if absolute < below {
                     return (Some((absolute, true)), true);
@@ -344,10 +345,11 @@ impl DynamicTable {
     ///
     /// The flag says whether the value matched too.
     pub fn find(&self, field: &HeaderField) -> Option<(u64, bool)> {
+        let mark = Mark::of(&field.name);
         let mut name_only = None;
 
         for (offset, entry) in self.entries.iter().enumerate() {
-            if entry.name != field.name {
+            if !entry.named(mark, field) {
                 continue;
             }
 
@@ -355,7 +357,7 @@ impl DynamicTable {
                 break;
             };
 
-            if entry.value == field.value {
+            if entry.valued(field) {
                 return Some((absolute, true));
             }
 

@@ -316,6 +316,298 @@ pub static LENGTHS: [u8; 257] = {
     lengths
 };
 
+/// The code in its canonical form, which is what the decoder walks.
+///
+/// The code words are canonical: sorted by length, and within one length by
+/// value. That lets a code word be recognised by the numeric value of the bits
+/// alone rather than by following them one at a time — [`Canonical::fast`]
+/// answers every short code word in one lookup, and the rest are found by
+/// asking which length's range the bits fall in.
+///
+/// [`DecodeTable`] holds the same code as an automaton, which is how the
+/// format is usually described and what [`decode_table`] exposes. The two
+/// accept exactly the same encodings; this is the one [`decode_into_ascii`]
+/// runs on.
+pub struct Canonical {
+    /// One entry per [`Canonical::FAST_BITS`]-bit prefix: the symbol in the
+    /// high octet and the length of its code word in the low one, or zero when
+    /// no code word that short begins with those bits.
+    pub fast: [u16; Canonical::FAST_SIZE],
+    /// The largest window each length covers, the code word left-aligned in a
+    /// word. A length carrying no code word repeats the length below it, so it
+    /// never matches.
+    pub limit: [u64; Canonical::MAX_BITS + 1],
+    /// The first code word of each length.
+    pub base: [u32; Canonical::MAX_BITS + 1],
+    /// Where the symbols of each length begin in [`Canonical::symbols`].
+    pub offset: [u16; Canonical::MAX_BITS + 1],
+    /// Every symbol, ordered by the length of its code word and then by its
+    /// value, which is the order a canonical code numbers them in.
+    pub symbols: [u16; 257],
+    /// One entry per [`Canonical::PAIR_BITS`]-bit prefix, answering as many
+    /// whole code words as those bits spell: how many bits they took in the
+    /// low octet, how many symbols they were in the next, and the symbols
+    /// themselves in the two above that. A zero entry means the code word at
+    /// the front is longer than the prefix.
+    pub pairs: [u32; Canonical::PAIR_SIZE],
+}
+
+impl Canonical {
+    /// How many bits [`Canonical::fast`] is indexed by.
+    ///
+    /// Every code word of eight bits or fewer covers the alphanumerics and the
+    /// punctuation a field value is mostly made of, so one lookup answers
+    /// nearly every symbol and the table stays small enough to stay resident.
+    pub const FAST_BITS: usize = 8;
+    /// How many entries [`Canonical::fast`] holds.
+    pub const FAST_SIZE: usize = 1 << Self::FAST_BITS;
+    /// The longest code word there is, and so how many bits a window has to
+    /// hold before one can be read out of it.
+    pub const MAX_BITS: usize = 30;
+    /// How many bits [`Canonical::pairs`] is indexed by.
+    ///
+    /// Wide enough for two of the short code words at once — the shortest is
+    /// five bits — which is what halves the number of dependent lookups a
+    /// string costs. Wider would answer more pairs and fewer singles, at a
+    /// table that no longer stays in the first level of cache.
+    pub const PAIR_BITS: usize = 12;
+    /// How many entries [`Canonical::pairs`] holds.
+    pub const PAIR_SIZE: usize = 1 << Self::PAIR_BITS;
+    /// The most symbols one [`Canonical::pairs`] entry can answer.
+    pub const PAIR_MOST: usize = Self::PAIR_BITS / 5;
+
+    /// Builds the canonical form from a code table.
+    pub const fn new(table: &[Symbol; 257]) -> Self {
+        let mut count = [0u16; Self::MAX_BITS + 1];
+        let mut value = 0;
+
+        while value < 257 {
+            count[table[value].length as usize] += 1;
+            value += 1;
+        }
+
+        let mut base = [0u32; Self::MAX_BITS + 1];
+        let mut offset = [0u16; Self::MAX_BITS + 1];
+        let mut limit = [0u64; Self::MAX_BITS + 1];
+
+        let mut code = 0u32;
+        let mut index = 0u16;
+        let mut length = 1;
+
+        while length <= Self::MAX_BITS {
+            code <<= 1;
+            base[length] = code;
+            offset[length] = index;
+            limit[length] = match count[length] {
+                0 => limit[length - 1],
+                held => (((code + held as u32 - 1) as u64) << (64 - length)) | (u64::MAX >> length),
+            };
+
+            code += count[length] as u32;
+            index += count[length];
+            length += 1;
+        }
+
+        let mut symbols = [0u16; 257];
+        let mut filled = [0u16; Self::MAX_BITS + 1];
+        let mut value = 0;
+
+        while value < 257 {
+            let length = table[value].length as usize;
+            symbols[(offset[length] + filled[length]) as usize] = value as u16;
+            filled[length] += 1;
+            value += 1;
+        }
+
+        let mut fast = [0u16; Self::FAST_SIZE];
+        let mut value = 0;
+
+        while value < 257 {
+            let length = table[value].length as usize;
+
+            if length <= Self::FAST_BITS {
+                let first = (table[value].code as usize) << (Self::FAST_BITS - length);
+                let spread = 1 << (Self::FAST_BITS - length);
+                let mut slot = 0;
+
+                while slot < spread {
+                    fast[first + slot] = ((value as u16) << 8) | length as u16;
+                    slot += 1;
+                }
+            }
+
+            value += 1;
+        }
+
+        let mut pairs = [0u32; Self::PAIR_SIZE];
+        let mut index = 0;
+
+        while index < Self::PAIR_SIZE {
+            let mut window = (index as u64) << (64 - Self::PAIR_BITS);
+            let mut used = 0usize;
+            let mut count = 0u32;
+            let mut held = [0u32; 2];
+
+            while (count as usize) < Self::PAIR_MOST {
+                let entry = fast[(window >> (64 - Self::FAST_BITS)) as usize];
+
+                let mut length = match entry & 0xff {
+                    0 => Self::FAST_BITS + 1,
+                    short => short as usize,
+                };
+
+                while length < Self::MAX_BITS && window > limit[length] {
+                    length += 1;
+                }
+
+                // Only the leading `PAIR_BITS` of the window are the index's
+                // own, so a code word running past them is one this entry
+                // cannot answer.
+                if used + length > Self::PAIR_BITS {
+                    break;
+                }
+
+                let code = (window >> (64 - length)) as u32;
+                held[count as usize] = symbols[offset[length] as usize + (code - base[length]) as usize] as u32;
+
+                count += 1;
+                used += length;
+                window <<= length;
+            }
+
+            if count > 0 {
+                pairs[index] = used as u32 | count << 8 | held[0] << 16 | held[1] << 24;
+            }
+
+            index += 1;
+        }
+
+        Self { fast, limit, base, offset, symbols, pairs }
+    }
+
+    /// The symbol the top bits of `window` spell, and how many bits it took,
+    /// for a code word longer than [`Canonical::FAST_BITS`].
+    ///
+    /// The code is complete, so some length always matches and this always
+    /// answers.
+    #[inline]
+    pub fn long(&self, window: u64) -> (u16, u32) {
+        let mut length = Self::FAST_BITS + 1;
+
+        while length < Self::MAX_BITS && window > self.limit[length] {
+            length += 1;
+        }
+
+        let code = (window >> (64 - length)) as u32;
+        let index = self.offset[length] as usize + (code - self.base[length]) as usize;
+
+        (self.symbols[index], length as u32)
+    }
+
+    /// The symbol the top bits of `window` spell, and how many bits it took.
+    ///
+    /// `window` holds the bits left-aligned and must carry
+    /// [`Canonical::MAX_BITS`] of them; a caller holding fewer pads with
+    /// one-bits, which is what valid padding is, and then refuses a code word
+    /// longer than what it really had.
+    #[inline]
+    pub fn symbol(&self, window: u64) -> (u16, u32) {
+        let entry = self.fast[(window >> (64 - Self::FAST_BITS)) as usize];
+
+        match entry & 0xff {
+            0 => self.long(window),
+            length => (entry >> 8, length as u32),
+        }
+    }
+}
+
+/// The canonical form of the code, built once at compile time.
+pub static CANONICAL: Canonical = Canonical::new(&TABLE);
+
+/// The octets of an encoding, read as the bits a code word is spelled in.
+///
+/// Code words do not fall on octet boundaries, so the octets are read into a
+/// window holding the next bits left-aligned. Filling takes whole octets, so
+/// the window may carry bits past what [`Bits::held`] counts; those are always
+/// below the bits that count, and [`Bits::fill`] clears them before it reads
+/// more in.
+pub struct Bits<'a> {
+    /// The octets not yet read into the window.
+    pub input: &'a [u8],
+    /// The next bits, left-aligned.
+    pub window: u64,
+    /// How many bits of [`Bits::window`] are meaningful.
+    pub held: u32,
+}
+
+impl<'a> Bits<'a> {
+    /// How many bits the window holds.
+    pub const WIDTH: u32 = u64::BITS;
+
+    /// A window over `input`, with nothing read in yet.
+    pub fn new(input: &'a [u8]) -> Self {
+        Self { input, window: 0, held: 0 }
+    }
+
+    /// The mask of the bits that count, which is the top [`Bits::held`] of them.
+    #[inline]
+    pub fn mask(&self) -> u64 {
+        !u64::MAX.checked_shr(self.held).unwrap_or(0)
+    }
+
+    /// Reads octets in until the window cannot hold another whole one.
+    #[inline]
+    pub fn fill(&mut self) {
+        self.window &= self.mask();
+
+        if self.input.len() >= size_of::<u64>() && self.held <= Self::WIDTH - 8 {
+            let octets: [u8; 8] = self.input[..8].try_into().expect("eight octets are eight octets");
+            let taken = ((Self::WIDTH - self.held) / 8) as usize;
+
+            self.window |= u64::from_be_bytes(octets) >> self.held;
+            self.held += (taken * 8) as u32;
+            self.input = &self.input[taken..];
+
+            return;
+        }
+
+        while self.held <= Self::WIDTH - 8 {
+            let Some((octet, rest)) = self.input.split_first() else { return };
+
+            self.window |= (*octet as u64) << (Self::WIDTH - 8 - self.held);
+            self.held += 8;
+            self.input = rest;
+        }
+    }
+
+    /// Drops the `length` bits at the front.
+    ///
+    /// # Panics
+    ///
+    /// Debug builds assert that the window held them.
+    #[inline]
+    pub fn take(&mut self, length: u32) {
+        debug_assert!(length <= self.held, "the window holds fewer bits than were taken");
+
+        self.window <<= length;
+        self.held -= length;
+    }
+
+    /// The window with everything past what it holds set to one, which is what
+    /// valid padding is.
+    #[inline]
+    pub fn padded(&self) -> u64 {
+        self.window | u64::MAX.checked_shr(self.held).unwrap_or(0)
+    }
+
+    /// Whether what is left is valid padding: fewer than eight bits, all ones.
+    #[inline]
+    pub fn is_padding(&self) -> bool {
+        let mask = self.mask();
+        self.held < 8 && self.window & mask == mask
+    }
+}
+
 /// What following one bit out of a node reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Branch {
@@ -593,39 +885,97 @@ pub fn decode_into(input: &[u8], out: &mut Vec<u8>) -> Result<(), DecodeError> {
 ///
 /// [`Text`]: crate::helpers::text::Text
 pub fn decode_into_ascii(input: &[u8], out: &mut Vec<u8>) -> Result<bool, DecodeError> {
-    let table = decode_table();
-    let rows = table.rows.as_slice();
+    let codes = &CANONICAL;
+    let mut bits = Bits::new(input);
 
-    out.reserve(input.len() * 8 / 5 + 1);
-    let mut state = 0usize;
+    // No code word is shorter than five bits, so this is what the input could
+    // decode to at most, and every write below lands inside it.
+    out.reserve(input.len() * 8 / 5 + Canonical::PAIR_MOST);
+
+    let start = out.len();
+    let capacity = out.capacity();
+    let room = out.as_mut_ptr();
+    let mut written = 0usize;
     let mut seen = 0u8;
 
-    for byte in input {
-        for nibble in [(byte >> 4) as usize, (byte & 0x0f) as usize] {
-            let step = rows[state][nibble];
+    loop {
+        bits.fill();
 
-            if step.flags & (FAIL | ENDED) != 0 {
-                return Err(if step.flags & FAIL != 0 {
-                    DecodeError::UnknownSymbol
-                } else {
-                    DecodeError::InvalidPadding
-                });
+        while bits.held >= Canonical::MAX_BITS as u32 {
+            let entry = codes.pairs[(bits.window >> (64 - Canonical::PAIR_BITS)) as usize];
+            let length = entry as u8 as u32;
+
+            if length == 0 {
+                let (symbol, length) = codes.long(bits.window);
+
+                if symbol == EOS {
+                    // SAFETY: `written` octets were written into the room
+                    // reserved above, so the partial result is initialised.
+                    unsafe { out.set_len(start + written) };
+                    return Err(DecodeError::InvalidPadding);
+                }
+
+                // SAFETY: as above, and `written` is below what was reserved.
+                debug_assert!(start + written < capacity, "a decoded symbol would land past the room reserved for it");
+                unsafe { room.add(start + written).write(symbol as u8) };
+                written += 1;
+                seen |= symbol as u8;
+                bits.take(length);
+                continue;
             }
 
-            if step.flags & EMIT != 0 {
-                seen |= step.symbol;
-                out.push(step.symbol);
-            }
+            // Both symbols are written whether the entry answered one or two,
+            // so that the count only moves the cursor and never a branch. The
+            // room reserved above allows for the octet a single write leaves
+            // behind.
+            //
+            // SAFETY: as above.
+            debug_assert!(start + written + Canonical::PAIR_MOST <= capacity, "a decoded pair would land past the room reserved for it");
+            unsafe { room.add(start + written).cast::<[u8; 2]>().write_unaligned(((entry >> 16) as u16).to_le_bytes()) };
+            written += (entry >> 8) as u8 as usize;
+            seen |= (entry >> 16) as u8 | (entry >> 24) as u8;
+            bits.take(length);
+        }
 
-            state = step.next as usize;
+        if bits.input.is_empty() {
+            break;
         }
     }
 
-    if !table.accepting[state] {
-        return Err(DecodeError::InvalidPadding);
+    // What is left is shorter than a code word can be read out of on its own,
+    // so it is read against the padding and a code word is only taken when the
+    // input really carried the whole of it. Padding is asked about first: no
+    // code word is all one-bits over seven bits or fewer, so a window that is
+    // already valid padding carries nothing more to read and is the ordinary
+    // way out.
+    while !bits.is_padding() {
+        let (symbol, length) = codes.symbol(bits.padded());
+
+        if length > bits.held {
+            break;
+        }
+
+        if symbol == EOS {
+            // SAFETY: as above.
+            unsafe { out.set_len(start + written) };
+            return Err(DecodeError::InvalidPadding);
+        }
+
+        // SAFETY: as above.
+        debug_assert!(start + written < capacity, "a decoded symbol would land past the room reserved for it");
+        unsafe { room.add(start + written).write(symbol as u8) };
+        written += 1;
+        seen |= symbol as u8;
+        bits.take(length);
     }
 
-    Ok(seen & 0x80 == 0)
+    // SAFETY: as above.
+    unsafe { out.set_len(start + written) };
+
+    match bits.is_padding() {
+        true => Ok(seen & 0x80 == 0),
+        false => Err(DecodeError::InvalidPadding),
+    }
 }
 
 /// How many octets [`encode`] will produce for this input, padding included.

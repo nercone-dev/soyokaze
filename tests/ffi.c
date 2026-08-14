@@ -180,6 +180,9 @@ static void check_compression(void) {
     /* An entry with no q parameter is fully acceptable. */
     assert(soyokaze_compression_quality(LIT("gzip")) == 1.0f);
     assert(soyokaze_compression_quality(LIT("gzip;q=0")) == 0.0f);
+    assert(soyokaze_compression_qvalue(LIT("0.5")) == 0.5f);
+    assert(soyokaze_compression_qvalue(LIT("1")) == 1.0f);
+    assert(soyokaze_compression_qvalue(LIT("nonsense")) == -1.0f);
 
     soyokaze_buffer_t coded = {NULL, 0, 0};
     assert(soyokaze_compression_encode(SOYOKAZE_COMPRESSION_GZIP, LIT("hello, soyokaze"), &coded, NULL) == SOYOKAZE_OK);

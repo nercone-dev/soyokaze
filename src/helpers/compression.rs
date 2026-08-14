@@ -48,6 +48,8 @@ impl Compression {
     pub const ACCEPTED: &str = "zstd, br, gzip, deflate";
     /// The token for a body that was not coded at all.
     pub const IDENTITY: &str = "identity";
+    /// The deprecated token RFC 9110 §8.4.1 says must be read as `gzip`.
+    pub const GZIP_ALIAS: &str = "x-gzip";
 
     /// The zstd level bodies are encoded at.
     pub const ZSTD_LEVEL: i32 = 3;
@@ -79,13 +81,20 @@ impl Compression {
     /// does not implement — `compress` and `identity` among them — names
     /// nothing here, so a body carried in one is left exactly as it arrived.
     pub fn parse(token: &str) -> Option<Self> {
-        let token = token.trim();
+        let token = token.trim_ascii();
 
-        Self::CODINGS
-            .iter()
-            .copied()
-            .find(|coding| token.eq_ignore_ascii_case(coding.as_str()))
-            .or_else(|| token.eq_ignore_ascii_case("x-gzip").then_some(Self::Gzip))
+        // The length and the first octet together name at most one candidate,
+        // so a token naming no coding of ours is turned away without comparing
+        // anything: a field lists several codings and every one of them is
+        // looked up here, on every message that carries the field.
+        match (token.len(), token.as_bytes().first()?.to_ascii_lowercase()) {
+            (2, b'b') => token.eq_ignore_ascii_case(Self::Brotli.as_str()).then_some(Self::Brotli),
+            (4, b'g') => token.eq_ignore_ascii_case(Self::Gzip.as_str()).then_some(Self::Gzip),
+            (4, b'z') => token.eq_ignore_ascii_case(Self::Zstd.as_str()).then_some(Self::Zstd),
+            (6, b'x') => token.eq_ignore_ascii_case(Self::GZIP_ALIAS).then_some(Self::Gzip),
+            (7, b'd') => token.eq_ignore_ascii_case(Self::Deflate.as_str()).then_some(Self::Deflate),
+            _ => None,
+        }
     }
 
     /// The best coding an `Accept-Encoding` field permits.
@@ -105,11 +114,17 @@ impl Compression {
         let mut quality = [None; Self::COUNT];
         let mut wildcard = None;
 
-        for coding in values.flat_map(Coding::list) {
-            match coding.compression() {
-                Some(compression) => quality[compression as usize] = Some(coding.quality),
-                None if coding.wildcard() => wildcard = Some(coding.quality),
-                None => {}
+        // A field at a time and an entry at a time, rather than the two
+        // flattened into one iterator: this is walked for every message that
+        // carries the field, and the plain loops are what the flattening
+        // costs more than.
+        for value in values {
+            for coding in Coding::list(value) {
+                match coding.compression() {
+                    Some(compression) => quality[compression as usize] = Some(coding.quality),
+                    None if coding.wildcard() => wildcard = Some(coding.quality),
+                    None => {}
+                }
             }
         }
 
@@ -125,16 +140,18 @@ impl Compression {
     pub fn applied<'a>(values: impl Iterator<Item = &'a str>) -> Option<Self> {
         let mut applied = None;
 
-        for coding in values.flat_map(Coding::list) {
-            if coding.token.eq_ignore_ascii_case(Self::IDENTITY) {
-                continue;
-            }
+        for value in values {
+            for coding in Coding::list(value) {
+                if coding.token.eq_ignore_ascii_case(Self::IDENTITY) {
+                    continue;
+                }
 
-            if applied.is_some() {
-                return None;
-            }
+                if applied.is_some() {
+                    return None;
+                }
 
-            applied = Some(coding.compression()?);
+                applied = Some(coding.compression()?);
+            }
         }
 
         applied
@@ -146,7 +163,15 @@ impl Compression {
     /// makes it the question "is the body still compressed" rather than "can
     /// this crate decode it". `identity` codes nothing and so does not count.
     pub fn encoded<'a>(values: impl Iterator<Item = &'a str>) -> bool {
-        values.flat_map(Coding::list).any(|coding| !coding.token.eq_ignore_ascii_case(Self::IDENTITY))
+        for value in values {
+            for coding in Coding::list(value) {
+                if !coding.token.eq_ignore_ascii_case(Self::IDENTITY) {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     /// Reads a decoder out, refusing to produce more than `max` octets.
@@ -164,8 +189,11 @@ impl Compression {
         let start = out.len();
         let mut bounded = reader.take(max.saturating_add(1));
 
-        match std::io::copy(&mut bounded, out) {
-            Ok(produced) if produced <= max => Ok(()),
+        // Read straight into the buffer. Copying between the two would stage
+        // every block in a buffer of its own first, which is one whole extra
+        // pass over the body for nothing.
+        match bounded.read_to_end(out) {
+            Ok(produced) if produced as u64 <= max => Ok(()),
             Ok(_) => {
                 out.truncate(start);
                 Err(Error::TooLarge(max))
@@ -294,6 +322,51 @@ impl<'a> Coding<'a> {
     pub const FULL: f32 = 1.0;
     /// The quality at which an entry is a refusal.
     pub const NONE: f32 = 0.0;
+    /// The parameter carrying an entry's quality.
+    pub const QUALITY: &'static str = "q";
+    /// What a quality is divided by, indexed by how many digits follow the point.
+    pub const PLACES: [f32; 4] = [1.0, 10.0, 100.0, 1000.0];
+
+    /// Reads a quality value, or `None` for anything outside its grammar.
+    ///
+    /// RFC 9110 §12.4.2 gives `qvalue = ( "0" [ "." 0*3DIGIT ] ) / ( "1" [ "."
+    /// 0*3("0") ] )`, which is five octets at the most and is read here
+    /// directly rather than through the general float parser — which is most
+    /// of what reading one entry of a field costs. Whatever the grammar does
+    /// not admit answers `None`, so [`Coding::parse`] can fall back and a
+    /// sender writing something else is read exactly as it was before.
+    ///
+    /// A whole part other than zero or one is not refused here: it parses to a
+    /// quality above one, which is refused where the value is used, and that
+    /// is the same answer by a shorter road.
+    #[inline]
+    pub fn qvalue(text: &str) -> Option<f32> {
+        let (whole, fraction) = text.as_bytes().split_first()?;
+
+        if !whole.is_ascii_digit() {
+            return None;
+        }
+
+        let mut value = (whole - b'0') as u32;
+        let mut places = 0;
+
+        if let Some((point, digits)) = fraction.split_first() {
+            if *point != b'.' || digits.len() >= Self::PLACES.len() {
+                return None;
+            }
+
+            for digit in digits {
+                if !digit.is_ascii_digit() {
+                    return None;
+                }
+
+                value = value * 10 + (digit - b'0') as u32;
+                places += 1;
+            }
+        }
+
+        Some(value as f32 / Self::PLACES[places])
+    }
 
     /// Reads one entry, with whatever parameters follow it.
     ///
@@ -302,24 +375,61 @@ impl<'a> Coding<'a> {
     /// would let a malformed field talk this end into coding a body the peer
     /// cannot read.
     pub fn parse(entry: &'a str) -> Self {
-        let mut parts = entry.split(';');
-        let token = parts.next().unwrap_or_default().trim();
+        // Trimming is asked of ASCII whitespace rather than of every code
+        // point the Unicode tables call whitespace: the surrounding space RFC
+        // 9110 §5.6.3 admits is a space or a tab, and deciding that one octet
+        // at a time is what a whole field of entries pays for.
+        let (token, parameters) = match Coding::split(entry, Self::PARAMETER) {
+            Some((token, parameters)) => (token.trim_ascii(), Some(parameters)),
+            None => (entry.trim_ascii(), None),
+        };
 
-        let written = parts.filter_map(|parameter| parameter.split_once('=')).find(|(name, _)| name.trim().eq_ignore_ascii_case("q"));
+        let Some(parameters) = parameters else {
+            return Self { token, quality: Self::FULL };
+        };
+
+        let written = parameters
+            .split(Self::PARAMETER as char)
+            .filter_map(|parameter| parameter.split_once('='))
+            .find(|(name, _)| name.trim_ascii().eq_ignore_ascii_case(Self::QUALITY));
+
         let quality = match written {
-            Some((_, value)) => value.trim().parse::<f32>().ok().filter(|quality| (Self::NONE..=Self::FULL).contains(quality)).unwrap_or(Self::NONE),
+            Some((_, value)) => {
+                let value = value.trim_ascii();
+                Self::qvalue(value).or_else(|| value.parse::<f32>().ok()).filter(|quality| (Self::NONE..=Self::FULL).contains(quality)).unwrap_or(Self::NONE)
+            }
             None => Self::FULL,
         };
 
         Self { token, quality }
     }
 
+    /// The octet separating one entry of a list from the next.
+    pub const SEPARATOR: u8 = b',';
+    /// The octet separating an entry from its parameters.
+    pub const PARAMETER: u8 = b';';
+
+    /// Splits `text` at the first `octet`, if it is there.
+    ///
+    /// `octet` must be ASCII, which every delimiter a field value is written
+    /// with is, so the split always lands on a character boundary.
+    ///
+    /// # Panics
+    ///
+    /// Debug builds assert that `octet` is ASCII.
+    pub fn split(text: &str, octet: u8) -> Option<(&str, &str)> {
+        debug_assert!(octet.is_ascii(), "a delimiter outside ASCII can fall inside a character");
+
+        let at = crate::helpers::scan::find(text.as_bytes(), octet)?;
+        Some((&text[..at], &text[at + 1..]))
+    }
+
     /// Reads every entry of a field value, in the order they were written.
     ///
     /// Entries naming nothing at all are dropped, so an empty field value
     /// yields nothing rather than one nameless entry.
-    pub fn list(value: &'a str) -> impl Iterator<Item = Self> {
-        value.split(',').map(Self::parse).filter(|coding| !coding.token.is_empty())
+    pub fn list(value: &'a str) -> Codings<'a> {
+        Codings { rest: value }
     }
 
     /// The coding this entry names, or `None` for a wildcard or an unknown token.
@@ -335,6 +445,41 @@ impl<'a> Coding<'a> {
     /// Whether this entry permits what it names.
     pub fn accepts(&self) -> bool {
         self.quality > Self::NONE
+    }
+}
+
+/// The entries of one content coding list, read as they are asked for.
+///
+/// Every message that carries an `Accept-Encoding` has it read through this,
+/// so the entries are found with the crate's own word-at-a-time scan rather
+/// than through the general pattern machinery a string split reaches for.
+pub struct Codings<'a> {
+    /// What is left of the field value.
+    pub rest: &'a str,
+}
+
+impl<'a> Iterator for Codings<'a> {
+    type Item = Coding<'a>;
+
+    fn next(&mut self) -> Option<Coding<'a>> {
+        loop {
+            if self.rest.is_empty() {
+                return None;
+            }
+
+            let entry = match Coding::split(self.rest, Coding::SEPARATOR) {
+                Some((entry, rest)) => {
+                    self.rest = rest;
+                    entry
+                }
+                None => std::mem::take(&mut self.rest),
+            };
+
+            let coding = Coding::parse(entry);
+            if !coding.token.is_empty() {
+                return Some(coding);
+            }
+        }
     }
 }
 

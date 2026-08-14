@@ -298,6 +298,16 @@ impl H3Session {
         self
     }
 
+    /// The fewest octets a field block is given room for.
+    ///
+    /// What [`H3Session::message_room`] falls back to before any section has
+    /// been encoded and the block has a size of its own to go on.
+    pub const BLOCK_FLOOR: usize = 256;
+
+    /// How many frames one message is written as at most: a field section, a
+    /// body, and a trailer section.
+    pub const FRAMES_PER_MESSAGE: usize = 3;
+
     /// The SETTINGS frame that must lead this end's control stream.
     pub fn control_frame(&self) -> Bytes {
         let mut out = BytesMut::new();
@@ -347,9 +357,24 @@ impl H3Session {
     ///
     /// As [`H3Session::frame_message`].
     pub fn encode_message(&mut self, stream_id: StreamID, message: &mut Message) -> Result<(Bytes, bool), Error> {
-        let mut out = BytesMut::new();
+        let mut out = BytesMut::with_capacity(self.message_room(message));
         let fin = self.encode_message_into(stream_id, message, &mut out)?;
         Ok((out.freeze(), fin))
+    }
+
+    /// How much room a message is likely to need on the wire.
+    ///
+    /// The field section is the part that cannot be counted in advance, so the
+    /// block the last one was encoded into stands in for it — sections on one
+    /// connection are near enough alike, which is the same reason the block is
+    /// kept at all — while the body is counted exactly. A buffer grown from
+    /// empty reallocates on its way to an ordinary response; one that starts
+    /// here does not.
+    pub fn message_room(&self, message: &Message) -> usize {
+        let body = message.body.as_ref().and_then(Body::len).unwrap_or(0);
+        let frames = Self::FRAMES_PER_MESSAGE * 2 * Varint::len(Varint::MAXIMUM);
+
+        self.block.capacity().max(Self::BLOCK_FLOOR) + body + frames
     }
 
     /// [`H3Session::encode_message`], appending to a buffer the caller owns.
