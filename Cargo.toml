@@ -24,7 +24,7 @@ socket2 = "0.6.5"
 tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-boring = "=4.22.0"
 tokio-quiche = "0.19"
-zstd = "0.13"
+zstd = "0.14"
 
 [dev-dependencies]
 rcgen = "0.14.5"
