@@ -15,7 +15,7 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 [dependencies]
 boring = "=4.22.0"
 boring-sys = "=4.22.0"
-brotli = "8"
+brotli = "9"
 bytes = "1.12.1"
 flate2 = "1"
 foreign-types = "0.5"
