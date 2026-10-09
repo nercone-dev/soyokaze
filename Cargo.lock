@@ -1356,6 +1356,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "intrusive-collections"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4275b20e6057cd7733fd8df8a5a31701e4fe44497dad0f3fa0e1c4fb971506be"
+
+[[package]]
 name = "ipnetwork"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1690,9 +1696,9 @@ dependencies = [
 
 [[package]]
 name = "octets"
-version = "0.3.6"
+version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "866cb5af6f3aa3c1b44c3c2d79d22165fbb1b102e1b3fb499864bfe34736ec4b"
+checksum = "4d59d30d3ad7f7e1c9a66e51c9cb71ae1c794b28ffe7053fd785defb0d180069"
 
 [[package]]
 name = "oid-registry"
@@ -2039,7 +2045,7 @@ dependencies = [
  "either",
  "enum_dispatch",
  "foreign-types-shared",
- "intrusive-collections",
+ "intrusive-collections 0.9.7",
  "libc",
  "libm",
  "log",
@@ -2048,6 +2054,29 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "slab",
+ "smallvec",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "quiche"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52b35a721a2a56797347929745fa783fc99e680d9484b80324ce40106b75493a"
+dependencies = [
+ "boring",
+ "boring-sys",
+ "bytes",
+ "debug_panic",
+ "either",
+ "enum_dispatch",
+ "foreign-types-shared",
+ "intrusive-collections 0.10.3",
+ "libc",
+ "libm",
+ "log",
+ "octets",
  "slab",
  "smallvec",
  "windows-sys 0.59.0",
@@ -2531,7 +2560,7 @@ dependencies = [
  "bytes",
  "flate2",
  "foreign-types",
- "quiche",
+ "quiche 0.30.0",
  "rcgen",
  "socket2",
  "tokio",
@@ -2809,7 +2838,7 @@ dependencies = [
  "octets",
  "pin-project",
  "qlog",
- "quiche",
+ "quiche 0.29.3",
  "serde",
  "serde_with",
  "slog-scope",
